@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ZoneMinder NG</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="top">
+  <div class="brand">ZM<span>NG</span></div>
+  <nav>
+    <a href="#/live" data-view="live">Live</a>
+    <a href="#/review" data-view="review">Review</a>
+    <a href="#/events" data-view="events">Events</a>
+    <a href="#/admin" data-view="admin" class="admin-only">Admin</a>
+  </nav>
+  <div class="spacer"></div>
+  <div id="clock"></div>
+  <button id="logout" class="ghost">Sign out</button>
+</header>
+<main id="main"></main>
+<div id="login" hidden>
+  <form id="login-form" class="card">
+    <h1>ZoneMinder NG</h1>
+    <p id="login-hint"></p>
+    <label>Username <input name="username" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <label id="setup-token-row" hidden>Setup token <input name="setup_token" autocomplete="off"></label>
+    <button type="submit">Sign in</button>
+    <p class="err" id="login-err"></p>
+  </form>
+</div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

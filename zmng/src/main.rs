@@ -1,0 +1,326 @@
+mod api;
+mod config;
+mod db;
+mod detect;
+mod import;
+mod mp4;
+mod recorder;
+mod retention;
+mod thumbs;
+mod video;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::info;
+
+#[derive(Parser)]
+#[command(name = "zmng", version, about = "ZoneMinder NG: passthrough NVR core")]
+struct Cli {
+    /// Config file (TOML)
+    #[arg(short, long, default_value = "zmng.toml")]
+    config: PathBuf,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run recorder, detector, retention and HTTP API
+    Run,
+    /// Print an example config file
+    ExampleConfig,
+    /// Add a storage location
+    AddStorage {
+        path: String,
+        /// Hard cap in GB (default: use free-space reserve only)
+        #[arg(long)]
+        max_gb: Option<f64>,
+        /// Always keep this many GB free on the filesystem
+        #[arg(long, default_value_t = 20.0)]
+        reserve_gb: f64,
+    },
+    /// Add a camera
+    AddCamera {
+        name: String,
+        main_url: String,
+        #[arg(long)]
+        sub_url: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        storage: i64,
+    },
+    /// List cameras
+    Cameras,
+    /// Add a user (prompts for password via --password or ZMNG_PASSWORD)
+    AddUser {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// Camera ids a viewer may see, comma separated
+        #[arg(long)]
+        cameras: Option<String>,
+    },
+    /// Re-adopt segment files that exist on disk but not in the index
+    Reindex,
+    /// Print storage usage
+    Stats,
+    /// Import ZoneMinder events (TSV export + files in place). See src/import.rs for the SQL.
+    ImportZm {
+        /// TSV from `mysql -B -N -e "SELECT ..."`
+        tsv: PathBuf,
+        /// zmng storage id whose path is the ZoneMinder events root
+        #[arg(long)]
+        storage: i64,
+        /// ZoneMinder MonitorId=zmng camera id pairs, comma separated (default identity)
+        #[arg(long, default_value = "")]
+        camera_map: String,
+        #[arg(long, default_value_t = 480)]
+        thumb_width: u32,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        skip_thumbs: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let cfg = if cli.config.exists() {
+        config::Config::load(&cli.config)?
+    } else if matches!(cli.cmd, Cmd::ExampleConfig) {
+        config::Config::default()
+    } else {
+        anyhow::bail!("config {} not found (run `zmng example-config > zmng.toml`)", cli.config.display());
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cfg.log).unwrap_or_else(|_| "info".into()))
+        .with_target(false)
+        .init();
+
+    match cli.cmd {
+        Cmd::ExampleConfig => {
+            print!("{}", toml::to_string_pretty(&config::Config::default())?);
+            Ok(())
+        }
+        Cmd::AddStorage { path, max_gb, reserve_gb } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            std::fs::create_dir_all(&path).with_context(|| format!("creating {path}"))?;
+            let id = db.add_storage(
+                &std::fs::canonicalize(&path)?.to_string_lossy(),
+                max_gb.map(|g| (g * 1e9) as i64),
+                (reserve_gb * 1e9) as i64,
+            )?;
+            println!("storage {id} added");
+            Ok(())
+        }
+        Cmd::AddCamera { name, main_url, sub_url, storage } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            let id = db.add_camera(&name, &main_url, sub_url.as_deref(), storage)?;
+            println!("camera {id} added");
+            Ok(())
+        }
+        Cmd::Cameras => {
+            let db = db::Db::open(&cfg.db_path)?;
+            for c in db.cameras()? {
+                println!("{:>3} {:<24} enabled={} storage={} main={}", c.id, c.name, c.enabled, c.storage_id, c.main_url);
+            }
+            Ok(())
+        }
+        Cmd::AddUser { username, password, role, cameras } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            let pw = password
+                .or_else(|| std::env::var("ZMNG_PASSWORD").ok())
+                .ok_or_else(|| anyhow::anyhow!("--password or ZMNG_PASSWORD required"))?;
+            let hash = api::hash_password(&pw)?;
+            let id = db.add_user(&username, &hash, &role)?;
+            if let Some(cs) = cameras {
+                let ids: Vec<i64> = cs.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                db.set_user_cameras(id, &ids)?;
+            }
+            println!("user {id} added");
+            Ok(())
+        }
+        Cmd::Reindex => {
+            let db = db::Db::open(&cfg.db_path)?;
+            let n = retention::reindex(&db)?;
+            println!("adopted {n} segment files");
+            Ok(())
+        }
+        Cmd::Stats => {
+            let db = db::Db::open(&cfg.db_path)?;
+            for s in db.storages()? {
+                let used = db.storage_used_bytes(s.id)?;
+                let free = retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(0);
+                println!(
+                    "storage {} {} used={:.1} GB free={:.1} GB max={:?} reserve={:.1} GB",
+                    s.id,
+                    s.path,
+                    used as f64 / 1e9,
+                    free as f64 / 1e9,
+                    s.max_bytes.map(|m| m as f64 / 1e9),
+                    s.reserve_bytes as f64 / 1e9
+                );
+            }
+            Ok(())
+        }
+        Cmd::ImportZm { tsv, storage, camera_map, thumb_width, dry_run, skip_thumbs } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            std::fs::create_dir_all(&cfg.thumb_dir)?;
+            let st = import::import_zm(
+                &db,
+                &import::ImportOpts {
+                    tsv: &tsv,
+                    storage_id: storage,
+                    camera_map: import::parse_camera_map(&camera_map),
+                    thumb_dir: &cfg.thumb_dir,
+                    thumb_width,
+                    dry_run,
+                    skip_thumbs,
+                },
+            )?;
+            println!("{st:#?}");
+            Ok(())
+        }
+        Cmd::Run => run(cfg),
+    }
+}
+
+/// Fire-and-forget JSON POST to the alert webhook (if configured).
+async fn notify(url: &Option<String>, body: serde_json::Value) {
+    let Some(url) = url else { return };
+    let url = url.clone();
+    let body = body.to_string();
+    // minimal HTTP client without pulling in reqwest: use curl if present
+    let _ = tokio::process::Command::new("curl")
+        .args(["-s", "-m", "10", "-X", "POST", "-H", "content-type: application/json", "-d", &body, &url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
+fn run(cfg: config::Config) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let db = db::Db::open(&cfg.db_path)?;
+        let closed = db.close_stale_events()?;
+        if closed > 0 {
+            info!(closed, "closed events left open by previous run");
+        }
+        let adopted = retention::reindex(&db)?;
+        if adopted > 0 {
+            info!(adopted, "adopted orphan segment files");
+        }
+        std::fs::create_dir_all(&cfg.thumb_dir)?;
+        let hub = Arc::new(recorder::LiveHub::new());
+        let rctx = Arc::new(recorder::RecorderCtx {
+            db: db.clone(),
+            hub: hub.clone(),
+            segment_secs: cfg.segment_secs,
+            fsync: cfg.fsync,
+        });
+        recorder::reconcile(rctx.clone()).await?;
+
+        let dctx = Arc::new(detect::DetectCtx {
+            db: db.clone(),
+            hub: hub.clone(),
+            ffmpeg: cfg.ffmpeg.clone(),
+            thumb_dir: cfg.thumb_dir.clone(),
+        });
+        detect::reconcile(dctx.clone()).await?;
+
+        // periodic: retention + reconcile (picks up camera changes made via API) + alerts + backup
+        {
+            let db = db.clone();
+            let rctx = rctx.clone();
+            let dctx = dctx.clone();
+            let thumb_dir = cfg.thumb_dir.clone();
+            let hub = hub.clone();
+            let webhook = cfg.alert_webhook.clone();
+            let alert_after = cfg.alert_after_minutes as i64 * 60 * 90_000;
+            let db_path = cfg.db_path.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut down: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                let mut last_backup = std::time::Instant::now();
+                loop {
+                    tick.tick().await;
+                    // camera-down alerts (state transitions only)
+                    let now = db::now_dts();
+                    let cams: Vec<(i64, String, i64, bool)> = hub
+                        .cams
+                        .read()
+                        .values()
+                        .map(|h| {
+                            let c = h.camera.read();
+                            let st = h.status.read();
+                            (c.id, c.name.clone(), st.last_frame_dts, st.connected)
+                        })
+                        .collect();
+                    for (id, name, last, connected) in cams {
+                        let is_down = !connected || (last > 0 && now - last > alert_after) || (last == 0);
+                        let was_down = down.contains(&id);
+                        if is_down && !was_down && last != 0 {
+                            down.insert(id);
+                            tracing::warn!(camera = id, %name, "camera down: no frames for {} min", (now - last) / 90_000 / 60);
+                            notify(&webhook, serde_json::json!({"event": "camera_down", "camera_id": id, "name": name})).await;
+                        } else if !is_down && was_down {
+                            down.remove(&id);
+                            tracing::info!(camera = id, %name, "camera recovered");
+                            notify(&webhook, serde_json::json!({"event": "camera_up", "camera_id": id, "name": name})).await;
+                        }
+                    }
+                    if last_backup.elapsed() > std::time::Duration::from_secs(24 * 3600) {
+                        last_backup = std::time::Instant::now();
+                        let (db2, p) = (db.clone(), db_path.clone());
+                        let _ = tokio::task::spawn_blocking(move || retention::backup_db(&db2, &p)).await;
+                    }
+                    if let Err(e) = recorder::reconcile(rctx.clone()).await {
+                        tracing::error!("reconcile recorders: {e:#}");
+                    }
+                    if let Err(e) = detect::reconcile(dctx.clone()).await {
+                        tracing::error!("reconcile detectors: {e:#}");
+                    }
+                    let db2 = db.clone();
+                    let td = thumb_dir.clone();
+                    let r = tokio::task::spawn_blocking(move || retention::run_once(&db2, &td)).await;
+                    match r {
+                        Ok(Err(e)) => tracing::error!("retention: {e:#}"),
+                        Err(e) => tracing::error!("retention task: {e}"),
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // graceful shutdown: SIGTERM/SIGINT stop every recorder so open segments are closed and indexed
+        {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+                info!("shutdown requested: closing segments");
+                let handles: Vec<_> = hub.cams.read().values().cloned().collect();
+                for h in &handles {
+                    let _ = h.stop.send(true);
+                }
+                // give sessions time to flush + close (fsync on the blocking pool)
+                for _ in 0..40 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if handles.iter().all(|h| h.status.read().current_segment.is_none()) {
+                        break;
+                    }
+                }
+                std::process::exit(0);
+            });
+        }
+
+        api::serve(cfg, db, hub).await
+    })
+}

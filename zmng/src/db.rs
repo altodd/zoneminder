@@ -1,0 +1,953 @@
+//! SQLite index. One row per *segment* (a ~60 s fMP4 file) and one row per
+//! *event*; never a row per frame. See docs/ARCHITECTURE.md §Data model.
+
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::mp4::{self, FragEntry};
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS storage (
+  id            INTEGER PRIMARY KEY,
+  path          TEXT NOT NULL UNIQUE,
+  -- hard cap on bytes of segments kept on this storage (NULL = use free-space reserve only)
+  max_bytes     INTEGER,
+  -- always keep at least this many bytes free on the filesystem
+  reserve_bytes INTEGER NOT NULL DEFAULT 21474836480
+);
+
+CREATE TABLE IF NOT EXISTS camera (
+  id               INTEGER PRIMARY KEY,
+  name             TEXT NOT NULL UNIQUE,
+  main_url         TEXT NOT NULL,
+  sub_url          TEXT,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  storage_id       INTEGER NOT NULL REFERENCES storage(id),
+  retention_days   REAL NOT NULL DEFAULT 30,
+  -- substream analysis
+  detect_fps       REAL NOT NULL DEFAULT 5,
+  detect_width     INTEGER NOT NULL DEFAULT 320,
+  detect_height    INTEGER NOT NULL DEFAULT 180,
+  pixel_threshold  INTEGER NOT NULL DEFAULT 25,
+  min_area_pct     REAL NOT NULL DEFAULT 1.0,
+  min_blob_pct     REAL NOT NULL DEFAULT 0.5,
+  pre_secs         REAL NOT NULL DEFAULT 5,
+  post_secs        REAL NOT NULL DEFAULT 8,
+  cooldown_secs    REAL NOT NULL DEFAULT 10,
+  -- JSON: [[[x,y],...], ...] polygons in 0..1 normalized coords (empty = whole frame)
+  zones_json       TEXT NOT NULL DEFAULT '[]',
+  -- JSON: [[[x,y],...], ...] polygons in 0..1 to ignore (privacy / swaying trees)
+  masks_json       TEXT NOT NULL DEFAULT '[]',
+  sort_order       INTEGER NOT NULL DEFAULT 0,
+  created_at       INTEGER NOT NULL
+);
+
+-- codec configuration (the mp4 sample entry) deduplicated across segments
+CREATE TABLE IF NOT EXISTS sample_entry (
+  id       INTEGER PRIMARY KEY,
+  sha256   TEXT NOT NULL UNIQUE,
+  codec    TEXT NOT NULL,
+  rfc6381  TEXT NOT NULL,
+  width    INTEGER NOT NULL,
+  height   INTEGER NOT NULL,
+  data     BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS segment (
+  id               INTEGER PRIMARY KEY,
+  camera_id        INTEGER NOT NULL REFERENCES camera(id),
+  storage_id       INTEGER NOT NULL REFERENCES storage(id),
+  sample_entry_id  INTEGER NOT NULL REFERENCES sample_entry(id),
+  start_dts        INTEGER NOT NULL,   -- 90 kHz ticks since Unix epoch
+  end_dts          INTEGER NOT NULL,
+  path             TEXT NOT NULL,      -- relative to storage.path
+  bytes            INTEGER NOT NULL,
+  init_len         INTEGER NOT NULL,
+  frames           INTEGER NOT NULL,
+  motion_max       INTEGER NOT NULL DEFAULT 0,
+  index_blob       BLOB NOT NULL,      -- mp4::encode_index (dts already absolute)
+  -- non-zero for imported files whose tfdt values are relative: add this when serving
+  dts_offset       INTEGER NOT NULL DEFAULT 0,
+  -- provenance for imported ZoneMinder events
+  zm_event_id      INTEGER,
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS segment_cam_start ON segment(camera_id, start_dts);
+CREATE INDEX IF NOT EXISTS segment_cam_end   ON segment(camera_id, end_dts);
+CREATE INDEX IF NOT EXISTS segment_storage   ON segment(storage_id, start_dts);
+
+CREATE TABLE IF NOT EXISTS event (
+  id          INTEGER PRIMARY KEY,
+  camera_id   INTEGER NOT NULL REFERENCES camera(id),
+  start_dts   INTEGER NOT NULL,
+  end_dts     INTEGER,                 -- NULL while in progress
+  kind        TEXT NOT NULL DEFAULT 'motion',
+  score       INTEGER NOT NULL DEFAULT 0,   -- peak 0..255
+  peak_dts    INTEGER,
+  thumb_path  TEXT,                    -- relative to thumb_dir
+  meta_json   TEXT NOT NULL DEFAULT '{}',
+  archived    INTEGER NOT NULL DEFAULT 0,
+  notes       TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_cam_start ON event(camera_id, start_dts);
+CREATE INDEX IF NOT EXISTS event_start     ON event(start_dts);
+
+CREATE TABLE IF NOT EXISTS user (
+  id         INTEGER PRIMARY KEY,
+  username   TEXT NOT NULL UNIQUE,
+  pass_hash  TEXT NOT NULL,
+  role       TEXT NOT NULL DEFAULT 'viewer',   -- admin | viewer
+  created_at INTEGER NOT NULL
+);
+-- viewers see only the cameras listed here (fails closed); admins see all
+CREATE TABLE IF NOT EXISTS user_camera (
+  user_id   INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+  camera_id INTEGER NOT NULL REFERENCES camera(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, camera_id)
+);
+CREATE TABLE IF NOT EXISTS session (
+  token      TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+"#;
+
+fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
+    let num = |lo: f64, hi: f64| -> Result<()> {
+        let f = v.as_f64().ok_or_else(|| anyhow::anyhow!("{k} must be a number"))?;
+        if f < lo || f > hi {
+            anyhow::bail!("{k} must be between {lo} and {hi}");
+        }
+        Ok(())
+    };
+    match k {
+        "name" | "main_url" => {
+            if v.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                anyhow::bail!("{k} must be a non-empty string");
+            }
+        }
+        "sub_url" => {
+            if !(v.is_null() || v.is_string()) {
+                anyhow::bail!("sub_url must be a string or null");
+            }
+        }
+        "enabled" => {
+            if !(v.is_boolean() || v.as_i64().map(|i| i == 0 || i == 1).unwrap_or(false)) {
+                anyhow::bail!("enabled must be true/false");
+            }
+        }
+        "storage_id" | "sort_order" => num(-1e9, 1e9)?,
+        "retention_days" => num(0.01, 3650.0)?,
+        "detect_fps" => num(0.2, 30.0)?,
+        "detect_width" => num(64.0, 1920.0)?,
+        "detect_height" => num(36.0, 1080.0)?,
+        "pixel_threshold" => num(1.0, 255.0)?,
+        "min_area_pct" | "min_blob_pct" => num(0.0, 100.0)?,
+        "pre_secs" | "post_secs" | "cooldown_secs" => num(0.0, 600.0)?,
+        "zones_json" | "masks_json" => {
+            let s = v.as_str().ok_or_else(|| anyhow::anyhow!("{k} must be a JSON string"))?;
+            serde_json::from_str::<Vec<Vec<(f64, f64)>>>(s).map_err(|e| anyhow::anyhow!("{k}: {e}"))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Additive migrations for databases created by earlier builds.
+fn migrate(c: &Connection) -> Result<()> {
+    let has_col = |table: &str, col: &str| -> Result<bool> {
+        let mut st = c.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols: Vec<String> = st.query_map([], |r| r.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+        Ok(cols.iter().any(|x| x == col))
+    };
+    if !has_col("segment", "dts_offset")? {
+        c.execute_batch("ALTER TABLE segment ADD COLUMN dts_offset INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !has_col("segment", "zm_event_id")? {
+        c.execute_batch("ALTER TABLE segment ADD COLUMN zm_event_id INTEGER;")?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct Db {
+    conn: Arc<Mutex<Connection>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Storage {
+    pub id: i64,
+    pub path: String,
+    pub max_bytes: Option<i64>,
+    pub reserve_bytes: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Camera {
+    pub id: i64,
+    pub name: String,
+    pub main_url: String,
+    pub sub_url: Option<String>,
+    pub enabled: bool,
+    pub storage_id: i64,
+    pub retention_days: f64,
+    pub detect_fps: f64,
+    pub detect_width: u32,
+    pub detect_height: u32,
+    pub pixel_threshold: u8,
+    pub min_area_pct: f64,
+    pub min_blob_pct: f64,
+    pub pre_secs: f64,
+    pub post_secs: f64,
+    pub cooldown_secs: f64,
+    pub zones_json: String,
+    pub masks_json: String,
+    pub sort_order: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleEntry {
+    pub id: i64,
+    pub codec: String,
+    pub rfc6381: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip)]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Segment {
+    pub id: i64,
+    pub camera_id: i64,
+    pub storage_id: i64,
+    pub sample_entry_id: i64,
+    pub start_dts: i64,
+    pub end_dts: i64,
+    pub path: String,
+    pub bytes: i64,
+    pub init_len: u32,
+    pub frames: i64,
+    pub motion_max: u8,
+    pub dts_offset: i64,
+    pub zm_event_id: Option<i64>,
+    #[serde(skip)]
+    pub index: Vec<FragEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub camera_id: i64,
+    pub start_dts: i64,
+    pub end_dts: Option<i64>,
+    pub kind: String,
+    pub score: u8,
+    pub peak_dts: Option<i64>,
+    pub thumb_path: Option<String>,
+    pub archived: bool,
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub role: String,
+    #[serde(skip)]
+    pub pass_hash: String,
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 90 kHz ticks since epoch for "now".
+pub fn now_dts() -> i64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (d.as_nanos() as i128 * 90_000 / 1_000_000_000) as i64
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; \
+             PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;",
+        )?;
+        conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version', ?1)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(Db { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    pub fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let c = self.conn.lock();
+        f(&c)
+    }
+
+    // ----- storage -----------------------------------------------------------
+
+    pub fn storages(&self) -> Result<Vec<Storage>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id,path,max_bytes,reserve_bytes FROM storage ORDER BY id")?;
+            let rows = st.query_map([], |r| {
+                Ok(Storage { id: r.get(0)?, path: r.get(1)?, max_bytes: r.get(2)?, reserve_bytes: r.get(3)? })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn storage(&self, id: i64) -> Result<Option<Storage>> {
+        Ok(self.storages()?.into_iter().find(|s| s.id == id))
+    }
+
+    pub fn add_storage(&self, path: &str, max_bytes: Option<i64>, reserve_bytes: i64) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO storage(path,max_bytes,reserve_bytes) VALUES(?1,?2,?3)",
+                params![path, max_bytes, reserve_bytes],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn storage_used_bytes(&self, storage_id: i64) -> Result<i64> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM segment WHERE storage_id=?1",
+                params![storage_id],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    // ----- cameras -----------------------------------------------------------
+
+    fn row_camera(r: &rusqlite::Row) -> rusqlite::Result<Camera> {
+        Ok(Camera {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            main_url: r.get("main_url")?,
+            sub_url: r.get("sub_url")?,
+            enabled: r.get::<_, i64>("enabled")? != 0,
+            storage_id: r.get("storage_id")?,
+            retention_days: r.get("retention_days")?,
+            detect_fps: r.get("detect_fps")?,
+            detect_width: r.get::<_, i64>("detect_width")? as u32,
+            detect_height: r.get::<_, i64>("detect_height")? as u32,
+            pixel_threshold: r.get::<_, i64>("pixel_threshold")? as u8,
+            min_area_pct: r.get("min_area_pct")?,
+            min_blob_pct: r.get("min_blob_pct")?,
+            pre_secs: r.get("pre_secs")?,
+            post_secs: r.get("post_secs")?,
+            cooldown_secs: r.get("cooldown_secs")?,
+            zones_json: r.get("zones_json")?,
+            masks_json: r.get("masks_json")?,
+            sort_order: r.get("sort_order")?,
+        })
+    }
+
+    pub fn cameras(&self) -> Result<Vec<Camera>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM camera ORDER BY sort_order, id")?;
+            let rows = st.query_map([], Self::row_camera)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn camera(&self, id: i64) -> Result<Option<Camera>> {
+        self.with(|c| {
+            Ok(c.query_row("SELECT * FROM camera WHERE id=?1", params![id], Self::row_camera).optional()?)
+        })
+    }
+
+    pub fn add_camera(&self, name: &str, main_url: &str, sub_url: Option<&str>, storage_id: i64) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO camera(name,main_url,sub_url,storage_id,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![name, main_url, sub_url, storage_id, now_secs()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// Update a subset of camera fields from a JSON object (admin API).
+    pub fn update_camera(&self, id: i64, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        const ALLOWED: &[&str] = &[
+            "name", "main_url", "sub_url", "enabled", "storage_id", "retention_days", "detect_fps",
+            "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
+            "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
+        ];
+        self.with(|c| {
+            for (k, v) in patch {
+                if !ALLOWED.contains(&k.as_str()) {
+                    anyhow::bail!("field {k} is not updatable");
+                }
+                validate_camera_field(k, v)?;
+                let sql = format!("UPDATE camera SET {k}=?1 WHERE id=?2");
+                let val: rusqlite::types::Value = match v {
+                    serde_json::Value::Null => rusqlite::types::Value::Null,
+                    serde_json::Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            rusqlite::types::Value::Integer(i)
+                        } else {
+                            rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.0))
+                        }
+                    }
+                    serde_json::Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+                    other => rusqlite::types::Value::Text(other.to_string()),
+                };
+                c.execute(&sql, params![val, id])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete a camera and its index rows; the caller removes files first
+    /// (see retention::delete_camera_files).
+    pub fn delete_camera(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM event WHERE camera_id=?1", params![id])?;
+            c.execute("DELETE FROM segment WHERE camera_id=?1", params![id])?;
+            c.execute("DELETE FROM user_camera WHERE camera_id=?1", params![id])?;
+            c.execute("DELETE FROM camera WHERE id=?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    pub fn segments_of_camera(&self, camera_id: i64, limit: usize) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM segment WHERE camera_id=?1 ORDER BY start_dts LIMIT ?2")?;
+            let rows = st.query_map(params![camera_id, limit as i64], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Atomically create the first admin; fails if any user already exists.
+    pub fn add_first_admin(&self, username: &str, pass_hash: &str) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "INSERT INTO user(username,pass_hash,role,created_at) SELECT ?1,?2,'admin',?3 WHERE NOT EXISTS (SELECT 1 FROM user)",
+                params![username, pass_hash, now_secs()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    // ----- sample entries ------------------------------------------------------
+
+    pub fn intern_sample_entry(&self, codec: mp4::Codec, rfc6381: &str, width: u32, height: u32, data: &[u8]) -> Result<i64> {
+        use sha2::Digest;
+        let sha = hex::encode(sha2::Sha256::digest(data));
+        self.with(|c| {
+            if let Some(id) = c
+                .query_row("SELECT id FROM sample_entry WHERE sha256=?1", params![sha], |r| r.get::<_, i64>(0))
+                .optional()?
+            {
+                return Ok(id);
+            }
+            c.execute(
+                "INSERT INTO sample_entry(sha256,codec,rfc6381,width,height,data) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![sha, codec.to_string(), rfc6381, width, height, data],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn sample_entry(&self, id: i64) -> Result<Option<SampleEntry>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT id,codec,rfc6381,width,height,data FROM sample_entry WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(SampleEntry {
+                        id: r.get(0)?,
+                        codec: r.get(1)?,
+                        rfc6381: r.get(2)?,
+                        width: r.get::<_, i64>(3)? as u32,
+                        height: r.get::<_, i64>(4)? as u32,
+                        data: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+        })
+    }
+
+    // ----- segments ------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_segment(
+        &self,
+        camera_id: i64,
+        storage_id: i64,
+        sample_entry_id: i64,
+        path: &str,
+        bytes: i64,
+        init_len: u32,
+        index: &[FragEntry],
+    ) -> Result<i64> {
+        self.insert_segment_ext(camera_id, storage_id, sample_entry_id, path, bytes, init_len, index, 0, None)
+    }
+
+    /// `index` must already carry absolute dts values; `dts_offset` is what
+    /// must be added to the file's own tfdt values to get there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_segment_ext(
+        &self,
+        camera_id: i64,
+        storage_id: i64,
+        sample_entry_id: i64,
+        path: &str,
+        bytes: i64,
+        init_len: u32,
+        index: &[FragEntry],
+        dts_offset: i64,
+        zm_event_id: Option<i64>,
+    ) -> Result<i64> {
+        let start = index.first().map(|f| f.dts).unwrap_or(0);
+        let end = index.last().map(|f| f.dts + f.duration as i64).unwrap_or(start);
+        let frames: i64 = index.iter().map(|f| f.samples as i64).sum();
+        let motion_max = index.iter().map(|f| f.motion).max().unwrap_or(0);
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO segment(camera_id,storage_id,sample_entry_id,start_dts,end_dts,path,bytes,init_len,frames,motion_max,index_blob,dts_offset,zm_event_id,created_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![camera_id, storage_id, sample_entry_id, start, end, path, bytes, init_len, frames, motion_max, mp4::encode_index(index), dts_offset, zm_event_id, now_secs()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn zm_event_imported(&self, zm_event_id: i64) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.query_row("SELECT 1 FROM segment WHERE zm_event_id=?1 LIMIT 1", params![zm_event_id], |_| Ok(()))
+                .optional()?
+                .is_some())
+        })
+    }
+
+    pub fn insert_event_full(&self, camera_id: i64, start_dts: i64, end_dts: i64, kind: &str, score: u8, peak_dts: Option<i64>, thumb_path: Option<&str>, meta_json: &str, archived: bool, notes: Option<&str>) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO event(camera_id,start_dts,end_dts,kind,score,peak_dts,thumb_path,meta_json,archived,notes,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![camera_id, start_dts, end_dts, kind, score as i64, peak_dts, thumb_path, meta_json, archived as i64, notes, now_secs()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    fn row_segment(r: &rusqlite::Row) -> rusqlite::Result<Segment> {
+        let blob: Vec<u8> = r.get("index_blob")?;
+        Ok(Segment {
+            id: r.get("id")?,
+            camera_id: r.get("camera_id")?,
+            storage_id: r.get("storage_id")?,
+            sample_entry_id: r.get("sample_entry_id")?,
+            start_dts: r.get("start_dts")?,
+            end_dts: r.get("end_dts")?,
+            path: r.get("path")?,
+            bytes: r.get("bytes")?,
+            init_len: r.get::<_, i64>("init_len")? as u32,
+            frames: r.get("frames")?,
+            motion_max: r.get::<_, i64>("motion_max")? as u8,
+            dts_offset: r.get("dts_offset")?,
+            zm_event_id: r.get("zm_event_id")?,
+            index: mp4::decode_index(&blob),
+        })
+    }
+
+    /// Segments of a camera overlapping [start, end).
+    pub fn segments_in_range(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT * FROM segment WHERE camera_id=?1 AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+            )?;
+            let rows = st.query_map(params![camera_id, start, end], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn segment(&self, id: i64) -> Result<Option<Segment>> {
+        self.with(|c| Ok(c.query_row("SELECT * FROM segment WHERE id=?1", params![id], Self::row_segment).optional()?))
+    }
+
+    pub fn segment_paths_for_storage(&self, storage_id: i64) -> Result<std::collections::HashSet<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT path FROM segment WHERE storage_id=?1")?;
+            let rows = st.query_map(params![storage_id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Oldest segments on a storage (for retention).
+    pub fn oldest_segments(&self, storage_id: i64, limit: usize) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 ORDER BY start_dts LIMIT ?2")?;
+            let rows = st.query_map(params![storage_id, limit as i64], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn segments_older_than(&self, camera_id: i64, before_dts: i64, limit: usize) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT * FROM segment WHERE camera_id=?1 AND end_dts<?2 ORDER BY start_dts LIMIT ?3",
+            )?;
+            let rows = st.query_map(params![camera_id, before_dts, limit as i64], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn delete_segment(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM segment WHERE id=?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Coverage summary for the timeline: (start,end,motion_max) tuples.
+    pub fn coverage(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<(i64, i64, u8)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT start_dts,end_dts,motion_max FROM segment WHERE camera_id=?1 AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+            )?;
+            let rows = st.query_map(params![camera_id, start, end], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u8))
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn earliest_segment_dts(&self, camera_id: Option<i64>) -> Result<Option<i64>> {
+        self.with(|c| {
+            let v: Option<i64> = match camera_id {
+                Some(id) => c.query_row("SELECT MIN(start_dts) FROM segment WHERE camera_id=?1", params![id], |r| r.get(0))?,
+                None => c.query_row("SELECT MIN(start_dts) FROM segment", [], |r| r.get(0))?,
+            };
+            Ok(v)
+        })
+    }
+
+    // ----- events --------------------------------------------------------------
+
+    pub fn insert_event(&self, camera_id: i64, start_dts: i64, kind: &str) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO event(camera_id,start_dts,kind,created_at) VALUES(?1,?2,?3,?4)",
+                params![camera_id, start_dts, kind, now_secs()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn update_event_progress(&self, id: i64, score: u8, peak_dts: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE event SET score=MAX(score,?1), peak_dts=CASE WHEN ?1>=score THEN ?2 ELSE peak_dts END WHERE id=?3",
+                params![score as i64, peak_dts, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn close_event(&self, id: i64, end_dts: i64, thumb_path: Option<&str>, meta_json: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE event SET end_dts=?1, thumb_path=COALESCE(?2,thumb_path), meta_json=?3 WHERE id=?4",
+                params![end_dts, thumb_path, meta_json, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_event_thumb(&self, id: i64, thumb_path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE event SET thumb_path=?1 WHERE id=?2", params![thumb_path, id])?;
+            Ok(())
+        })
+    }
+
+    fn row_event(r: &rusqlite::Row) -> rusqlite::Result<Event> {
+        Ok(Event {
+            id: r.get("id")?,
+            camera_id: r.get("camera_id")?,
+            start_dts: r.get("start_dts")?,
+            end_dts: r.get("end_dts")?,
+            kind: r.get("kind")?,
+            score: r.get::<_, i64>("score")? as u8,
+            peak_dts: r.get("peak_dts")?,
+            thumb_path: r.get("thumb_path")?,
+            archived: r.get::<_, i64>("archived")? != 0,
+            notes: r.get("notes")?,
+        })
+    }
+
+    pub fn event(&self, id: i64) -> Result<Option<Event>> {
+        self.with(|c| Ok(c.query_row("SELECT * FROM event WHERE id=?1", params![id], Self::row_event).optional()?))
+    }
+
+    /// Event listing with keyset pagination (newest first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn events(
+        &self,
+        cameras: Option<&[i64]>,
+        start: Option<i64>,
+        end: Option<i64>,
+        min_score: u8,
+        archived_only: bool,
+        before_id: Option<i64>,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<Vec<Event>> {
+        let mut sql = String::from("SELECT * FROM event WHERE end_dts IS NOT NULL AND score>=?1");
+        let mut args: Vec<rusqlite::types::Value> = vec![(min_score as i64).into()];
+        if let Some(cs) = cameras {
+            if cs.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(" AND camera_id IN (");
+            sql.push_str(&cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","));
+            sql.push(')');
+        }
+        if let Some(s) = start {
+            args.push(s.into());
+            sql.push_str(&format!(" AND end_dts>=?{}", args.len()));
+        }
+        if let Some(e) = end {
+            args.push(e.into());
+            sql.push_str(&format!(" AND start_dts<?{}", args.len()));
+        }
+        if archived_only {
+            sql.push_str(" AND archived=1");
+        }
+        if let Some(b) = before_id {
+            // keyset on (start_dts, id) so ORDER BY start_dts never skips/duplicates
+            args.push(b.into());
+            let n = args.len();
+            let op = if ascending { ">" } else { "<" };
+            sql.push_str(&format!(
+                " AND (start_dts {op} (SELECT start_dts FROM event WHERE id=?{n}) OR (start_dts = (SELECT start_dts FROM event WHERE id=?{n}) AND id {op} ?{n}))"
+            ));
+        }
+        sql.push_str(if ascending { " ORDER BY start_dts ASC, id ASC" } else { " ORDER BY start_dts DESC, id DESC" });
+        args.push((limit as i64).into());
+        sql.push_str(&format!(" LIMIT ?{}", args.len()));
+        self.with(|c| {
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(args.iter()), Self::row_event)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn events_in_range(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<Event>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT * FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+            )?;
+            let rows = st.query_map(params![camera_id, start, end], Self::row_event)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn set_event_archived(&self, id: i64, archived: bool) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE event SET archived=?1 WHERE id=?2", params![archived as i64, id])?;
+            Ok(())
+        })
+    }
+
+    pub fn set_event_notes(&self, id: i64, notes: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE event SET notes=?1 WHERE id=?2", params![notes, id])?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_event(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM event WHERE id=?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Events whose recording is entirely gone (older than the camera's
+    /// oldest segment) and that are not archived.
+    pub fn orphan_events(&self, camera_id: i64, before_dts: i64, limit: usize) -> Result<Vec<Event>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT * FROM event WHERE camera_id=?1 AND archived=0 AND end_dts IS NOT NULL AND end_dts<?2 ORDER BY start_dts LIMIT ?3",
+            )?;
+            let rows = st.query_map(params![camera_id, before_dts, limit as i64], Self::row_event)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Close any events left open by a crash.
+    pub fn close_stale_events(&self) -> Result<usize> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE event SET end_dts=COALESCE(peak_dts,start_dts)+90000*5 WHERE end_dts IS NULL",
+                [],
+            )?)
+        })
+    }
+
+    // ----- users / sessions ----------------------------------------------------
+
+    pub fn user_count(&self) -> Result<i64> {
+        self.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM user", [], |r| r.get(0))?))
+    }
+
+    pub fn add_user(&self, username: &str, pass_hash: &str, role: &str) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO user(username,pass_hash,role,created_at) VALUES(?1,?2,?3,?4)",
+                params![username, pass_hash, role, now_secs()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn users(&self) -> Result<Vec<User>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id,username,role,pass_hash FROM user ORDER BY id")?;
+            let rows = st.query_map([], |r| {
+                Ok(User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn user_by_name(&self, username: &str) -> Result<Option<User>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT id,username,role,pass_hash FROM user WHERE username=?1",
+                params![username],
+                |r| Ok(User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? }),
+            )
+            .optional()?)
+        })
+    }
+
+    pub fn delete_user(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM user WHERE id=?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    pub fn set_user_cameras(&self, user_id: i64, cameras: &[i64]) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM user_camera WHERE user_id=?1", params![user_id])?;
+            for cam in cameras {
+                c.execute("INSERT OR IGNORE INTO user_camera(user_id,camera_id) VALUES(?1,?2)", params![user_id, cam])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn user_cameras(&self, user_id: i64) -> Result<Vec<i64>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT camera_id FROM user_camera WHERE user_id=?1")?;
+            let rows = st.query_map(params![user_id], |r| r.get::<_, i64>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn create_session(&self, user_id: i64, token: &str, ttl_secs: i64) -> Result<()> {
+        self.with(|c| {
+            let now = now_secs();
+            c.execute(
+                "INSERT INTO session(token,user_id,created_at,expires_at) VALUES(?1,?2,?3,?4)",
+                params![token, user_id, now, now + ttl_secs],
+            )?;
+            c.execute("DELETE FROM session WHERE expires_at<?1", params![now])?;
+            Ok(())
+        })
+    }
+
+    pub fn session_user(&self, token: &str) -> Result<Option<User>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT u.id,u.username,u.role,u.pass_hash FROM session s JOIN user u ON u.id=s.user_id WHERE s.token=?1 AND s.expires_at>?2",
+                params![token, now_secs()],
+                |r| Ok(User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? }),
+            )
+            .optional()?)
+        })
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM session WHERE token=?1", params![token])?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_and_basic_roundtrip() {
+        let dir = tempdir();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        let sid = db.add_storage("/tmp/x", None, 0).unwrap();
+        let cid = db.add_camera("cam", "rtsp://x/1", Some("rtsp://x/2"), sid).unwrap();
+        let se = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc").unwrap();
+        let se2 = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc").unwrap();
+        assert_eq!(se, se2);
+        let idx = vec![
+            FragEntry { dts: 1000, duration: 180_000, offset: 900, len: 5000, samples: 40, motion: 3 },
+            FragEntry { dts: 181_000, duration: 180_000, offset: 5900, len: 5000, samples: 40, motion: 200 },
+        ];
+        let seg = db.insert_segment(cid, sid, se, "1/x.mp4", 10900, 900, &idx).unwrap();
+        let got = db.segment(seg).unwrap().unwrap();
+        assert_eq!(got.start_dts, 1000);
+        assert_eq!(got.end_dts, 361_000);
+        assert_eq!(got.frames, 80);
+        assert_eq!(got.motion_max, 200);
+        assert_eq!(got.index, idx);
+        assert_eq!(db.segments_in_range(cid, 0, 1500).unwrap().len(), 1);
+        assert_eq!(db.segments_in_range(cid, 0, 500).unwrap().len(), 0);
+        assert_eq!(db.segments_in_range(cid, 361_000, 400_000).unwrap().len(), 0);
+        let ev = db.insert_event(cid, 5000, "motion").unwrap();
+        db.update_event_progress(ev, 50, 6000).unwrap();
+        db.update_event_progress(ev, 40, 7000).unwrap();
+        db.close_event(ev, 9000, Some("1/e.jpg"), "{}").unwrap();
+        let e = db.event(ev).unwrap().unwrap();
+        assert_eq!(e.score, 50);
+        assert_eq!(e.peak_dts, Some(6000));
+        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false).unwrap().len(), 1);
+        assert_eq!(db.events(Some(&[cid]), None, None, 60, false, None, 10, false).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("zmng-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+}

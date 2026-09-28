@@ -1,0 +1,23 @@
+[Unit]
+Description=ZoneMinder NG recorder/API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=zmng
+Group=zmng
+WorkingDirectory=/var/lib/zmng
+ExecStart=/usr/local/bin/zmng -c /etc/zmng/zmng.toml run
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+# recording volumes must be writable by the zmng user
+ReadWritePaths=/var/lib/zmng /var/cache/zmng /media
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=multi-user.target
