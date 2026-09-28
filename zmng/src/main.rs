@@ -1,16 +1,4 @@
-#![recursion_limit = "512"]
-mod api;
-mod config;
-mod db;
-mod detect;
-mod import;
-mod mp4;
-mod recorder;
-mod retention;
-mod thumbs;
-mod tier;
-mod video;
-mod zmapi;
+use zmng::{api, config, db, detect, import, recorder, retention, tier};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

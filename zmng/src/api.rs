@@ -915,21 +915,25 @@ async fn health() -> impl IntoResponse {
 
 // ---------------------------------------------------------------------------
 
-pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>) -> Result<()> {
-    let listen = cfg.listen.clone();
-    let web_dir = cfg.web_dir.clone();
-    let setup_token = new_token()[..12].to_string();
-    if db.user_count()? == 0 {
-        info!("no users yet: open the UI and create the first admin with setup token {setup_token}");
+impl App {
+    /// Assemble the shared application state. The setup token is printed by
+    /// `serve` when no users exist yet.
+    pub fn new(cfg: Config, db: Db, hub: Arc<LiveHub>) -> App {
+        App {
+            cfg: Arc::new(cfg),
+            db,
+            hub,
+            setup_token: Arc::new(new_token()[..12].to_string()),
+            login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
+            decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+        }
     }
-    let app = App {
-        cfg: Arc::new(cfg),
-        db,
-        hub,
-        setup_token: Arc::new(setup_token),
-        login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
-        decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
-    };
+}
+
+/// The complete router: JSON API, ZoneMinder-compatible API, static UI.
+/// Separate from `serve` so tests can drive it in-process.
+pub fn router(app: App) -> Router {
+    let web_dir = app.cfg.web_dir.clone();
     let index = ServeFile::new(web_dir.join("index.html"));
     let static_files = ServeDir::new(&web_dir).not_found_service(index);
 
@@ -963,7 +967,16 @@ pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>) -> Result<()> {
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw))
         .with_state(app);
 
-    let router = api.fallback_service(static_files).layer(tower_http::trace::TraceLayer::new_for_http());
+    api.fallback_service(static_files).layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>) -> Result<()> {
+    let listen = cfg.listen.clone();
+    let app = App::new(cfg, db, hub);
+    if app.db.user_count()? == 0 {
+        info!("no users yet: open the UI and create the first admin with setup token {}", app.setup_token);
+    }
+    let router = router(app);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "http server listening");
     axum::serve(listener, router).await?;

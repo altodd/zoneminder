@@ -682,6 +682,103 @@ fn parse_moof(moof: &[u8]) -> anyhow::Result<(i64, u32, u32)> {
     Ok((dts, duration, samples))
 }
 
+/// One sample as described by a fragment's `trun` (size, duration, keyframe
+/// flag) plus its payload slice inside the fragment buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleInfo {
+    pub duration: u32,
+    pub size: u32,
+    pub is_key: bool,
+    /// Byte offset of the sample payload inside the fragment buffer.
+    pub offset: usize,
+}
+
+/// Parse the per-sample table of a single-`traf` `moof`+`mdat` fragment
+/// (ours or ffmpeg's `default_base_moof` files). Handles `tfhd` defaults and
+/// every `trun` optional field. Bounds-checked: a corrupt fragment yields an
+/// error, never a panic.
+pub fn parse_fragment_samples(frag: &[u8]) -> anyhow::Result<Vec<SampleInfo>> {
+    let rd32 = |b: &[u8], at: usize| -> anyhow::Result<u32> {
+        b.get(at..at + 4).map(|x| u32::from_be_bytes(x.try_into().unwrap())).ok_or_else(|| anyhow::anyhow!("truncated box"))
+    };
+    if frag.len() < 8 || &frag[4..8] != b"moof" {
+        anyhow::bail!("not a moof");
+    }
+    let moof_len = rd32(frag, 0)? as usize;
+    if moof_len > frag.len() {
+        anyhow::bail!("truncated moof");
+    }
+    let moof = &frag[..moof_len];
+    let mut out = Vec::new();
+    let mut pos = 8;
+    while pos + 8 <= moof.len() {
+        let size = rd32(moof, pos)? as usize;
+        if size < 8 || pos + size > moof.len() {
+            anyhow::bail!("bad moof child");
+        }
+        if &moof[pos + 4..pos + 8] == b"traf" {
+            let traf = &moof[pos..pos + size];
+            let (mut def_dur, mut def_size, mut def_flags) = (0u32, 0u32, 0u32);
+            let mut base_is_moof = false;
+            let mut p = 8;
+            while p + 8 <= traf.len() {
+                let s = rd32(traf, p)? as usize;
+                if s < 8 || p + s > traf.len() {
+                    anyhow::bail!("bad traf child");
+                }
+                match &traf[p + 4..p + 8] {
+                    b"tfhd" => {
+                        let flags = rd32(traf, p + 8)? & 0xff_ffff;
+                        base_is_moof = flags & 0x2_0000 != 0;
+                        let mut q = p + 16;
+                        if flags & 0x1 != 0 { q += 8; }
+                        if flags & 0x2 != 0 { q += 4; }
+                        if flags & 0x8 != 0 { def_dur = rd32(traf, q)?; q += 4; }
+                        if flags & 0x10 != 0 { def_size = rd32(traf, q)?; q += 4; }
+                        if flags & 0x20 != 0 { def_flags = rd32(traf, q)?; }
+                    }
+                    b"trun" => {
+                        let flags = rd32(traf, p + 8)? & 0xff_ffff;
+                        let count = rd32(traf, p + 12)? as usize;
+                        let mut q = p + 16;
+                        let mut data_offset = 0i64;
+                        if flags & 0x1 != 0 {
+                            data_offset = rd32(traf, q)? as i32 as i64;
+                            q += 4;
+                        }
+                        let mut first_flags = None;
+                        if flags & 0x4 != 0 {
+                            first_flags = Some(rd32(traf, q)?);
+                            q += 4;
+                        }
+                        if !base_is_moof {
+                            anyhow::bail!("fragment does not use default-base-is-moof");
+                        }
+                        let mut off = data_offset;
+                        for i in 0..count {
+                            let dur = if flags & 0x100 != 0 { let v = rd32(traf, q)?; q += 4; v } else { def_dur };
+                            let sz = if flags & 0x200 != 0 { let v = rd32(traf, q)?; q += 4; v } else { def_size };
+                            let fl = if flags & 0x400 != 0 { let v = rd32(traf, q)?; q += 4; v } else if i == 0 { first_flags.unwrap_or(def_flags) } else { def_flags };
+                            if flags & 0x800 != 0 { q += 4; }
+                            // sample_is_non_sync_sample is bit 16; depends_on==2 (bits 24-25) also marks an I-frame
+                            let is_key = fl & 0x0001_0000 == 0;
+                            if off < 0 || off as usize + sz as usize > frag.len() {
+                                anyhow::bail!("sample outside fragment");
+                            }
+                            out.push(SampleInfo { duration: dur, size: sz, is_key, offset: off as usize });
+                            off += sz as i64;
+                        }
+                    }
+                    _ => {}
+                }
+                p += s;
+            }
+        }
+        pos += size;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +890,21 @@ mod tests {
         assert_eq!(&f1[moof_len + 4..moof_len + 8], b"mdat");
         let blob = encode_index(&scanned.frags);
         assert_eq!(decode_index(&blob), scanned.frags);
+    }
+
+    #[test]
+    fn fragment_samples_roundtrip() {
+        let s = |dts: i64, key: bool, n: usize| Sample { dts, duration: 3000, is_key: key, data: Bytes::from(vec![0xCD; n]) };
+        let f = fragment(7, &[s(0, true, 50), s(3000, false, 10), s(6000, false, 20)]);
+        let samples = parse_fragment_samples(&f).unwrap();
+        assert_eq!(samples.len(), 3);
+        assert!(samples[0].is_key && !samples[1].is_key && !samples[2].is_key);
+        assert_eq!(samples.iter().map(|x| x.size).collect::<Vec<_>>(), vec![50, 10, 20]);
+        assert_eq!(samples[0].duration, 3000);
+        // offsets are contiguous inside the mdat payload
+        assert_eq!(samples[1].offset, samples[0].offset + 50);
+        assert_eq!(&f[samples[2].offset..samples[2].offset + 20], &[0xCD; 20]);
+        assert!(parse_fragment_samples(&f[..40]).is_err());
     }
 }
 
