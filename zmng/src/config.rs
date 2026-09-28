@@ -37,6 +37,8 @@ pub struct Config {
     pub alert_webhook: Option<String>,
     /// Minutes without frames before a camera is alerted as down.
     pub alert_after_minutes: u32,
+    /// MQTT broker for Home Assistant (motion/recording topics + discovery).
+    pub mqtt: Option<crate::notify::MqttConfig>,
 }
 
 impl Default for Config {
@@ -55,6 +57,7 @@ impl Default for Config {
             secure_cookies: false,
             alert_webhook: None,
             alert_after_minutes: 3,
+            mqtt: None,
         }
     }
 }

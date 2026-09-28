@@ -29,6 +29,7 @@ pub struct DetectCtx {
     pub hub: Arc<LiveHub>,
     pub ffmpeg: String,
     pub thumb_dir: PathBuf,
+    pub bus: Arc<crate::notify::Bus>,
 }
 
 pub struct DetectorHandle {
@@ -561,6 +562,7 @@ impl EventState {
                     self.frames = 1;
                     h.status.write().in_event = Some(id);
                     ctx.db.update_event_progress(id, score, dts)?;
+                    ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);
                 }
             }
             Some(id) => {
@@ -589,16 +591,19 @@ impl EventState {
                     ctx.db.close_event(id, end, None, &meta.to_string())?;
                     info!(camera = cam.id, event = id, peak = self.peak, secs = (end - (self.peak_dts)) / ts, "event end");
                     h.status.write().in_event = None;
+                    ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventEnd);
                     let peak_dts = self.peak_dts;
                     *self = EventState::default();
                     // thumbnail in the background (waits for the segment to close if needed)
                     let db = ctx.db.clone();
                     let ffmpeg = ctx.ffmpeg.clone();
                     let thumb_dir = ctx.thumb_dir.clone();
+                    let bus = ctx.bus.clone();
                     let cam_id = cam.id;
                     tokio::spawn(async move {
-                        if let Err(e) = make_thumbnail(&db, &ffmpeg, &thumb_dir, cam_id, id, peak_dts).await {
-                            error!(camera = cam_id, event = id, "thumbnail: {e:#}");
+                        match make_thumbnail(&db, &ffmpeg, &thumb_dir, cam_id, id, peak_dts).await {
+                            Ok(jpeg) => bus.publish(crate::notify::Notification::EventThumbnail { event_id: id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) }),
+                            Err(e) => error!(camera = cam_id, event = id, "thumbnail: {e:#}"),
                         }
                     });
                 }
@@ -610,7 +615,7 @@ impl EventState {
 
 /// Find the fragment containing `dts` (retrying until the segment holding it
 /// has been closed and indexed), decode its keyframe and store a JPEG.
-pub async fn make_thumbnail(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, cam_id: i64, event_id: i64, dts: i64) -> Result<()> {
+pub async fn make_thumbnail(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, cam_id: i64, event_id: i64, dts: i64) -> Result<Vec<u8>> {
     let mut attempt = 0;
     loop {
         let segs = db.segments_in_range(cam_id, dts, dts + 1)?;
@@ -633,7 +638,7 @@ pub async fn make_thumbnail(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, 
             std::fs::write(&abs, &jpeg)?;
             db.set_event_thumb(event_id, &rel)?;
             debug!(camera = cam_id, event = event_id, bytes = jpeg.len(), "thumbnail written");
-            return Ok(());
+            return Ok(jpeg);
         }
         attempt += 1;
         if attempt > 6 {

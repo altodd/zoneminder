@@ -33,6 +33,7 @@ pub struct App {
     pub login_guard: Arc<parking_lot::Mutex<LoginGuard>>,
     /// Bounds concurrent on-demand ffmpeg decodes (snapshot/frame endpoints).
     pub decode_sem: Arc<tokio::sync::Semaphore>,
+    pub bus: Arc<crate::notify::Bus>,
 }
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
@@ -144,7 +145,7 @@ fn token_from(headers: &HeaderMap) -> Option<String> {
 async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let public = path == "/api/login" || path == "/api/setup" || path == "/api/health"
-        || path == "/zm/api/host/getVersion.json" || path == "/zm/api/host/login.json"
+        || path == "/zm/api/host/getVersion.json" || path == "/zm/api/host/login.json" || path == "/zm/ws"
         || !(path.starts_with("/api/") || path.starts_with("/zm/"));
     let user = match token_from(req.headers()).or_else(|| token_from_query(req.uri())) {
         Some(t) => app.db.session_user(&t).ok().flatten(),
@@ -909,6 +910,42 @@ async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
     Ok(Json(serde_json::json!({"earliest_ms": earliest, "now_ms": crate::db::now_dts() / 90, "cameras": cams})).into_response())
 }
 
+/// Server-sent events: every notification for cameras the user may see.
+/// The UI uses it for toasts and to refresh lists without polling.
+async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let admin = u.role == "admin";
+    let vis = visible_cameras(&app, u);
+    let rx = app.bus.subscribe();
+    let stream = futures::stream::unfold(rx, move |mut rx| {
+        let vis = vis.clone();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(n) => {
+                        if !n.is_external() {
+                            continue;
+                        }
+                        let allowed = match n.camera_id() {
+                            Some(c) => vis.contains(&c),
+                            None => admin,
+                        };
+                        if !allowed {
+                            continue;
+                        }
+                        let ev = SseEvent::default().event(n.name()).json_data(&n).unwrap_or_else(|_| SseEvent::default());
+                        return Some((Ok::<_, std::convert::Infallible>(ev), rx));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return None,
+                }
+            }
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping")).into_response())
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true, "ts": TIMESCALE}))
 }
@@ -918,11 +955,12 @@ async fn health() -> impl IntoResponse {
 impl App {
     /// Assemble the shared application state. The setup token is printed by
     /// `serve` when no users exist yet.
-    pub fn new(cfg: Config, db: Db, hub: Arc<LiveHub>) -> App {
+    pub fn new(cfg: Config, db: Db, hub: Arc<LiveHub>, bus: Arc<crate::notify::Bus>) -> App {
         App {
             cfg: Arc::new(cfg),
             db,
             hub,
+            bus,
             setup_token: Arc::new(new_token()[..12].to_string()),
             login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -957,6 +995,7 @@ pub fn router(app: App) -> Router {
         .route("/api/events", get(events))
         .route("/api/events/{id}", get(event_get).patch(event_update))
         .route("/api/events/{id}/thumb.jpg", get(event_thumb))
+        .route("/api/events/stream", get(event_stream))
         .route("/api/tokens", post(create_token))
         .route("/api/users", get(users).post(user_create))
         .route("/api/users/{id}", axum::routing::patch(user_update).delete(user_delete))
@@ -970,9 +1009,9 @@ pub fn router(app: App) -> Router {
     api.fallback_service(static_files).layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
-pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>) -> Result<()> {
+pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>, bus: Arc<crate::notify::Bus>) -> Result<()> {
     let listen = cfg.listen.clone();
-    let app = App::new(cfg, db, hub);
+    let app = App::new(cfg, db, hub, bus);
     if app.db.user_count()? == 0 {
         info!("no users yet: open the UI and create the first admin with setup token {}", app.setup_token);
     }

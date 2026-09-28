@@ -309,6 +309,8 @@ pub struct Event {
     pub thumb_path: Option<String>,
     pub archived: bool,
     pub notes: Option<String>,
+    /// JSON object: detector stats, detected objects (`objects`), import provenance
+    pub meta_json: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -826,6 +828,7 @@ impl Db {
             thumb_path: r.get("thumb_path")?,
             archived: r.get::<_, i64>("archived")? != 0,
             notes: r.get("notes")?,
+            meta_json: r.get::<_, Option<String>>("meta_json")?.unwrap_or_else(|| "{}".into()),
         })
     }
 

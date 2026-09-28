@@ -1,4 +1,4 @@
-use zmng::{api, config, db, detect, import, recorder, retention, tier};
+use zmng::{api, config, db, detect, import, notify, recorder, retention, tier};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -191,20 +191,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Fire-and-forget JSON POST to the alert webhook (if configured).
-async fn notify(url: &Option<String>, body: serde_json::Value) {
-    let Some(url) = url else { return };
-    let url = url.clone();
-    let body = body.to_string();
-    // minimal HTTP client without pulling in reqwest: use curl if present
-    let _ = tokio::process::Command::new("curl")
-        .args(["-s", "-m", "10", "-X", "POST", "-H", "content-type: application/json", "-d", &body, &url])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-}
-
 fn run(cfg: config::Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
@@ -219,6 +205,14 @@ fn run(cfg: config::Config) -> Result<()> {
         }
         std::fs::create_dir_all(&cfg.thumb_dir)?;
         let hub = Arc::new(recorder::LiveHub::new());
+        let bus = Arc::new(notify::Bus::new());
+        if let Some(url) = cfg.alert_webhook.clone() {
+            tokio::spawn(notify::webhook_sink(bus.clone(), url));
+        }
+        if let Some(m) = cfg.mqtt.clone() {
+            tokio::spawn(notify::mqtt_sink(bus.clone(), db.clone(), m, hub.clone()));
+        }
+        bus.publish(notify::Notification::ServiceStarted { version: env!("CARGO_PKG_VERSION").into() });
         let rctx = Arc::new(recorder::RecorderCtx {
             db: db.clone(),
             hub: hub.clone(),
@@ -232,6 +226,7 @@ fn run(cfg: config::Config) -> Result<()> {
             hub: hub.clone(),
             ffmpeg: cfg.ffmpeg.clone(),
             thumb_dir: cfg.thumb_dir.clone(),
+            bus: bus.clone(),
         });
         detect::reconcile(dctx.clone()).await?;
 
@@ -242,7 +237,7 @@ fn run(cfg: config::Config) -> Result<()> {
             let dctx = dctx.clone();
             let thumb_dir = cfg.thumb_dir.clone();
             let hub = hub.clone();
-            let webhook = cfg.alert_webhook.clone();
+            let bus = bus.clone();
             let alert_after = cfg.alert_after_minutes as i64 * 60 * 90_000;
             let db_path = cfg.db_path.clone();
             tokio::spawn(async move {
@@ -269,11 +264,11 @@ fn run(cfg: config::Config) -> Result<()> {
                         if is_down && !was_down && last != 0 {
                             down.insert(id);
                             tracing::warn!(camera = id, %name, "camera down: no frames for {} min", (now - last) / 90_000 / 60);
-                            notify(&webhook, serde_json::json!({"event": "camera_down", "camera_id": id, "name": name})).await;
+                            bus.publish(notify::Notification::CameraDown { camera_id: id, name });
                         } else if !is_down && was_down {
                             down.remove(&id);
                             tracing::info!(camera = id, %name, "camera recovered");
-                            notify(&webhook, serde_json::json!({"event": "camera_up", "camera_id": id, "name": name})).await;
+                            bus.publish(notify::Notification::CameraUp { camera_id: id, name });
                         }
                     }
                     if last_backup.elapsed() > std::time::Duration::from_secs(24 * 3600) {
@@ -328,6 +323,6 @@ fn run(cfg: config::Config) -> Result<()> {
             });
         }
 
-        api::serve(cfg, db, hub).await
+        api::serve(cfg, db, hub, bus).await
     })
 }

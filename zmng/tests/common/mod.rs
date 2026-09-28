@@ -3,6 +3,7 @@
 //! timestamps), from video encoded by ffmpeg (`lavfi testsrc`). Every HTTP
 //! test drives the real axum router in-process.
 #![allow(dead_code)]
+pub mod mqtt;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -25,6 +26,7 @@ pub struct Fixture {
     pub thumb_dir: PathBuf,
     pub cfg: zmng::config::Config,
     pub hub: Arc<zmng::recorder::LiveHub>,
+    pub bus: Arc<zmng::notify::Bus>,
 }
 
 /// Encode `secs` seconds of synthetic video with ffmpeg as an fMP4 and return
@@ -93,7 +95,7 @@ impl Fixture {
             thumb_dir: thumb_dir.clone(),
             ..Default::default()
         };
-        Fixture { dir, db, storage_id, thumb_dir, cfg, hub: Arc::new(zmng::recorder::LiveHub::new()) }
+        Fixture { dir, db, storage_id, thumb_dir, cfg, hub: Arc::new(zmng::recorder::LiveHub::new()), bus: Arc::new(zmng::notify::Bus::new()) }
     }
 
     pub fn storage_path(&self) -> PathBuf {
@@ -158,7 +160,7 @@ impl Fixture {
     }
 
     pub fn app(&self) -> zmng::api::App {
-        zmng::api::App::new(self.cfg.clone(), self.db.clone(), self.hub.clone())
+        zmng::api::App::new(self.cfg.clone(), self.db.clone(), self.hub.clone(), self.bus.clone())
     }
     pub fn router(&self) -> Router {
         zmng::api::router(self.app())

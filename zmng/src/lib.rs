@@ -8,6 +8,7 @@ pub mod db;
 pub mod detect;
 pub mod import;
 pub mod mp4;
+pub mod notify;
 pub mod recorder;
 pub mod retention;
 pub mod thumbs;

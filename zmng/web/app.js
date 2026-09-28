@@ -610,11 +610,36 @@ $('#login-form').addEventListener('submit', async (e) => {
 $('#logout').addEventListener('click', async () => { await api.post('/api/logout'); location.reload(); });
 setInterval(() => { $('#clock').textContent = new Date().toLocaleString(); }, 1000);
 
+// ---------------------------------------------------------------------------
+// live notifications (SSE): toasts for new events and camera outages
+// ---------------------------------------------------------------------------
+function toast(text, { kind = '', onclick = null, ttl = 8000 } = {}) {
+  let host = $('#toasts');
+  if (!host) { host = h('div', { id: 'toasts' }); document.body.append(host); }
+  const el = h('div', { class: 'toast ' + kind, onclick: () => { el.remove(); onclick?.(); } }, text);
+  host.append(el);
+  setTimeout(() => el.remove(), ttl);
+}
+let sse = null;
+function listen() {
+  if (sse) sse.close();
+  sse = new EventSource('/api/events/stream');
+  sse.addEventListener('event_start', (m) => {
+    const e = JSON.parse(m.data);
+    const what = e.objects?.length ? e.objects.map((o) => o.label).join(', ') : 'motion';
+    toast(`${e.camera_name}: ${what}`, { kind: 'motion', onclick: () => { location.hash = `#/camera/${e.camera_id}/${e.start_ms}`; } });
+  });
+  sse.addEventListener('camera_down', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: not recording`, { kind: 'bad', ttl: 30000 }); });
+  sse.addEventListener('camera_up', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: recording again`, { kind: 'ok' }); });
+  sse.addEventListener('storage_low', (m) => { const e = JSON.parse(m.data); toast(`Storage ${e.path} low: ${gb(e.free_bytes)} free`, { kind: 'bad', ttl: 30000 }); });
+}
+
 async function boot() {
   try { state.me = await api.get('/api/me'); } catch { return; }
   if (state.me.setup_needed) { showLogin(true); return; }
   state.cameras = await api.get('/api/cameras');
   document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = state.me.user.role !== 'admin'; });
+  listen();
   route();
 }
 async function route() {

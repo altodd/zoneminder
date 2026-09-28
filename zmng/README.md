@@ -68,7 +68,27 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/events?camera&start&end&min_score&archived&before&limit&order` | keyset-paged list |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
+| `GET /api/events/stream` | server-sent events: `event_start`, `event_end`, `camera_down`, `camera_up`, `storage_low` |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
+
+## Notifications (Home Assistant, ntfy, the UI, zmNinjaNg)
+
+Every event start/end, camera outage/recovery, storage warning and service start is published on an in-process bus and delivered by whichever sinks are configured:
+
+* **Webhook** — `alert_webhook = "https://host/hook"` in `zmng.toml`: one JSON POST per notification, `{"event": "event_start" | "event_end" | "camera_down" | "camera_up" | "storage_low" | "service_started", ...}`. Event payloads carry `id`, `camera_id`, `camera_name`, `start_ms`, `end_ms`, `score`, `kind`, `thumb` (URL) and `objects` (phase 3 detections).
+* **MQTT + Home Assistant discovery** —
+  ```toml
+  [mqtt]
+  host = "10.10.100.5"
+  port = 1883
+  username = "zmng"
+  password = "..."
+  topic_prefix = "zmng"                # zmng/status, zmng/camera/<id>/{motion,recording,event,thumbnail}
+  discovery_prefix = "homeassistant"   # "" disables discovery
+  ```
+  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280` with a long-lived token (`Authorization: Bearer`, see `POST /api/tokens`).
+* **UI** — `GET /api/events/stream` is a server-sent-events feed of the same notifications, filtered to the cameras the user may see; the web UI shows toasts from it.
+* **zmNinjaNg** — `/zm/ws` speaks the zmeventnotification websocket protocol (auth, `control/version`, `control/filter` with `monlist`/`intlist`, `push/token` registration, `alarm` messages with `DetectionJson`). Point the app's event-server URL at `ws(s)://<host>/zm/ws`.
 
 ## ZoneMinder-compatible API (zmNinjaNg)
 

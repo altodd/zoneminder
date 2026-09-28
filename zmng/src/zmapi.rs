@@ -709,6 +709,153 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
         .unwrap())
 }
 
+
+// ---------------------------------------------------------------------------
+// Event-server websocket (zmeventnotification protocol) for zmNinjaNg
+// ---------------------------------------------------------------------------
+
+const ES_VERSION: &str = "7.0.0";
+
+/// Per-connection notification filter set by the client (`control/filter`).
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct EsFilter {
+    /// monitor ids the client wants (empty = every visible monitor)
+    pub monitors: Vec<i64>,
+    /// per-monitor minimum seconds between alarms, parallel to `monitors`
+    pub intervals: Vec<i64>,
+}
+
+impl EsFilter {
+    pub fn parse(monlist: &str, intlist: &str) -> EsFilter {
+        let monitors: Vec<i64> = monlist.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let mut intervals: Vec<i64> = intlist.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        intervals.resize(monitors.len(), 0);
+        EsFilter { monitors, intervals }
+    }
+    /// Minimum interval for a monitor (0 when unfiltered).
+    pub fn interval(&self, monitor: i64) -> Option<i64> {
+        if self.monitors.is_empty() {
+            return Some(0);
+        }
+        self.monitors.iter().position(|m| *m == monitor).map(|i| self.intervals[i])
+    }
+}
+
+/// The `alarm` message zmNinja parses.
+pub fn es_alarm_json(e: &crate::notify::EventInfo) -> Value {
+    let cause = if e.objects.is_empty() {
+        "Motion".to_string()
+    } else {
+        format!("{} detected", e.objects.iter().map(|o| o.label.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    let detection: Vec<Value> = e
+        .objects
+        .iter()
+        .map(|o| json!({"label": o.label, "confidence": format!("{:.0}%", o.confidence * 100.0), "box": o.bbox}))
+        .collect();
+    json!({
+        "event": "alarm", "type": "", "status": "Success",
+        "events": [{
+            "MonitorId": e.camera_id, "MonitorName": e.camera_name, "EventId": e.id,
+            "Cause": cause, "Name": e.camera_name, "DetectionJson": detection,
+        }]
+    })
+}
+
+async fn es_ws(State(app): State<App>, ws: axum::extract::ws::WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| es_session(app, socket))
+}
+
+async fn es_session(app: App, mut socket: axum::extract::ws::WebSocket) {
+    use axum::extract::ws::Message;
+    use futures::StreamExt;
+    async fn send(socket: &mut axum::extract::ws::WebSocket, v: Value) -> bool {
+        socket.send(Message::Text(v.to_string().into())).await.is_ok()
+    }
+    // 1. authenticate within 20 s
+    let auth = tokio::time::timeout(std::time::Duration::from_secs(20), socket.next()).await;
+    let msg: Value = match auth {
+        Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str(&t).unwrap_or(Value::Null),
+        _ => return,
+    };
+    let user = if msg["event"] == "auth" {
+        let (u, p) = (msg["data"]["user"].as_str().unwrap_or(""), msg["data"]["password"].as_str().unwrap_or(""));
+        if !app.login_guard.lock().allowed() {
+            let _ = send(&mut socket, json!({"event": "auth", "type": "", "status": "Fail", "reason": "BADAUTH"})).await;
+            return;
+        }
+        let user = app.db.user_by_name(u).ok().flatten();
+        let ok = user.as_ref().map(|x| crate::api::verify_password_pub(p, &x.pass_hash)).unwrap_or(false);
+        if !ok {
+            hash_password_dummy();
+            app.login_guard.lock().record_failure();
+            let _ = send(&mut socket, json!({"event": "auth", "type": "", "status": "Fail", "reason": "BADAUTH"})).await;
+            return;
+        }
+        user.unwrap()
+    } else {
+        let _ = send(&mut socket, json!({"event": "auth", "type": "", "status": "Fail", "reason": "NOAUTH"})).await;
+        return;
+    };
+    if !send(&mut socket, json!({"event": "auth", "type": "", "status": "Success", "reason": "", "version": ES_VERSION})).await {
+        return;
+    }
+    info!(user = %user.username, "event-server websocket connected");
+    let mut filter = EsFilter::default();
+    let mut last_sent: HashMap<i64, i64> = HashMap::new();
+    let mut rx = app.bus.subscribe();
+    loop {
+        tokio::select! {
+            m = socket.next() => {
+                let v: Value = match m {
+                    Some(Ok(Message::Text(t))) => serde_json::from_str(&t).unwrap_or(Value::Null),
+                    Some(Ok(Message::Ping(p))) => { let _ = socket.send(Message::Pong(p)).await; continue; }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    _ => continue,
+                };
+                let typ = v["data"]["type"].as_str().unwrap_or("");
+                let reply: Option<Value> = match (v["event"].as_str().unwrap_or(""), typ) {
+                    ("control", "version") => Some(json!({"event": "control", "type": "version", "status": "Success", "reason": "", "version": ES_VERSION})),
+                    ("control", "filter") => {
+                        filter = EsFilter::parse(v["data"]["monlist"].as_str().unwrap_or(""), v["data"]["intlist"].as_str().unwrap_or(""));
+                        Some(json!({"event": "control", "type": "filter", "status": "Success", "reason": ""}))
+                    }
+                    ("push", "token") => {
+                        let d = &v["data"];
+                        let g = |k: &str| d[k].as_str().unwrap_or("").to_string();
+                        let res = app.db.upsert_push_token(user.id, &g("token"), &g("platform"), &g("monlist"), 0, &g("state"), &g("appversion"), &g("profile"));
+                        let (status, reason) = match res { Ok(_) => ("Success", String::new()), Err(e) => ("Fail", e.to_string()) };
+                        Some(json!({"event": "push", "type": "token", "status": status, "reason": reason}))
+                    }
+                    ("push", _) => Some(json!({"event": "push", "type": typ, "status": "Success", "reason": ""})),
+                    _ => None,
+                };
+                if let Some(r) = reply {
+                    if !send(&mut socket, r).await { return; }
+                }
+            }
+            n = rx.recv() => {
+                let n = match n {
+                    Ok(n) => n,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return,
+                };
+                let crate::notify::Notification::EventStart(e) = n else { continue };
+                if !crate::api::visible_cameras_pub(&app, &user).contains(&e.camera_id) {
+                    continue;
+                }
+                let Some(min_secs) = filter.interval(e.camera_id) else { continue };
+                let now = crate::db::now_secs();
+                if last_sent.get(&e.camera_id).is_some_and(|t| now - t < min_secs) {
+                    continue;
+                }
+                last_sent.insert(e.camera_id, now);
+                if !send(&mut socket, es_alarm_json(&e)).await { return; }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 pub fn router() -> Router<App> {
@@ -741,6 +888,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/{*rest}", get(empty_list))
         .route("/zm/index.php", get(index_php))
         .route("/zm/cgi-bin/nph-zms", get(nph_zms))
+        .route("/zm/ws", get(es_ws))
 }
 
 #[cfg(test)]
@@ -757,6 +905,27 @@ mod tests {
         assert_eq!(f.ids, vec![1, 2, 3]);
         let g = parse_filter("index.json");
         assert!(g.monitors.is_empty());
+    }
+
+    #[test]
+    fn es_filter_and_alarm() {
+        let f = EsFilter::parse("1,2", "0,60");
+        assert_eq!(f.interval(1), Some(0));
+        assert_eq!(f.interval(2), Some(60));
+        assert_eq!(f.interval(3), None);
+        assert_eq!(EsFilter::default().interval(9), Some(0));
+        let short = EsFilter::parse("4,5", "30");
+        assert_eq!(short.interval(5), Some(0));
+        let e = crate::notify::EventInfo { id: 12, camera_id: 3, camera_name: "Front".into(), start_ms: 0, end_ms: None, score: 1, kind: "person".into(), thumb: None,
+            objects: vec![crate::notify::DetectedObject { label: "person".into(), confidence: 0.91, bbox: [0.1, 0.1, 0.5, 0.9] }] };
+        let a = es_alarm_json(&e);
+        assert_eq!(a["event"], "alarm");
+        assert_eq!(a["events"][0]["MonitorId"], 3);
+        assert_eq!(a["events"][0]["EventId"], 12);
+        assert_eq!(a["events"][0]["Cause"], "person detected");
+        assert_eq!(a["events"][0]["DetectionJson"][0]["confidence"], "91%");
+        let plain = crate::notify::EventInfo { objects: vec![], ..e };
+        assert_eq!(es_alarm_json(&plain)["events"][0]["Cause"], "Motion");
     }
 
     #[test]
