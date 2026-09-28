@@ -132,3 +132,9 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 
 /* detected objects */
 .event .labels { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0; }
+
+/* PTZ pad */
+.ptz { position: absolute; right: 10px; bottom: 10px; background: rgba(0,0,0,.6); border-radius: 8px; padding: 6px; display: grid; gap: 6px; }
+.ptz .pad { display: grid; grid-template-columns: repeat(3, 34px); gap: 3px; }
+.ptz button { width: 34px; height: 30px; padding: 0; touch-action: none; user-select: none; }
+.ptz select { width: auto; padding: 4px 6px; }

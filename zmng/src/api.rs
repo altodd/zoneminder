@@ -38,6 +38,8 @@ pub struct App {
     pub started_ms: i64,
     /// on-demand H.264 transcode (None = not configured)
     pub transcoder: Option<Arc<crate::transcode::Transcoder>>,
+    /// pending PTZ auto-stop timers per camera
+    pub ptz_timers: Arc<parking_lot::Mutex<std::collections::HashMap<i64, tokio::task::AbortHandle>>>,
 }
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
@@ -326,10 +328,14 @@ fn camera_out(app: &App, c: crate::db::Camera, admin: bool) -> CameraOut {
     let detect = crate::detect::status(&app.hub, c.id);
     let mut c = c;
     if !admin || app.db.user_count().unwrap_or(1) == 0 {
-        // never leak RTSP credentials to viewers
+        // never leak RTSP/ONVIF credentials or internal URLs to viewers
         c.main_url = String::new();
         c.sub_url = None;
+        c.onvif_url = String::new();
+        c.onvif_user = String::new();
+        c.ptz_url = String::new();
     }
+    c.onvif_pass = String::new();
     CameraOut { camera: c, status, sub_status, detect }
 }
 
@@ -847,6 +853,101 @@ async fn preview_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query
     }
 }
 
+// ---------------------------------------------------------------------------
+// PTZ (ONVIF)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PtzReq {
+    /// move | stop | preset | set_preset | home
+    action: String,
+    #[serde(default)]
+    pan: f64,
+    #[serde(default)]
+    tilt: f64,
+    #[serde(default)]
+    zoom: f64,
+    /// auto-stop after this many seconds (0 = keep moving until `stop`)
+    #[serde(default)]
+    seconds: f64,
+    preset: Option<String>,
+    name: Option<String>,
+}
+
+fn ptz_client(cam: &crate::db::Camera) -> Result<(crate::onvif::Client, String, String), Response> {
+    if !cam.ptz || cam.ptz_url.is_empty() || cam.ptz_profile.is_empty() {
+        return Err(bad("camera has no PTZ (run the PTZ probe first)"));
+    }
+    let (u, p) = crate::onvif::credentials(cam);
+    let c = crate::onvif::Client::new(&u, &p).map_err(err500)?;
+    Ok((c, cam.ptz_url.clone(), cam.ptz_profile.clone()))
+}
+
+fn ptz_err(e: anyhow::Error) -> Response {
+    (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("camera: {e:#}")}))).into_response()
+}
+
+/// Discover the camera's ONVIF media/PTZ services and store them.
+async fn ptz_probe(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let cam = app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?;
+    let device = crate::onvif::default_device_url(&cam).ok_or_else(|| bad("set onvif_url or a main_url with a host"))?;
+    let (u, p) = crate::onvif::credentials(&cam);
+    let c = crate::onvif::Client::new(&u, &p).map_err(err500)?;
+    let probe = c.probe(&device).await.map_err(ptz_err)?;
+    let patch = serde_json::json!({"ptz": true, "ptz_url": probe.ptz_url, "ptz_profile": probe.profile, "onvif_url": device});
+    app.db.update_camera(id, patch.as_object().unwrap()).map_err(err500)?;
+    Ok(Json(serde_json::json!({"ok": true, "ptz_url": probe.ptz_url, "media_url": probe.media_url, "profile": probe.profile})).into_response())
+}
+
+/// Move/stop/preset. Admins only: a PTZ move changes what every viewer sees.
+async fn ptz_command(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<PtzReq>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let cam = app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?;
+    let (c, url, profile) = ptz_client(&cam)?;
+    // any new command cancels a pending auto-stop
+    if let Some(t) = app.ptz_timers.lock().remove(&id) {
+        t.abort();
+    }
+    match req.action.as_str() {
+        "move" => {
+            if req.pan.abs() > 1.0 || req.tilt.abs() > 1.0 || req.zoom.abs() > 1.0 {
+                return Err(bad("pan/tilt/zoom must be within -1..1"));
+            }
+            c.continuous_move(&url, &profile, req.pan, req.tilt, req.zoom).await.map_err(ptz_err)?;
+            if req.seconds > 0.0 {
+                let (c2, url2, profile2) = (c, url.clone(), profile.clone());
+                let secs = req.seconds.min(30.0);
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+                    if let Err(e) = c2.stop(&url2, &profile2).await {
+                        tracing::warn!(camera = id, "ptz auto-stop: {e:#}");
+                    }
+                });
+                app.ptz_timers.lock().insert(id, handle.abort_handle());
+            }
+        }
+        "stop" => c.stop(&url, &profile).await.map_err(ptz_err)?,
+        "preset" => c.goto_preset(&url, &profile, req.preset.as_deref().ok_or_else(|| bad("preset required"))?).await.map_err(ptz_err)?,
+        "set_preset" => {
+            let token = c.set_preset(&url, &profile, req.name.as_deref().ok_or_else(|| bad("name required"))?).await.map_err(ptz_err)?;
+            return Ok(Json(serde_json::json!({"ok": true, "preset": token})).into_response());
+        }
+        "home" => c.goto_home(&url, &profile).await.map_err(ptz_err)?,
+        _ => return Err(bad("action must be move, stop, preset, set_preset or home")),
+    }
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+async fn ptz_presets(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    can_see(&app, u, id)?;
+    let cam = app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?;
+    let (c, url, profile) = ptz_client(&cam)?;
+    let presets = c.presets(&url, &profile).await.map_err(ptz_err)?;
+    Ok(Json(presets).into_response())
+}
+
 #[derive(Deserialize)]
 struct PreviewQ {
     t: i64,
@@ -1094,6 +1195,7 @@ impl App {
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
             started_ms: crate::db::now_dts() / 90,
             transcoder,
+            ptz_timers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -1120,6 +1222,9 @@ pub fn router(app: App) -> Router {
         .route("/api/cameras/{id}/snapshot.jpg", get(snapshot))
         .route("/api/cameras/{id}/frame.jpg", get(frame_at))
         .route("/api/cameras/{id}/preview.jpg", get(preview_at))
+        .route("/api/cameras/{id}/ptz", post(ptz_command))
+        .route("/api/cameras/{id}/ptz/probe", post(ptz_probe))
+        .route("/api/cameras/{id}/ptz/presets", get(ptz_presets))
         .route("/api/cameras/{id}/previews", get(preview_hours))
         .route("/api/cameras/{id}/previews/{hour}", get(preview_sprite))
         .route("/api/segments/{id}/file.mp4", get(segment_file))

@@ -224,7 +224,7 @@ fn monitor_json(app: &App, c: &crate::db::Camera, seq: usize) -> Value {
             "Id": c.id.to_string(), "Name": c.name, "Type": "Ffmpeg", "Function": "Mocord",
             "Capturing": "Always", "Analysing": "Always", "Recording": "Always", "Decoding": "Always",
             "Enabled": if c.enabled { "1" } else { "0" }, "Width": st.width.to_string(), "Height": st.height.to_string(),
-            "Orientation": "ROTATE_0", "Controllable": "0", "ControlId": null, "ServerId": null, "StorageId": c.storage_id.to_string(),
+            "Orientation": "ROTATE_0", "Controllable": if c.ptz { "1" } else { "0" }, "ControlId": if c.ptz { json!("1") } else { Value::Null }, "ServerId": null, "StorageId": c.storage_id.to_string(),
             "Sequence": seq.to_string(), "Deleted": false, "LinkedMonitors": null, "Path": "", "Options": null,
             "StreamChannel": "CameraDirectSecondary", "RTSPServer": "0", "Go2RTCEnabled": go2rtc, "Go2RTCType": null,
             "RTSP2WebEnabled": false, "JanusEnabled": false, "DefaultPlayer": null, "Colours": "4",
@@ -530,7 +530,10 @@ async fn index_php(State(app): State<App>, RawQuery(raw): RawQuery, headers: Hea
             Ok(([(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")], m3u8).into_response())
         }
         "request" => {
-            // stream control (pause/quit/query) and PTZ: acknowledge
+            if q.get("request").map(|s| s.as_str()) == Some("control") {
+                return zm_control(&app, u, &q).await;
+            }
+            // stream control (pause/quit/query): acknowledge
             let cmd = q.get("command").map(|s| s.as_str()).unwrap_or("");
             if cmd == "99" {
                 return Ok(Json(json!({"result": "Ok", "status": {"progress": 0, "duration": 0, "rate": 1, "zoom": 1, "paused": 0, "delayed": 0}})).into_response());
@@ -539,6 +542,66 @@ async fn index_php(State(app): State<App>, RawQuery(raw): RawQuery, headers: Hea
         }
         _ => Err(err(StatusCode::NOT_FOUND, "unsupported view")),
     }
+}
+
+/// ZoneMinder control command name -> (pan, tilt, zoom) velocity, or None
+/// for stop. Presets are handled separately.
+pub fn zm_control_velocity(control: &str) -> Option<Option<(f64, f64, f64)>> {
+    let v = match control {
+        "moveConUp" => (0.0, 1.0, 0.0),
+        "moveConDown" => (0.0, -1.0, 0.0),
+        "moveConLeft" => (-1.0, 0.0, 0.0),
+        "moveConRight" => (1.0, 0.0, 0.0),
+        "moveConUpLeft" => (-1.0, 1.0, 0.0),
+        "moveConUpRight" => (1.0, 1.0, 0.0),
+        "moveConDownLeft" => (-1.0, -1.0, 0.0),
+        "moveConDownRight" => (1.0, -1.0, 0.0),
+        "zoomConTele" => (0.0, 0.0, 1.0),
+        "zoomConWide" => (0.0, 0.0, -1.0),
+        "moveStop" | "zoomStop" => return Some(None),
+        _ => return None,
+    };
+    Some(Some(v))
+}
+
+/// `index.php?view=request&request=control&id=<mid>&control=<cmd>[&preset=N]`
+async fn zm_control(app: &App, u: &User, q: &HashMap<String, String>) -> ApiResult {
+    if u.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "Insufficient privileges"));
+    }
+    let mid: i64 = q.get("id").and_then(|s| s.parse().ok()).ok_or_else(|| err(StatusCode::BAD_REQUEST, "id required"))?;
+    let cam = app.db.camera(mid).map_err(e500)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
+    if !cam.ptz || cam.ptz_url.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "monitor is not controllable"));
+    }
+    let (user, pass) = crate::onvif::credentials(&cam);
+    let c = crate::onvif::Client::new(&user, &pass).map_err(e500)?;
+    let control = q.get("control").map(|s| s.as_str()).unwrap_or("");
+    let res = match control {
+        "presetGoto" => {
+            let p = q.get("preset").cloned().unwrap_or_default();
+            c.goto_preset(&cam.ptz_url, &cam.ptz_profile, &p).await
+        }
+        "presetHome" => c.goto_home(&cam.ptz_url, &cam.ptz_profile).await,
+        other => match zm_control_velocity(other) {
+            Some(Some((p, t, z))) => c.continuous_move(&cam.ptz_url, &cam.ptz_profile, p, t, z).await,
+            Some(None) => c.stop(&cam.ptz_url, &cam.ptz_profile).await,
+            None => return Err(err(StatusCode::BAD_REQUEST, "unsupported control")),
+        },
+    };
+    res.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("camera: {e:#}")))?;
+    Ok(Json(json!({"result": "Ok"})).into_response())
+}
+
+/// `/zm/api/controls/1.json`: one generic continuous-move PTZ control.
+async fn control_one(Path(_id): Path<String>) -> Response {
+    Json(json!({"control": {"Control": {
+        "Id": "1", "Name": "ONVIF", "Type": "Remote", "Protocol": "onvif", "CanWake": "0", "CanSleep": "0", "CanReset": "0",
+        "CanZoom": "1", "CanAutoZoom": "0", "CanZoomAbs": "0", "CanZoomRel": "0", "CanZoomCon": "1", "MinZoomRange": null, "MaxZoomRange": null,
+        "CanFocus": "0", "CanIris": "0", "CanGain": "0", "CanWhite": "0",
+        "CanMove": "1", "CanMoveDiag": "1", "CanMoveMap": "0", "CanMoveAbs": "0", "CanMoveRel": "0", "CanMoveCon": "1",
+        "CanPan": "1", "CanTilt": "1", "HasPresets": "1", "NumPresets": "8", "HasHomePreset": "1", "CanSetPresets": "0"
+    }}})).into_response()
 }
 
 /// A complete MP4 (Content-Length + Accept-Ranges) cut from the recording.
@@ -883,6 +946,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/monitors/alarm/{*rest}", get(monitor_alarm))
         .route("/zm/api/monitors/daemonStatus/{*rest}", get(monitor_daemon))
         .route("/zm/api/monitors/{id}", get(monitor_one).post(saved))
+        .route("/zm/api/controls/{id}", get(control_one))
         .route("/zm/api/events/index.json", get(events_index))
         .route("/zm/api/events/index/{*filters}", get(events_index))
         .route("/zm/api/events/consoleEvents/{interval}", get(console_events))

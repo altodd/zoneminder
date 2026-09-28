@@ -84,6 +84,18 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
 
+## PTZ (ONVIF)
+
+For a camera with a motorized head, `Admin → Cameras → Edit → Probe PTZ (ONVIF)` asks the device service (`onvif_url`, default `http://<camera host>/onvif/device_service`, with the RTSP credentials unless `onvif_user`/`onvif_pass` are set) for its Media and PTZ services and a PTZ-capable profile, and stores them. The camera page then shows a pad: hold an arrow to move (ContinuousMove, auto-stop after 10 s as a safety net), release to stop, zoom, presets and home. Admins only: a move changes what every viewer sees.
+
+| Method/path | Purpose |
+|---|---|
+| `POST /api/cameras/{id}/ptz/probe` | discover ONVIF media/PTZ URLs and profile, mark the camera `ptz` |
+| `POST /api/cameras/{id}/ptz` `{action: move, pan, tilt, zoom, seconds}` / `{action: stop}` / `{action: preset, preset}` / `{action: set_preset, name}` / `{action: home}` | ContinuousMove (velocities -1..1, optional auto-stop), Stop, GotoPreset, SetPreset, GotoHomePosition |
+| `GET /api/cameras/{id}/ptz/presets` | `[{token, name}]` |
+
+zmNinjaNg sees PTZ cameras as `Controllable` with the generic control `/zm/api/controls/1.json`; its `moveCon*`, `zoomCon*`, `moveStop`, `presetGoto` and `presetHome` requests map onto the same ONVIF calls.
+
 ## H.264 fallback for browsers without HEVC
 
 Safari, and Chrome/Edge on machines with an HEVC decoder, play the 4 MP HEVC recording directly. Everything else (Firefox, Linux desktops, older Windows boxes) gets the H.264 substream — or, with a transcoder configured, the full-resolution picture re-encoded on demand:
@@ -137,7 +149,7 @@ Every event start/end, camera outage/recovery, storage warning and service start
 
 ## ZoneMinder-compatible API (zmNinjaNg)
 
-Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive (delete is admin-only) with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration, and the event-server websocket at `/zm/ws`. Not yet: push delivery (needs the zmNinjaNg FCM relay), PTZ.
+Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive (delete is admin-only) with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration, PTZ control for probed cameras, and the event-server websocket at `/zm/ws`. Not yet: push delivery (needs the zmNinjaNg FCM relay).
 
 ## Storage tiering and retention
 

@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS camera (
   objects          INTEGER NOT NULL DEFAULT 1,
   object_labels    TEXT NOT NULL DEFAULT '',
   require_object   INTEGER NOT NULL DEFAULT 0,
+  -- ONVIF PTZ: device service URL (default http://<rtsp host>/onvif/device_service),
+  -- credentials (default: the RTSP URL's), and what `probe` discovered
+  onvif_url        TEXT NOT NULL DEFAULT '',
+  onvif_user       TEXT NOT NULL DEFAULT '',
+  onvif_pass       TEXT NOT NULL DEFAULT '',
+  ptz              INTEGER NOT NULL DEFAULT 0,
+  ptz_url          TEXT NOT NULL DEFAULT '',
+  ptz_profile      TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
 );
 
@@ -175,7 +183,7 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
                 anyhow::bail!("{k} must be a non-empty string");
             }
         }
-        "tags" | "object_labels" => {
+        "tags" | "object_labels" | "onvif_url" | "onvif_user" | "onvif_pass" | "ptz_url" | "ptz_profile" => {
             if !v.is_string() {
                 anyhow::bail!("{k} must be a string");
             }
@@ -186,7 +194,7 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
             }
         }
         "event_retention_days" => num(0.0, 3650.0)?,
-        "enabled" | "record_sub" | "objects" | "require_object" => {
+        "enabled" | "record_sub" | "objects" | "require_object" | "ptz" => {
             if !(v.is_boolean() || v.as_i64().map(|i| i == 0 || i == 1).unwrap_or(false)) {
                 anyhow::bail!("enabled must be true/false");
             }
@@ -232,6 +240,9 @@ fn migrate(c: &Connection) -> Result<()> {
     }
     if !has_col("camera", "tags")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !has_col("camera", "ptz")? {
+        c.execute_batch("ALTER TABLE camera ADD COLUMN onvif_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_user TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_pass TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz INTEGER NOT NULL DEFAULT 0; ALTER TABLE camera ADD COLUMN ptz_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz_profile TEXT NOT NULL DEFAULT '';")?;
     }
     if !has_col("camera", "objects")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN objects INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN object_labels TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN require_object INTEGER NOT NULL DEFAULT 0;")?;
@@ -286,6 +297,28 @@ pub struct Camera {
     pub objects: bool,
     pub object_labels: String,
     pub require_object: bool,
+    pub onvif_url: String,
+    pub onvif_user: String,
+    /// never serialized: viewers must not see it
+    #[serde(skip_serializing)]
+    pub onvif_pass: String,
+    pub ptz: bool,
+    pub ptz_url: String,
+    pub ptz_profile: String,
+}
+
+impl Camera {
+    /// A camera with default settings (tests, examples).
+    pub fn example() -> Camera {
+        Camera {
+            id: 1, name: "cam".into(), main_url: "rtsp://u:p@10.0.0.1/1".into(), sub_url: None, enabled: true, storage_id: 1,
+            retention_days: 30.0, detect_fps: 5.0, detect_width: 320, detect_height: 180, pixel_threshold: 25, min_area_pct: 1.0,
+            min_blob_pct: 0.5, pre_secs: 5.0, post_secs: 8.0, cooldown_secs: 10.0, zones_json: "[]".into(), masks_json: "[]".into(),
+            sort_order: 0, record_sub: true, event_retention_days: 0.0, tags: String::new(), objects: true, object_labels: String::new(),
+            require_object: false, onvif_url: String::new(), onvif_user: String::new(), onvif_pass: String::new(), ptz: false,
+            ptz_url: String::new(), ptz_profile: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -522,6 +555,12 @@ impl Db {
             objects: r.get::<_, i64>("objects")? != 0,
             object_labels: r.get("object_labels")?,
             require_object: r.get::<_, i64>("require_object")? != 0,
+            onvif_url: r.get("onvif_url")?,
+            onvif_user: r.get("onvif_user")?,
+            onvif_pass: r.get("onvif_pass")?,
+            ptz: r.get::<_, i64>("ptz")? != 0,
+            ptz_url: r.get("ptz_url")?,
+            ptz_profile: r.get("ptz_profile")?,
         })
     }
 
@@ -556,6 +595,7 @@ impl Db {
             "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
             "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
             "record_sub", "event_retention_days", "tags", "objects", "object_labels", "require_object",
+            "onvif_url", "onvif_user", "onvif_pass", "ptz", "ptz_url", "ptz_profile",
         ];
         self.with(|c| {
             for (k, v) in patch {

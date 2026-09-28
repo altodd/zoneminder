@@ -318,6 +318,7 @@ async function viewCamera(main, camId, atMs) {
     h('button', { class: 'ghost', onclick: () => { location.hash = '#/events'; localStorage.setItem('evCam', cam.id); } }, 'Events'),
     h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s'));
   main.replaceChildren(head, player, tl.el, controls);
+  if (cam.ptz && state.me.user.role === 'admin') player.append(ptzPad(cam));
 
   const mse = new MsePlayer(video);
   let playRange = null;
@@ -366,6 +367,21 @@ async function viewCamera(main, camId, atMs) {
     if (range.end >= Date.now() - 20000) { range.end = Date.now(); range.start = range.end - windowMs; tl.load(); }
   }, 15000);
   state.cleanup = () => { clearInterval(tick); clearInterval(snapTimer); mse.stop(); tl.destroy(); document.removeEventListener('keydown', keys); };
+}
+
+// PTZ pad: hold an arrow to move, release to stop; zoom; presets; home.
+function ptzPad(cam) {
+  const send = (body) => api.post(`/api/cameras/${cam.id}/ptz`, body).catch((e) => toast(`PTZ: ${e.message}`, { kind: 'bad' }));
+  const hold = (pan, tilt, zoom) => ({
+    onpointerdown: (e) => { e.preventDefault(); e.target.setPointerCapture(e.pointerId); send({ action: 'move', pan, tilt, zoom, seconds: 10 }); },
+    onpointerup: () => send({ action: 'stop' }), onpointercancel: () => send({ action: 'stop' }),
+  });
+  const btn = (label, pan, tilt, zoom, cls = '') => h('button', { class: 'ghost small ' + cls, ...hold(pan, tilt, zoom) }, label);
+  const presets = h('select', { onchange: (e) => { if (e.target.value) send({ action: 'preset', preset: e.target.value }); e.target.value = ''; } }, h('option', { value: '' }, 'Preset…'));
+  api.get(`/api/cameras/${cam.id}/ptz/presets`).then((ps) => ps.forEach((p) => presets.append(h('option', { value: p.token }, p.name)))).catch(() => {});
+  return h('div', { class: 'ptz' },
+    h('div', { class: 'pad' }, btn('↖', -1, 1, 0), btn('↑', 0, 1, 0), btn('↗', 1, 1, 0), btn('←', -1, 0, 0), h('button', { class: 'ghost small', onclick: () => send({ action: 'home' }) }, '⌂'), btn('→', 1, 0, 0), btn('↙', -1, -1, 0), btn('↓', 0, -1, 0), btn('↘', 1, -1, 0)),
+    h('div', { class: 'row' }, btn('－', 0, 0, -1), btn('＋', 0, 0, 1), presets));
 }
 
 // ---------------------------------------------------------------------------
@@ -598,15 +614,16 @@ async function viewAdmin(main) {
 }
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
 function editCamera(c) {
-  const fields = [['name', 'Name'], ['tags', 'Groups (comma separated, e.g. Outside, CBA)'], ['object_labels', 'Object labels (comma separated; blank = server default)'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
-  const strings = ['name', 'tags', 'object_labels', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
+  const fields = [['name', 'Name'], ['tags', 'Groups (comma separated, e.g. Outside, CBA)'], ['object_labels', 'Object labels (comma separated; blank = server default)'], ['onvif_url', 'ONVIF device service URL (blank = http://<camera host>/onvif/device_service)'], ['onvif_user', 'ONVIF user (blank = RTSP user)'], ['onvif_pass', 'ONVIF password (blank = RTSP password; never shown)'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
+  const strings = ['name', 'tags', 'object_labels', 'onvif_url', 'onvif_user', 'onvif_pass', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
   const inputs = {};
-  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v); if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; patch.objects = inputs.objects.checked; patch.require_object = inputs.require_object.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); state.cameras = await api.get('/api/cameras'); route(); } catch (err) { errEl.textContent = err.message; } } },
+  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v); if (k === 'onvif_pass' && v === '') continue; if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; patch.objects = inputs.objects.checked; patch.require_object = inputs.require_object.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); state.cameras = await api.get('/api/cameras'); route(); } catch (err) { errEl.textContent = err.message; } } },
     ...fields.map(([k, l]) => h('label', {}, l, inputs[k] = h('input', { value: c[k] ?? '' }))),
     h('label', { class: 'row' }, inputs.enabled = h('input', { type: 'checkbox', style: 'width:auto', checked: c.enabled }), ' Enabled'),
     h('label', { class: 'row' }, inputs.record_sub = h('input', { type: 'checkbox', style: 'width:auto', checked: c.record_sub }), ' Record substream too (review, phones, previews)'),
     h('label', { class: 'row' }, inputs.objects = h('input', { type: 'checkbox', style: 'width:auto', checked: c.objects }), ' Object detection on motion (needs [objects] in zmng.toml)'),
     h('label', { class: 'row' }, inputs.require_object = h('input', { type: 'checkbox', style: 'width:auto', checked: c.require_object }), ' Only keep events with a detected object'),
+    h('div', { class: 'row' }, h('span', { class: 'muted small' }, c.ptz ? `PTZ: ${c.ptz_url} profile ${c.ptz_profile}` : 'PTZ: not probed'), h('button', { type: 'button', class: 'ghost small', onclick: async () => { try { const r = await api.post(`/api/cameras/${c.id}/ptz/probe`); errEl.textContent = `PTZ found: ${r.ptz_url} (profile ${r.profile})`; } catch (e) { errEl.textContent = `PTZ probe: ${e.message}`; } } }, 'Probe PTZ (ONVIF)')),
     h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
   const errEl = h('p', { class: 'err' });
   const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Camera ${c.id}`), form, errEl));
