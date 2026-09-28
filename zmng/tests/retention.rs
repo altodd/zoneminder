@@ -192,6 +192,16 @@ fn unmarked_storage_root_is_treated_as_unmounted() {
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
     assert!(fx.db.segment(old).unwrap().is_none());
     assert!(zmng::health::report(&fx.db, &fx.hub, 0, 0, &[cam], true).unwrap().storages[0].available);
+    // an install that predates the marker: opening the index writes it, and
+    // add-storage on the same path repairs it without a second row
+    std::fs::remove_file(&marker).unwrap();
+    let reopened = zmng::db::Db::open(&fx.dir.path().join("zmng.db")).unwrap();
+    assert!(marker.is_file(), "migration writes the marker for existing storages");
+    std::fs::remove_file(&marker).unwrap();
+    let same = reopened.add_storage(fx.storage_path().to_str().unwrap(), None, 0).unwrap();
+    assert_eq!(same, fx.storage_id);
+    assert!(marker.is_file());
+    assert_eq!(reopened.storages().unwrap().len(), 1);
     // a read-only tree only has to exist
     let ro = fx.dir.path().join("zm-events");
     std::fs::create_dir_all(&ro).unwrap();
@@ -281,4 +291,34 @@ fn space_budget_deletes_unpinned_footage_first() {
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
     assert!(fx.db.segment(pinned).unwrap().is_some(), "archived event footage kept");
     assert!(fx.db.segment(plain).unwrap().is_none(), "the unpinned segment paid for the budget");
+    // at the hard floor the pin no longer holds
+    let free = zmng::retention::fs_free_bytes(&fx.storage_path()).unwrap() as i64;
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"reserve_bytes": free * 4}).as_object().unwrap()).unwrap();
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(pinned).unwrap().is_none(), "floor: pinned footage goes too");
+}
+
+/// Retention deletes a segment while tiering is copying it: the copy is
+/// discarded, the counters stay right, and the pass carries on.
+#[test]
+fn tiering_survives_a_segment_deleted_during_the_copy() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    let archive = fx.dir.path().join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    let arch_id = fx.db.add_storage(archive.to_str().unwrap(), None, 0).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let gone = fx.write_segment(cam, "main", &enc, dts(now_secs() - 3 * 86_400), |_| 0);
+    let used_before = fx.db.storage_used_bytes(fx.storage_id).unwrap();
+    // the row vanishes between the candidate query and the index switch
+    fx.db.delete_segment(gone).unwrap();
+    assert!(!fx.db.move_segment(gone, arch_id).unwrap(), "a vanished row is not moved");
+    assert_eq!(fx.db.storage_used_bytes(fx.storage_id).unwrap(), 0);
+    assert_eq!(fx.db.storage_used_bytes(arch_id).unwrap(), 0);
+    assert!(used_before > 0);
+    // moving a row that is already on the target is a no-op too
+    let stays = fx.write_segment(cam, "main", &enc, dts(now_secs() - 60), |_| 0);
+    fx.db.move_segment(stays, arch_id).unwrap();
+    assert!(!fx.db.move_segment(stays, arch_id).unwrap());
+    assert_eq!(fx.db.storage_used_bytes(arch_id).unwrap(), fx.db.segment(stays).unwrap().unwrap().bytes);
 }

@@ -729,7 +729,11 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
         let f = r.frags.back().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no frames yet"))?;
         (r.init.clone(), f.2.clone())
     };
-    let _permit = app.mjpeg_sem.clone().acquire_owned().await.map_err(e500)?;
+    // fail fast: a montage that opens more streams than the pool gets a 503
+    // it can retry, not a hung request
+    let _permit = app.mjpeg_sem.clone().try_acquire_owned().map_err(|_| {
+        (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "2")], "too many MJPEG streams; use the web UI or zmNinja's substream").into_response()
+    })?;
     let mut child = tokio::process::Command::new(&app.cfg.ffmpeg)
         .args([
             "-nostdin", "-loglevel", "error", "-threads", "1", "-fflags", "nobuffer", "-flags", "low_delay",

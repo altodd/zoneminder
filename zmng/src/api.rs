@@ -1246,7 +1246,9 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
     if parsed.host_str() != base.host_str() || parsed.port_or_known_default() != base.port_or_known_default() || parsed.scheme() != base.scheme() {
         return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
     }
-    if crate::peers::allowed(req.method(), parsed.path()) != Some(need_admin) {
+    // a peer may live under a path prefix (https://host/zmng)
+    let rel_path = parsed.path().strip_prefix(base.path().trim_end_matches('/')).unwrap_or(parsed.path()).to_string();
+    if crate::peers::allowed(req.method(), &rel_path) != Some(need_admin) {
         return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
     }
     let method = req.method().clone();
@@ -1267,7 +1269,7 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
     }
     // the peer token may belong to an admin there: camera JSON is stripped of
     // RTSP/ONVIF URLs and credentials whatever the peer returned
-    let strip = method == axum::http::Method::GET && (parsed.path() == "/api/cameras" || parsed.path().starts_with("/api/cameras/") && !parsed.path()[13..].contains('/'));
+    let strip = method == axum::http::Method::GET && (rel_path == "/api/cameras" || rel_path.starts_with("/api/cameras/") && !rel_path[13..].contains('/'));
     if strip {
         let ct = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         let status = res.status().as_u16();

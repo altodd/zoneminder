@@ -239,7 +239,7 @@ impl Store {
         if closed {
             // atomic: a concurrent reader never sees a half-written cache file
             for (target, data) in [(&jpg, bytes.clone()), (&json, manifest.to_string().into_bytes())] {
-                let tmp = target.with_extension("tmp");
+                let tmp = std::path::PathBuf::from(format!("{}.tmp", target.display()));
                 if std::fs::write(&tmp, &data).is_ok() {
                     let _ = std::fs::rename(&tmp, target);
                 }

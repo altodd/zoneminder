@@ -550,6 +550,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
                 if since.elapsed() > Duration::from_secs(30) {
                     warn!(camera = cam.id, drift_ms = drift / 90, "re-anchoring clock to wallclock");
                     anchor = Some((elapsed_90k, wall_now));
+                    audio_anchor = None; // audio follows the new clock from its next packet
                     dts = wall_now;
                     drift_bad_since = None;
                     if dts <= last_dts {

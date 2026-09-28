@@ -97,6 +97,28 @@ async fn proxy_serves_peer_cameras_events_and_media_with_the_peer_acl() {
     assert_eq!(call(&r, "GET", "/api/peers/barn/api/cameras", None, None).await.status, 401);
 }
 
+/// A peer served under a path prefix (https://host/zmng) is proxied like a
+/// bare-origin one.
+#[tokio::test]
+async fn peer_under_a_path_prefix_is_proxied() {
+    let (peer_fx, _, peer_tok, cam, _) = peer().await;
+    let nested = axum::Router::new().nest("/zmng", peer_fx.router());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, nested).await.unwrap() });
+    let mut local = Fixture::new();
+    local.cfg.peers = vec![zmng::peers::PeerConfig { name: "barn".into(), url: format!("http://127.0.0.1:{port}/zmng/"), token: peer_tok }];
+    let admin = local.add_admin("admin", "password123");
+    let at = local.token_for(admin);
+    let r = local.router();
+    let cams = get(&r, "/api/peers/barn/api/cameras", &at).await;
+    assert_eq!(cams.status, 200, "{}", cams.text());
+    assert_eq!(cams.json()[0]["id"], cam);
+    assert_eq!(cams.json()[0]["main_url"], "");
+    assert_eq!(get(&r, "/api/peers/barn/api/users", &at).await.status, 404);
+    assert_eq!(get(&r, "/api/peers/barn/api/cameras/../users", &at).await.status, 404);
+}
+
 #[tokio::test]
 async fn unreachable_peer_is_reported_not_fatal() {
     let mut local = Fixture::new();

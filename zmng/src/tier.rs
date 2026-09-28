@@ -91,6 +91,10 @@ pub fn run_once(db: &Db, max_per_pass: usize) -> Result<TierStats> {
                     stats.moved += 1;
                     stats.bytes += seg.bytes as u64;
                 }
+                Err(e) if db.segment(seg.id).ok().flatten().is_none() => {
+                    // raced with retention; nothing wrong with the disks
+                    warn!(segment = seg.id, path = %seg.path, "archive move skipped: {e:#}");
+                }
                 Err(e) => {
                     warn!(segment = seg.id, path = %seg.path, "archive move failed: {e:#}");
                     stats.more = false;
@@ -126,7 +130,11 @@ fn move_segment(db: &Db, src: &Storage, dst: &Storage, seg: &Segment, throttle: 
     }
     // index switch is a single row update; the file exists at the same
     // relative path on both volumes until the source unlink below
-    db.move_segment(seg.id, dst.id)?;
+    if !db.move_segment(seg.id, dst.id)? {
+        // retention deleted the row while the copy ran: the copy is an orphan
+        let _ = std::fs::remove_file(&to);
+        anyhow::bail!("segment {} was deleted during the copy", seg.id);
+    }
     match std::fs::remove_file(&from) {
         Ok(()) => {}
         Err(e) => warn!(path = %from.display(), "source unlink after archive failed: {e}"),

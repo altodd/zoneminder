@@ -113,39 +113,27 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
             let free = fs_free_bytes(p).unwrap_or(u64::MAX) as i64;
             st.max_bytes.map(|m| used > m).unwrap_or(false) || free < st.reserve_bytes
         };
-        // footage of archived events is skipped unless the floor is reached
+        // footage of archived events is skipped unless the floor is reached;
+        // a pass looks at up to 4000 rows and unlinks at most 1000 so the
+        // 30 s loop stays responsive whatever the pinned run at the front
         let mut after = i64::MIN;
-        'budget: for _round in 0..50 {
-            if !over_budget(used) {
-                break;
-            }
+        let (mut looked, mut unlinked) = (0usize, 0usize);
+        'budget: while over_budget(used) && looked < 4000 && unlinked < 1000 {
             let victims = db.oldest_segments_after(st.id, after, 20)?;
             if victims.is_empty() {
-                if after != i64::MIN && hard_floor {
-                    // only pinned footage is left and the floor is hit: start over without the pin
-                    after = i64::MIN;
-                    for s in db.oldest_segments(st.id, 20)? {
-                        if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
-                            used -= s.bytes;
-                            deleted += 1;
-                        }
-                        if !over_budget(used) {
-                            break 'budget;
-                        }
-                    }
-                    continue;
-                }
                 warn!(storage = st.id, "space budget exceeded but no segments to delete");
                 break;
             }
             for s in victims {
+                looked += 1;
                 after = s.start_dts;
-                if db.segment_pinned(&s, *event_cutoffs.get(&s.camera_id).unwrap_or(&now))? {
+                if !hard_floor && db.segment_pinned(&s, *event_cutoffs.get(&s.camera_id).unwrap_or(&now))? {
                     continue;
                 }
                 if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                     used -= s.bytes;
                     deleted += 1;
+                    unlinked += 1;
                 }
                 // re-check after every unlink: never delete a whole batch past the budget
                 if !over_budget(used) {

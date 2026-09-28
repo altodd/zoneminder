@@ -638,7 +638,9 @@ impl EventState {
             }
             return Ok(());
         };
-        if sent_for.is_some_and(|s| s != id) {
+        // a result taken before any event opened belongs here only if its frame is within the pre-roll
+        let pre = (cam.pre_secs * TIMESCALE as f64) as i64;
+        if sent_for.is_some_and(|s| s != id) || (sent_for.is_none() && dts < self.start_dts - pre) {
             debug!(camera = cam.id, event = id, "dropping detection for a closed event");
             return Ok(());
         }

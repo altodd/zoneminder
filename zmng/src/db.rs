@@ -265,6 +265,18 @@ fn migrate(c: &Connection) -> Result<()> {
     }
     // one scan at open; every later change keeps the counter in step
     c.execute_batch("UPDATE storage SET used_bytes=(SELECT COALESCE(SUM(bytes),0) FROM segment WHERE segment.storage_id=storage.id);")?;
+    // storages that predate the mount marker get one now (their path is a
+    // real directory at upgrade time, which is the only moment that is known)
+    {
+        let mut st = c.prepare("SELECT path FROM storage WHERE read_only=0")?;
+        let paths: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        for p in paths {
+            let root = std::path::Path::new(&p);
+            if root.is_dir() && !root.join(crate::retention::MARKER).exists() {
+                let _ = crate::retention::write_marker(root);
+            }
+        }
+    }
     if !has_col("camera", "objects")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN objects INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN object_labels TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN require_object INTEGER NOT NULL DEFAULT 0;")?;
     }
@@ -494,8 +506,14 @@ impl Db {
     /// Registers a volume. The marker file that tells the recorder the
     /// volume is really mounted is written when the directory exists
     /// (best effort: a read-only ZoneMinder tree may refuse it).
+    /// Idempotent on `path`: an existing row is updated and keeps its id,
+    /// so re-running `add-storage` repairs a lost marker.
     pub fn add_storage(&self, path: &str, max_bytes: Option<i64>, reserve_bytes: i64) -> Result<i64> {
         let id = self.with(|c| {
+            if let Some(id) = c.query_row("SELECT id FROM storage WHERE path=?1", params![path], |r| r.get::<_, i64>(0)).optional()? {
+                c.execute("UPDATE storage SET max_bytes=?1, reserve_bytes=?2 WHERE id=?3", params![max_bytes, reserve_bytes, id])?;
+                return Ok(id);
+            }
             c.execute(
                 "INSERT INTO storage(path,max_bytes,reserve_bytes) VALUES(?1,?2,?3)",
                 params![path, max_bytes, reserve_bytes],
@@ -535,17 +553,21 @@ impl Db {
 
     /// Move a segment's index row to another storage (file already copied to
     /// the same relative path there).
-    pub fn move_segment(&self, id: i64, storage_id: i64) -> Result<()> {
+    /// Returns false when the row is gone (retention deleted it meanwhile)
+    /// or already lives on `storage_id`; nothing is changed then.
+    pub fn move_segment(&self, id: i64, storage_id: i64) -> Result<bool> {
         self.with(|c| {
-            c.execute_batch("BEGIN")?;
-            let r = (|| -> Result<()> {
-                c.execute("UPDATE storage SET used_bytes=used_bytes-(SELECT bytes FROM segment WHERE id=?1) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
-                c.execute("UPDATE storage SET used_bytes=used_bytes+(SELECT bytes FROM segment WHERE id=?1) WHERE id=?2", params![id, storage_id])?;
-                c.execute("UPDATE segment SET storage_id=?1 WHERE id=?2", params![storage_id, id])?;
-                Ok(())
-            })();
-            c.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-            r
+            let tx = c.unchecked_transaction()?;
+            let cur: Option<(i64, i64)> = tx.query_row("SELECT storage_id, bytes FROM segment WHERE id=?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let Some((from, bytes)) = cur else { return Ok(false) };
+            if from == storage_id {
+                return Ok(false);
+            }
+            tx.execute("UPDATE storage SET used_bytes=used_bytes-?1 WHERE id=?2", params![bytes, from])?;
+            tx.execute("UPDATE storage SET used_bytes=used_bytes+?1 WHERE id=?2", params![bytes, storage_id])?;
+            tx.execute("UPDATE segment SET storage_id=?1 WHERE id=?2", params![storage_id, id])?;
+            tx.commit()?;
+            Ok(true)
         })
     }
 
@@ -822,13 +844,15 @@ impl Db {
         let frames: i64 = index.iter().map(|f| f.samples as i64).sum();
         let motion_max = index.iter().map(|f| f.motion).max().unwrap_or(0);
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO segment(camera_id,storage_id,sample_entry_id,start_dts,end_dts,path,bytes,init_len,frames,motion_max,index_blob,dts_offset,zm_event_id,stream,created_at) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![camera_id, storage_id, sample_entry_id, start, end, path, bytes, init_len, frames, motion_max, mp4::encode_index(index), dts_offset, zm_event_id, stream, now_secs()],
             )?;
-            let id = c.last_insert_rowid();
-            c.execute("UPDATE storage SET used_bytes=used_bytes+?1 WHERE id=?2", params![bytes, storage_id])?;
+            let id = tx.last_insert_rowid();
+            tx.execute("UPDATE storage SET used_bytes=used_bytes+?1 WHERE id=?2", params![bytes, storage_id])?;
+            tx.commit()?;
             Ok(id)
         })
     }
@@ -928,14 +952,11 @@ impl Db {
 
     pub fn delete_segment(&self, id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute_batch("BEGIN")?;
-            let r = (|| -> Result<()> {
-                c.execute("UPDATE storage SET used_bytes=used_bytes-(SELECT bytes FROM segment WHERE id=?1) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
-                c.execute("DELETE FROM segment WHERE id=?1", params![id])?;
-                Ok(())
-            })();
-            c.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-            r
+            let tx = c.unchecked_transaction()?;
+            tx.execute("UPDATE storage SET used_bytes=used_bytes-COALESCE((SELECT bytes FROM segment WHERE id=?1),0) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
+            tx.execute("DELETE FROM segment WHERE id=?1", params![id])?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
