@@ -123,6 +123,7 @@ async fn live_stream_is_transcoded() {
         status: parking_lot::RwLock::new(zmng::recorder::CamStatus { connected: true, codec: Some(enc.params.rfc6381.clone()), fps: 10.0, ..Default::default() }),
         live: live_tx.clone(),
         recent: parking_lot::RwLock::new(Some(zmng::recorder::Recent { params: params.clone(), init: init.clone(), frags: frags[..1].iter().cloned().collect() })),
+        open: parking_lot::RwLock::new(None),
         motion: Arc::new(zmng::recorder::MotionLog::default()),
         stop: stop_tx,
     });

@@ -46,13 +46,20 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
     let cameras = db.cameras()?;
     let now = now_dts();
     let mut deleted = 0usize;
+    // per camera: events younger than this pin their footage
+    let event_cutoffs: std::collections::HashMap<i64, i64> = cameras
+        .iter()
+        .map(|cam| {
+            let ev_days = if cam.event_retention_days > 0.0 { cam.event_retention_days } else { cam.retention_days };
+            (cam.id, now - (ev_days * 86_400.0 * TIMESCALE as f64) as i64)
+        })
+        .collect();
 
     // 1. per-camera age limit, keeping segments that overlap a recent or
     //    archived event for `event_retention_days`
     for cam in &cameras {
         let cutoff = now - (cam.retention_days * 86_400.0 * TIMESCALE as f64) as i64;
-        let ev_days = if cam.event_retention_days > 0.0 { cam.event_retention_days } else { cam.retention_days };
-        let event_cutoff = now - (ev_days * 86_400.0 * TIMESCALE as f64) as i64;
+        let event_cutoff = event_cutoffs[&cam.id];
         let pruned = crate::preview::Store::new(thumb_dir).prune(cam.id, cutoff.min(event_cutoff));
         if pruned > 0 {
             debug!(camera = cam.id, pruned, "removed old preview hours");
@@ -69,7 +76,7 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
                 if db.segment_pinned(&s, event_cutoff)? {
                     continue; // footage of an event worth keeping
                 }
-                if let Some(st) = storages.iter().find(|x| x.id == s.storage_id && !x.read_only) {
+                if let Some(st) = storages.iter().find(|x| x.id == s.storage_id && !x.read_only && storage_mounted(x)) {
                     if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                         deleted += 1;
                         progressed = true;
@@ -83,31 +90,59 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
     }
 
     // 2. per-storage space budget (oldest first, across cameras). A primary
-    //    volume with a reachable archive is drained by tier.rs instead.
-    for st in storages.iter().filter(|s| !s.read_only) {
+    //    volume with a reachable archive is drained by tier.rs instead, down
+    //    to a hard floor: under half the reserve the primary deletes anyway,
+    //    because ENOSPC on the recording volume stops every recorder.
+    for st in storages.iter().filter(|s| !s.read_only && storage_mounted(s)) {
         let p = Path::new(&st.path);
+        let free_now = fs_free_bytes(p).unwrap_or(u64::MAX) as i64;
+        let hard_floor = free_now < st.reserve_bytes / 2;
         if let Some(a) = st.archive_to {
-            let archive_ok = storages.iter().find(|x| x.id == a).map(|x| Path::new(&x.path).is_dir()).unwrap_or(false);
-            if archive_ok {
+            let archive_ok = storages.iter().find(|x| x.id == a).map(storage_mounted).unwrap_or(false);
+            if archive_ok && !hard_floor {
                 continue;
             }
-            warn!(storage = st.id, "archive volume unavailable: falling back to deleting oldest segments on the primary");
+            if archive_ok {
+                warn!(storage = st.id, free_gb = free_now / 1_000_000_000, "archive backlog: free space under half the reserve; deleting oldest segments on the primary");
+            } else {
+                warn!(storage = st.id, "archive volume unavailable: falling back to deleting oldest segments on the primary");
+            }
         }
         let mut used = db.storage_used_bytes(st.id)?;
         let over_budget = |used: i64| -> bool {
             let free = fs_free_bytes(p).unwrap_or(u64::MAX) as i64;
             st.max_bytes.map(|m| used > m).unwrap_or(false) || free < st.reserve_bytes
         };
+        // footage of archived events is skipped unless the floor is reached
+        let mut after = i64::MIN;
         'budget: for _round in 0..50 {
             if !over_budget(used) {
                 break;
             }
-            let victims = db.oldest_segments(st.id, 20)?;
+            let victims = db.oldest_segments_after(st.id, after, 20)?;
             if victims.is_empty() {
+                if after != i64::MIN && hard_floor {
+                    // only pinned footage is left and the floor is hit: start over without the pin
+                    after = i64::MIN;
+                    for s in db.oldest_segments(st.id, 20)? {
+                        if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
+                            used -= s.bytes;
+                            deleted += 1;
+                        }
+                        if !over_budget(used) {
+                            break 'budget;
+                        }
+                    }
+                    continue;
+                }
                 warn!(storage = st.id, "space budget exceeded but no segments to delete");
                 break;
             }
             for s in victims {
+                after = s.start_dts;
+                if db.segment_pinned(&s, *event_cutoffs.get(&s.camera_id).unwrap_or(&now))? {
+                    continue;
+                }
                 if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                     used -= s.bytes;
                     deleted += 1;
@@ -168,9 +203,34 @@ pub fn delete_camera_files(db: &Db, thumb_dir: &Path, camera_id: i64) -> Result<
 
 /// Adopt files on disk that are not in the index (crash recovery / manual
 /// copy).  Only call when no recorder is writing to these directories.
+/// Name of the file at a storage root that proves the volume is mounted.
+pub const MARKER: &str = ".zmng-storage";
+
+/// Write the mount marker at a storage root.
+pub fn write_marker(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a directory", root.display());
+    }
+    std::fs::write(root.join(MARKER), b"zmng storage root; do not delete\n")?;
+    Ok(())
+}
+
+/// A writable storage is usable only when its marker is present: a bare
+/// mount point (volume not mounted at boot, USB disk unplugged) has none,
+/// and recording or deleting there would hit the root filesystem instead.
+/// Read-only trees (imported ZoneMinder events) only need to exist.
+pub fn storage_mounted(st: &crate::db::Storage) -> bool {
+    let p = Path::new(&st.path);
+    if st.read_only { p.is_dir() } else { p.join(MARKER).is_file() }
+}
+
 pub fn reindex(db: &Db) -> Result<usize> {
     let mut adopted = 0;
     for st in db.storages()? {
+        if !storage_mounted(&st) {
+            warn!(storage = st.id, path = %st.path, "not mounted (no {MARKER}); skipping reindex there");
+            continue;
+        }
         let known = db.segment_paths_for_storage(st.id)?;
         let root = PathBuf::from(&st.path);
         let Ok(cams) = std::fs::read_dir(&root) else { continue };

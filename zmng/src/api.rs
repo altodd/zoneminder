@@ -33,6 +33,9 @@ pub struct App {
     pub login_guard: Arc<parking_lot::Mutex<LoginGuard>>,
     /// Bounds concurrent on-demand ffmpeg decodes (snapshot/frame endpoints).
     pub decode_sem: Arc<tokio::sync::Semaphore>,
+    /// zmNinja MJPEG streams hold a decoder for their whole life: their own
+    /// pool so they never starve snapshots and thumbnails
+    pub mjpeg_sem: Arc<tokio::sync::Semaphore>,
     pub bus: Arc<crate::notify::Bus>,
     /// epoch milliseconds when this process started
     pub started_ms: i64,
@@ -790,11 +793,22 @@ async fn live(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<Strea
         .unwrap())
 }
 
-/// Live snapshot: decode the most recent keyframe (cost: one I-frame decode).
+/// Live snapshot: decode the most recent keyframe (cost: one I-frame
+/// decode). The substream is used when it runs, unless `stream=main` or the
+/// requested width exceeds what the substream has: 23 tiles refreshing every
+/// 2 s must never decode 4 MP HEVC keyframes.
 async fn snapshot(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<SnapQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
-    let h = app.hub.get(id).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
+    let width = q.width.unwrap_or(1280).min(3840);
+    let sub = app.hub.get_stream(id, crate::recorder::StreamKind::Sub).filter(|h| {
+        q.stream.as_deref() != Some("main") && h.recent.read().as_ref().is_some_and(|r| r.params.width >= width || q.width.is_none())
+    });
+    let source = if sub.is_some() { "sub" } else { "main" };
+    let h = sub.or_else(|| app.hub.get(id)).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
+    // never upscale: the default 1280 means "up to 1280"
+    let src_w = h.recent.read().as_ref().map(|r| r.params.width).unwrap_or(0);
+    let width = if src_w > 0 { width.min(src_w) } else { width };
     let (init, frag) = {
         let r = h.recent.read();
         let r = r.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
@@ -802,13 +816,15 @@ async fn snapshot(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<S
         (r.init.clone(), f.2.clone())
     };
     let _permit = app.decode_sem.acquire().await.map_err(err500)?;
-    let jpeg = crate::thumbs::frag_to_jpeg(&app.cfg.ffmpeg, &init, &frag, q.width.unwrap_or(1280).min(3840), 4).await.map_err(err500)?;
-    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")], jpeg).into_response())
+    let jpeg = crate::thumbs::frag_to_jpeg(&app.cfg.ffmpeg, &init, &frag, width, 4).await.map_err(err500)?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store"), (axum::http::HeaderName::from_static("x-stream"), source)], jpeg).into_response())
 }
 
 #[derive(Deserialize)]
 struct SnapQ {
     width: Option<u32>,
+    /// "main" forces the main stream (full resolution)
+    stream: Option<String>,
 }
 
 /// Frame at an arbitrary recorded time (keyframe-accurate).
@@ -1075,7 +1091,8 @@ async fn storages(State(app): State<App>, user: Option<axum::Extension<AuthUser>
         let used = app.db.storage_used_bytes(s.id).unwrap_or(0);
         let free = crate::retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(0);
         out.push(serde_json::json!({"id": s.id, "path": s.path, "max_bytes": s.max_bytes, "reserve_bytes": s.reserve_bytes, "used_bytes": used, "free_bytes": free,
-            "archive_to": s.archive_to, "archive_after_days": s.archive_after_days, "archive_rate_mbps": s.archive_rate_mbps, "read_only": s.read_only, "available": std::path::Path::new(&s.path).is_dir()}));
+            "archive_to": s.archive_to, "archive_after_days": s.archive_after_days, "archive_rate_mbps": s.archive_rate_mbps, "read_only": s.read_only, "available": crate::retention::storage_mounted(&s),
+            "archive_backlog_bytes": crate::tier::backlog_bytes(&app.db, &s).unwrap_or(0)}));
     }
     Ok(Json(out).into_response())
 }
@@ -1233,7 +1250,7 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
         return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
     }
     let method = req.method().clone();
-    let mut out = app.http.request(method, &url).bearer_auth(&peer.token).timeout(std::time::Duration::from_secs(3600));
+    let mut out = app.http.request(method.clone(), &url).bearer_auth(&peer.token).timeout(std::time::Duration::from_secs(3600));
     for h in ["range", "content-type", "if-none-match", "accept"] {
         if let Some(v) = req.headers().get(h) {
             out = out.header(h, v.clone());
@@ -1247,6 +1264,29 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
     if res.status() == reqwest::StatusCode::UNAUTHORIZED || res.status() == reqwest::StatusCode::FORBIDDEN {
         // the peer rejected OUR token; never let that log the local user out
         return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("peer {name}: token rejected ({})", res.status())}))).into_response());
+    }
+    // the peer token may belong to an admin there: camera JSON is stripped of
+    // RTSP/ONVIF URLs and credentials whatever the peer returned
+    let strip = method == axum::http::Method::GET && (parsed.path() == "/api/cameras" || parsed.path().starts_with("/api/cameras/") && !parsed.path()[13..].contains('/'));
+    if strip {
+        let ct = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let status = res.status().as_u16();
+        let body = res.bytes().await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("peer {name}: {e}")}))).into_response())?;
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let blank = |c: &mut serde_json::Value| {
+            if let Some(o) = c.as_object_mut() {
+                for k in ["main_url", "sub_url", "onvif_url", "onvif_user", "onvif_pass", "ptz_url"] {
+                    if let Some(x) = o.get_mut(k) {
+                        *x = if x.is_null() { serde_json::Value::Null } else { serde_json::Value::String(String::new()) };
+                    }
+                }
+            }
+        };
+        match &mut v {
+            serde_json::Value::Array(a) => a.iter_mut().for_each(blank),
+            other => blank(other),
+        }
+        return Ok(Response::builder().status(status).header(header::CONTENT_TYPE, if ct.is_empty() { "application/json".to_string() } else { ct }).body(Body::from(v.to_string())).unwrap());
     }
     let mut b = Response::builder().status(res.status().as_u16());
     for h in crate::peers::PASS_HEADERS {
@@ -1278,6 +1318,7 @@ impl App {
             setup_token: Arc::new(new_token()[..12].to_string()),
             login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            mjpeg_sem: Arc::new(tokio::sync::Semaphore::new(3)),
             started_ms: crate::db::now_dts() / 90,
             transcoder,
             ptz_timers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),

@@ -74,7 +74,7 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/video.mp4?start&end[&stream=sub][&codec=h264]` | fMP4 for the range (≤ 6 h); header `X-First-Dts-Ms`; `codec=h264` transcodes HEVC on demand |
 | `GET /api/cameras/{id}/playlist.m3u8?start&end` | HLS (fMP4, byte ranges) |
 | `GET /api/cameras/{id}/live.mp4[?stream=sub][&codec=h264]` | live fMP4 (chunked) |
-| `GET /api/cameras/{id}/snapshot.jpg?width` | latest keyframe as JPEG |
+| `GET /api/cameras/{id}/snapshot.jpg?width&stream` | latest keyframe as JPEG, decoded from the substream when it runs and can serve `width` (never upscaled; `stream=main` forces the main stream); `X-Stream` says which |
 | `GET /api/cameras/{id}/frame.jpg?t&width[&stream=sub]` | keyframe nearest to time `t` (`stream=sub` ≈ 30 ms, used for scrub previews) |
 | `GET /api/cameras/{id}/preview.jpg?t` | scrub-preview tile (160 px, colour) nearest `t`, taken from the detector's frames every `preview_secs`; one small file read, no decode |
 | `GET /api/cameras/{id}/previews`, `GET /api/cameras/{id}/previews/{YYYYMMDDHH}.jpg|.json` | hours with previews; an hour as a sprite sheet (30 columns) plus its manifest `{cols, tile_w, tile_h, times}` |
@@ -148,7 +148,7 @@ Servers that work: CodeProject.AI (`/v1/vision/detection`, YOLO on CUDA), DeepSt
 
 Every event start/end, camera outage/recovery, storage warning and service start is published on an in-process bus and delivered by whichever sinks are configured:
 
-* **Webhook** — `alert_webhook = "https://host/hook"` in `zmng.toml`: one JSON POST per notification, `{"event": "event_start" | "event_update" | "event_end" | "camera_down" | "camera_up" | "storage_low" | "service_started", ...}`. Event payloads carry `id`, `camera_id`, `camera_name`, `start_ms`, `end_ms`, `score`, `kind`, `thumb` (URL) and `objects`. `event_start` fires as soon as motion is confirmed (so `thumb` is still null and `objects` empty); `event_update` follows whenever objects are detected and once more when the thumbnail exists after `event_end`, so automations that want a picture trigger on `event_update` with `thumb` set (or on the MQTT thumbnail entity).
+* **Webhook** — `alert_webhook = "https://host/hook"` in `zmng.toml`: one JSON POST per notification, `{"event": "event_start" | "event_update" | "event_end" | "camera_down" | "camera_up" | "storage_low" | "service_started", ...}`. Event payloads carry `id`, `camera_id`, `camera_name`, `start_ms`, `end_ms`, `score`, `kind`, `thumb` (URL) and `objects`. `event_start` fires as soon as motion is confirmed (so `thumb` is still null and `objects` empty); `event_update` follows whenever objects are detected and once more when the thumbnail exists, a few seconds after `event_end` (the peak frame is read from the segment still being written), so automations that want a picture trigger on `event_update` with `thumb` set (or on the MQTT thumbnail entity).
 * **MQTT + Home Assistant discovery** —
   ```toml
   [mqtt]
@@ -159,7 +159,7 @@ Every event start/end, camera outage/recovery, storage warning and service start
   topic_prefix = "zmng"                # zmng/status, zmng/camera/<id>/{motion,recording,event,thumbnail}
   discovery_prefix = "homeassistant"   # "" disables discovery
   ```
-  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. While the broker is unreachable, notifications are dropped (state topics are republished on reconnect); a camera removed from zmng keeps its stale discovery entry in HA until you delete the device there. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280` with a long-lived token (`Authorization: Bearer`, see `POST /api/tokens`).
+  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. While the broker is unreachable, notifications are dropped (state topics are republished on reconnect); a camera removed from zmng keeps its stale discovery entry in HA until you delete the device there. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<long-lived token>` (HA's generic camera cannot send a bearer header; `POST /api/tokens` makes the token).
 * **UI** — `GET /api/events/stream` is a server-sent-events feed of the same notifications, filtered to the cameras the user may see; the web UI shows toasts from it.
 * **zmNinjaNg** — `/zm/ws` speaks the zmeventnotification websocket protocol (auth, `control/version`, `control/filter` with `monlist`/`intlist`, `push/token` registration, `alarm` messages with `DetectionJson`). Point the app's event-server URL at `ws(s)://<host>/zm/ws`.
 
@@ -173,9 +173,11 @@ Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/ref
 
 ## Storage tiering and retention
 
-* `zmng add-storage /raid --archive-to <archive id> --archive-after-days 3` (or edit in Admin → Storage): segments older than 3 days are copied to the archive volume (checksummed, rate limited), then removed from the RAID. Space pressure on the RAID also triggers moves. A missing archive volume never stops recording.
+* `zmng add-storage /raid --archive-to <archive id> --archive-after-days 3` (or edit in Admin → Storage): segments older than 3 days are copied to the archive volume (checksummed, rate limited by `archive_rate_mbps`), then removed from the RAID. Space pressure on the RAID (byte cap or reserve reached) also triggers moves, unthrottled. Tiering is its own task; a pass that hits its batch limit runs again at once. A missing archive volume never stops recording.
+* Hard floor: while the archive is reachable, retention leaves the primary to tiering, but once free space falls under **half** the reserve it deletes the oldest segments on the primary anyway (ENOSPC on the recording volume would stop every recorder). Status shows the archive backlog (bytes past the cutoff still on the primary) and warns when it exceeds a day of ingest: raise `archive_rate_mbps`.
+* Mount marker: `add-storage` writes `.zmng-storage` at the storage root. A root without it is treated as unmounted: no recording, deleting, moving or reindexing there, an error line in Status and in `zmng doctor`. Read-only storages only have to exist. Re-run `add-storage` (or `touch <root>/.zmng-storage`) after moving a volume by hand.
 * `zmng add-storage /var/cache/zoneminder/events --read-only`: a read-only storage is never deleted from, never drained by tiering and never written to (doctor only checks it is readable); use it for imported ZoneMinder event trees. Flip the flag in Admin → Storage when those files may finally go.
-* Per camera: `retention_days` (continuous footage) and `event_retention_days` (segments that overlap a motion event); archived events keep their footage.
+* Per camera: `retention_days` (continuous footage) and `event_retention_days` (segments that overlap a motion event). Archived events keep their footage past both ages, and the space budget deletes unpinned footage first; only at the hard floor does archived footage go too.
 * Substream recording (`record_sub`, default on) stores `<camera>/sub/<day>/*.mp4`; use `?stream=sub` on the video/playlist/live endpoints.
 
 ## Layout on disk

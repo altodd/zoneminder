@@ -363,16 +363,36 @@ fn run(cfg: config::Config) -> Result<()> {
                     }
                     let db2 = db.clone();
                     let td = thumb_dir.clone();
-                    let r = tokio::task::spawn_blocking(move || {
-                        tier::run_once(&db2, 20).map_err(|e| anyhow::anyhow!("tiering: {e:#}"))?;
-                        retention::run_once(&db2, &td)
-                    })
-                    .await;
+                    let r = tokio::task::spawn_blocking(move || retention::run_once(&db2, &td)).await;
                     match r {
-                        Ok(Err(e)) => tracing::error!("retention/tiering: {e:#}"),
+                        Ok(Err(e)) => tracing::error!("retention: {e:#}"),
                         Err(e) => tracing::error!("retention task: {e}"),
                         _ => {}
                     }
+                }
+            });
+        }
+
+        // tiering runs on its own: a throttled copy of a backlog must never
+        // hold up alerts, reconcile or retention, and a pass that hit its
+        // limit runs again at once instead of waiting for the next tick
+        {
+            let db = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    let db2 = db.clone();
+                    let more = match tokio::task::spawn_blocking(move || tier::run_once(&db2, 20)).await {
+                        Ok(Ok(st)) => st.more,
+                        Ok(Err(e)) => {
+                            tracing::error!("tiering: {e:#}");
+                            false
+                        }
+                        Err(e) => {
+                            tracing::error!("tiering task: {e}");
+                            false
+                        }
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(if more { 1 } else { 30 })).await;
                 }
             });
         }

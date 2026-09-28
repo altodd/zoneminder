@@ -60,3 +60,54 @@ fn phase1_database_upgrades_in_place() {
     let db = zmng::db::Db::open(&path).unwrap();
     assert_eq!(db.cameras().unwrap()[0].tags, "Outside");
 }
+
+/// storage.used_bytes is maintained by every insert, delete and move, and
+/// recounted when the database is opened.
+#[test]
+fn storage_used_bytes_counter_follows_the_segments() {
+    let fx = common::Fixture::new();
+    let cam = fx.add_camera("c");
+    let other = fx.dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let other_id = fx.db.add_storage(other.to_str().unwrap(), None, 0).unwrap();
+    assert_eq!(fx.db.storage_used_bytes(fx.storage_id).unwrap(), 0);
+    let enc = common::parse_encoded(&common::encode_fmp4(2, "libx264", 160, 90));
+    let a = fx.write_segment(cam, "main", &enc, 1_000 * zmng::mp4::TIMESCALE as i64, |_| 0);
+    let b = fx.write_segment(cam, "main", &enc, 2_000 * zmng::mp4::TIMESCALE as i64, |_| 0);
+    let (ba, bb) = (fx.db.segment(a).unwrap().unwrap().bytes, fx.db.segment(b).unwrap().unwrap().bytes);
+    assert_eq!(fx.db.storage_used_bytes(fx.storage_id).unwrap(), ba + bb);
+    fx.db.move_segment(a, other_id).unwrap();
+    assert_eq!(fx.db.storage_used_bytes(fx.storage_id).unwrap(), bb);
+    assert_eq!(fx.db.storage_used_bytes(other_id).unwrap(), ba);
+    fx.db.delete_segment(b).unwrap();
+    assert_eq!(fx.db.storage_used_bytes(fx.storage_id).unwrap(), 0);
+    // a stale counter is recounted at open
+    fx.db.with(|c| { c.execute("UPDATE storage SET used_bytes=12345", []).unwrap(); Ok(()) }).unwrap();
+    let reopened = zmng::db::Db::open(&fx.dir.path().join("zmng.db")).unwrap();
+    assert_eq!(reopened.storage_used_bytes(other_id).unwrap(), ba);
+    assert_eq!(reopened.storage_used_bytes(fx.storage_id).unwrap(), 0);
+}
+
+/// Timeline/range queries are bounded on both sides of start_dts so the
+/// (camera, stream, start_dts) index covers the window instead of walking
+/// every older segment of the camera.
+#[test]
+fn range_queries_are_bounded_on_the_index() {
+    let fx = common::Fixture::new();
+    let plan = fx.db.query_plan("SELECT * FROM segment WHERE camera_id=1 AND stream='main' AND start_dts>=100 AND start_dts<200 AND end_dts>100 ORDER BY start_dts").unwrap();
+    let text = plan.join("\n");
+    assert!(text.contains("USING INDEX segment_cam") && text.contains("start_dts>?") && text.contains("start_dts<?"), "{text}");
+    let plan = fx.db.query_plan("SELECT start_dts,end_dts,motion_max FROM segment WHERE camera_id=1 AND start_dts>=100 AND start_dts<200 AND end_dts>100 ORDER BY start_dts").unwrap();
+    assert!(plan.join("\n").contains("start_dts<?"), "{plan:?}");
+    let plan = fx.db.query_plan("SELECT camera_id, storage_id, SUM(bytes) FROM segment INDEXED BY segment_start WHERE start_dts>=100 GROUP BY camera_id, storage_id").unwrap();
+    assert!(plan.join("\n").contains("segment_start (start_dts>?)"), "{plan:?}");
+    assert!(fx.db.ingest_since(0).unwrap().is_empty());
+    // and the bounded query still finds a segment that started long before the window
+    let cam = fx.add_camera("c");
+    let enc = common::parse_encoded(&common::encode_fmp4(3, "libx264", 160, 90));
+    let t = 5_000 * zmng::mp4::TIMESCALE as i64;
+    fx.write_segment(cam, "main", &enc, t, |_| 0);
+    assert_eq!(fx.db.segments_in_range(cam, t + 2 * zmng::mp4::TIMESCALE as i64, t + 10 * zmng::mp4::TIMESCALE as i64).unwrap().len(), 1);
+    assert_eq!(fx.db.coverage(cam, t + 2 * zmng::mp4::TIMESCALE as i64, t + 10 * zmng::mp4::TIMESCALE as i64).unwrap().len(), 1);
+    assert!(fx.db.segments_in_range(cam, t + 3 * zmng::mp4::TIMESCALE as i64, t + 10 * zmng::mp4::TIMESCALE as i64).unwrap().is_empty());
+}

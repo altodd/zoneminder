@@ -682,10 +682,10 @@ impl EventState {
         info!(camera = cam.id, event = id, peak = self.peak, kind = %self.objects.kind(&[]), secs = (end - self.start_dts) / ts, "event end");
         ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventEnd);
         *self = EventState::default();
-        // thumbnail in the background (waits for the segment to close if needed)
+        // thumbnail in the background, from the open segment when the peak is still in it
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let (db, ffmpeg, thumb_dir, bus, cam_id) = (ctx.db.clone(), ctx.ffmpeg.clone(), ctx.thumb_dir.clone(), ctx.bus.clone(), cam.id);
-            rt.spawn(async move { thumbnail_task(&db, &ffmpeg, &thumb_dir, &bus, cam_id, id, peak_dts).await });
+            let (db, hub, ffmpeg, thumb_dir, bus, cam_id) = (ctx.db.clone(), ctx.hub.clone(), ctx.ffmpeg.clone(), ctx.thumb_dir.clone(), ctx.bus.clone(), cam.id);
+            rt.spawn(async move { thumbnail_task(&db, Some(&hub), &ffmpeg, &thumb_dir, &bus, cam_id, id, peak_dts).await });
         }
         Ok(())
     }
@@ -756,8 +756,9 @@ impl EventState {
 /// Make the thumbnail of a closed event, then tell everyone: the JPEG bytes
 /// for MQTT, and an `event_update` whose `thumb` URL is now set (the
 /// `event_end` went out before the picture existed).
-pub async fn thumbnail_task(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, bus: &crate::notify::Bus, cam_id: i64, event_id: i64, peak_dts: i64) {
-    match make_thumbnail(db, ffmpeg, thumb_dir, cam_id, event_id, peak_dts).await {
+#[allow(clippy::too_many_arguments)]
+pub async fn thumbnail_task(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_dir: &std::path::Path, bus: &crate::notify::Bus, cam_id: i64, event_id: i64, peak_dts: i64) {
+    match make_thumbnail(db, hub, ffmpeg, thumb_dir, cam_id, event_id, peak_dts).await {
         Ok(jpeg) => {
             bus.publish(crate::notify::Notification::EventThumbnail { event_id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) });
             bus.publish_event(db, event_id, crate::notify::Notification::EventUpdate);
@@ -766,24 +767,41 @@ pub async fn thumbnail_task(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, 
     }
 }
 
-/// Find the fragment containing `dts` (retrying until the segment holding it
-/// has been closed and indexed), decode its keyframe and store a JPEG.
-pub async fn make_thumbnail(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, cam_id: i64, event_id: i64, dts: i64) -> Result<Vec<u8>> {
+/// Locate the fragment holding `dts`: an indexed segment first, else the
+/// main recorder's open segment (already on disk, not yet indexed).
+/// Returns (file, init_len, fragment, dts_offset).
+fn locate_fragment(db: &Db, hub: Option<&LiveHub>, cam_id: i64, dts: i64) -> Result<Option<(PathBuf, u32, crate::mp4::FragEntry, i64)>> {
+    if let Some(seg) = db.segments_in_range(cam_id, dts, dts + 1)?.first() {
+        let frag = seg
+            .index
+            .iter()
+            .find(|f| f.dts <= dts && dts < f.dts + f.duration as i64)
+            .or_else(|| seg.index.first())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("segment has no fragments"))?;
+        let storage = db.storage(seg.storage_id)?.ok_or_else(|| anyhow::anyhow!("storage missing"))?;
+        return Ok(Some((PathBuf::from(&storage.path).join(&seg.path), seg.init_len, frag, seg.dts_offset)));
+    }
+    if let Some(h) = hub.and_then(|h| h.get(cam_id)) {
+        let open = h.open.read().clone();
+        if let Some(o) = open {
+            if let Some(f) = o.frags.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64) {
+                return Ok(Some((o.abs_path, o.init_len, *f, 0)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find the fragment containing `dts` (from the open segment when it is
+/// still being written, retrying briefly until it has been flushed), decode
+/// its keyframe and store a JPEG.
+pub async fn make_thumbnail(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_dir: &std::path::Path, cam_id: i64, event_id: i64, dts: i64) -> Result<Vec<u8>> {
     let mut attempt = 0;
     loop {
-        let segs = db.segments_in_range(cam_id, dts, dts + 1)?;
-        if let Some(seg) = segs.first() {
-            let frag = seg
-                .index
-                .iter()
-                .find(|f| f.dts <= dts && dts < f.dts + f.duration as i64)
-                .or_else(|| seg.index.first())
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("segment has no fragments"))?;
-            let storage = db.storage(seg.storage_id)?.ok_or_else(|| anyhow::anyhow!("storage missing"))?;
-            let path = PathBuf::from(&storage.path).join(&seg.path);
-            let init = crate::thumbs::read_range(&path, 0, seg.init_len)?;
-            let data = crate::mp4::rebase_fragment(&crate::thumbs::read_range(&path, frag.offset, frag.len)?, seg.dts_offset);
+        if let Some((path, init_len, frag, dts_offset)) = locate_fragment(db, hub, cam_id, dts)? {
+            let init = crate::thumbs::read_range(&path, 0, init_len)?;
+            let data = crate::mp4::rebase_fragment(&crate::thumbs::read_range(&path, frag.offset, frag.len)?, dts_offset);
             let jpeg = crate::thumbs::frag_to_jpeg(ffmpeg, &init, &data, 640, 5).await?;
             let rel = format!("{cam_id}/{event_id}.jpg");
             let abs = thumb_dir.join(&rel);
@@ -794,10 +812,12 @@ pub async fn make_thumbnail(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, 
             return Ok(jpeg);
         }
         attempt += 1;
-        if attempt > 6 {
+        if attempt > 40 {
             anyhow::bail!("no segment covers dts {dts} after waiting");
         }
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        // the GOP holding the peak is flushed within a few seconds; the
+        // segment close (up to 60 s) is no longer waited for
+        tokio::time::sleep(Duration::from_secs(if attempt < 10 { 2 } else { 6 })).await;
     }
 }
 

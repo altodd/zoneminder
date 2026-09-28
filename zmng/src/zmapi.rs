@@ -729,7 +729,7 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
         let f = r.frags.back().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no frames yet"))?;
         (r.init.clone(), f.2.clone())
     };
-    let _permit = app.decode_sem.clone().acquire_owned().await.map_err(e500)?;
+    let _permit = app.mjpeg_sem.clone().acquire_owned().await.map_err(e500)?;
     let mut child = tokio::process::Command::new(&app.cfg.ffmpeg)
         .args([
             "-nostdin", "-loglevel", "error", "-threads", "1", "-fflags", "nobuffer", "-flags", "low_delay",

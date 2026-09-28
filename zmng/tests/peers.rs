@@ -128,3 +128,31 @@ fn get_token(fx: &Fixture) -> String {
     let admin = fx.add_admin("peer-admin", "password123");
     fx.token_for(admin)
 }
+
+/// Whatever the peer's token may see there, proxied camera JSON never
+/// carries RTSP or ONVIF URLs or credentials.
+#[tokio::test]
+async fn proxied_cameras_never_carry_urls_even_with_an_admin_peer_token() {
+    let (peer_fx, port, _viewer_tok, cam, _cam2) = peer().await;
+    let peer_admin = peer_fx.add_admin("peer-admin", "password123");
+    let admin_tok = peer_fx.token_for(peer_admin);
+    peer_fx.db.update_camera(cam, json!({"onvif_url": "http://10.0.0.5/onvif/device_service", "onvif_user": "svc", "onvif_pass": "s3cret", "ptz": true}).as_object().unwrap()).unwrap();
+    let mut local = Fixture::new();
+    local.cfg.peers = vec![zmng::peers::PeerConfig { name: "barn".into(), url: format!("http://127.0.0.1:{port}"), token: admin_tok.clone() }];
+    let admin = local.add_admin("admin", "password123");
+    let viewer = local.add_viewer("v", "password123", &[]);
+    let r = local.router();
+    // the peer itself would hand its admin everything
+    let direct = get(&peer_fx.router(), &format!("/api/cameras/{cam}"), &admin_tok).await.json();
+    assert!(direct["main_url"].as_str().unwrap().starts_with("rtsp://"));
+    for tok in [local.token_for(admin), local.token_for(viewer)] {
+        for c in [get(&r, "/api/peers/barn/api/cameras", &tok).await.json()[0].clone(), get(&r, &format!("/api/peers/barn/api/cameras/{cam}"), &tok).await.json()] {
+            assert_eq!(c["id"], cam);
+            for k in ["main_url", "onvif_url", "onvif_user", "onvif_pass", "ptz_url"] {
+                assert!(c[k].is_null() || c[k] == "", "{k} leaked through the proxy: {c}");
+            }
+            assert!(c["sub_url"].is_null() || c["sub_url"] == "");
+            assert_eq!(c["name"], "barn-door");
+        }
+    }
+}

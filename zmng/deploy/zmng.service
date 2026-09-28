@@ -3,6 +3,10 @@ Description=ZoneMinder NG recorder/API
 # recordings are timestamped with the wall clock: wait for time sync
 After=network-online.target time-sync.target
 Wants=network-online.target time-sync.target
+# never start on bare mount points: a recording volume that is not mounted
+# would otherwise fill the root filesystem (zmng also refuses a storage root
+# without its .zmng-storage marker; see CUTOVER.md §2)
+RequiresMountsFor=/var/cache/zoneminder /media/zmoverflow
 
 [Service]
 User=zmng

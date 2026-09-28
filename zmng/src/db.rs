@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS storage (
   archive_after_days  REAL,
   archive_rate_mbps   INTEGER NOT NULL DEFAULT 40,
   -- never delete, move or write here (imported ZoneMinder event trees)
-  read_only           INTEGER NOT NULL DEFAULT 0
+  read_only           INTEGER NOT NULL DEFAULT 0,
+  -- maintained with every segment insert/delete/move: SUM(bytes) without the scan
+  used_bytes          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS camera (
@@ -172,6 +174,7 @@ CREATE INDEX IF NOT EXISTS segment_cam_start ON segment(camera_id, start_dts);
 CREATE INDEX IF NOT EXISTS segment_cam_stream_start ON segment(camera_id, stream, start_dts);
 CREATE INDEX IF NOT EXISTS segment_cam_end   ON segment(camera_id, end_dts);
 CREATE INDEX IF NOT EXISTS segment_storage   ON segment(storage_id, start_dts);
+CREATE INDEX IF NOT EXISTS segment_start     ON segment(start_dts);
 CREATE INDEX IF NOT EXISTS event_cam_start ON event(camera_id, start_dts);
 CREATE INDEX IF NOT EXISTS event_start     ON event(start_dts);
 "#;
@@ -257,6 +260,11 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has_col("camera", "ptz")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN onvif_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_user TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_pass TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz INTEGER NOT NULL DEFAULT 0; ALTER TABLE camera ADD COLUMN ptz_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz_profile TEXT NOT NULL DEFAULT '';")?;
     }
+    if !has_col("storage", "used_bytes")? {
+        c.execute_batch("ALTER TABLE storage ADD COLUMN used_bytes INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    // one scan at open; every later change keeps the counter in step
+    c.execute_batch("UPDATE storage SET used_bytes=(SELECT COALESCE(SUM(bytes),0) FROM segment WHERE segment.storage_id=storage.id);")?;
     if !has_col("camera", "objects")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN objects INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN object_labels TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN require_object INTEGER NOT NULL DEFAULT 0;")?;
     }
@@ -415,6 +423,11 @@ pub fn now_secs() -> i64 {
 }
 
 /// 90 kHz ticks since epoch for "now".
+/// No segment or event spans longer than this (segments are ~60 s, events
+/// capped at 10 min; imported ZoneMinder events can be long): range queries
+/// bound `start_dts` from below by it so an index covers the window.
+pub const MAX_SPAN: i64 = 4 * 3600 * mp4::TIMESCALE as i64;
+
 pub fn now_dts() -> i64 {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -478,14 +491,19 @@ impl Db {
         Ok(self.storages()?.into_iter().find(|s| s.id == id))
     }
 
+    /// Registers a volume. The marker file that tells the recorder the
+    /// volume is really mounted is written when the directory exists
+    /// (best effort: a read-only ZoneMinder tree may refuse it).
     pub fn add_storage(&self, path: &str, max_bytes: Option<i64>, reserve_bytes: i64) -> Result<i64> {
-        self.with(|c| {
+        let id = self.with(|c| {
             c.execute(
                 "INSERT INTO storage(path,max_bytes,reserve_bytes) VALUES(?1,?2,?3)",
                 params![path, max_bytes, reserve_bytes],
             )?;
             Ok(c.last_insert_rowid())
-        })
+        })?;
+        let _ = crate::retention::write_marker(std::path::Path::new(path));
+        Ok(id)
     }
 
     pub fn update_storage(&self, id: i64, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
@@ -519,8 +537,36 @@ impl Db {
     /// the same relative path there).
     pub fn move_segment(&self, id: i64, storage_id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE segment SET storage_id=?1 WHERE id=?2", params![storage_id, id])?;
-            Ok(())
+            c.execute_batch("BEGIN")?;
+            let r = (|| -> Result<()> {
+                c.execute("UPDATE storage SET used_bytes=used_bytes-(SELECT bytes FROM segment WHERE id=?1) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
+                c.execute("UPDATE storage SET used_bytes=used_bytes+(SELECT bytes FROM segment WHERE id=?1) WHERE id=?2", params![id, storage_id])?;
+                c.execute("UPDATE segment SET storage_id=?1 WHERE id=?2", params![storage_id, id])?;
+                Ok(())
+            })();
+            c.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+            r
+        })
+    }
+
+    /// Bytes of segments on `storage_id` that ended before `before_dts` and
+    /// are still there: the tiering backlog when it is the archive cutoff.
+    pub fn storage_bytes_before(&self, storage_id: i64, before_dts: i64) -> Result<i64> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM segment WHERE storage_id=?1 AND start_dts<?2 AND end_dts<?2",
+                params![storage_id, before_dts],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// `EXPLAIN QUERY PLAN` lines for `sql` (tests: proves a query is bounded).
+    pub fn query_plan(&self, sql: &str) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let rows = st.query_map([], |r| r.get::<_, String>(3))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
 
@@ -546,13 +592,10 @@ impl Db {
         })
     }
 
+    /// The maintained counter (one row read), not a scan of the segments.
     pub fn storage_used_bytes(&self, storage_id: i64) -> Result<i64> {
         self.with(|c| {
-            Ok(c.query_row(
-                "SELECT COALESCE(SUM(bytes),0) FROM segment WHERE storage_id=?1",
-                params![storage_id],
-                |r| r.get(0),
-            )?)
+            Ok(c.query_row("SELECT used_bytes FROM storage WHERE id=?1", params![storage_id], |r| r.get(0)).optional()?.unwrap_or(0))
         })
     }
 
@@ -784,7 +827,9 @@ impl Db {
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![camera_id, storage_id, sample_entry_id, start, end, path, bytes, init_len, frames, motion_max, mp4::encode_index(index), dts_offset, zm_event_id, stream, now_secs()],
             )?;
-            Ok(c.last_insert_rowid())
+            let id = c.last_insert_rowid();
+            c.execute("UPDATE storage SET used_bytes=used_bytes+?1 WHERE id=?2", params![bytes, storage_id])?;
+            Ok(id)
         })
     }
 
@@ -834,10 +879,12 @@ impl Db {
 
     pub fn segments_in_range_stream(&self, camera_id: i64, stream: &str, start: i64, end: i64) -> Result<Vec<Segment>> {
         self.with(|c| {
+            // both bounds on start_dts so the (camera, stream, start_dts) index
+            // covers the window; no row can start more than MAX_SPAN before it
             let mut st = c.prepare(
-                "SELECT * FROM segment WHERE camera_id=?1 AND stream=?2 AND end_dts>?3 AND start_dts<?4 ORDER BY start_dts",
+                "SELECT * FROM segment WHERE camera_id=?1 AND stream=?2 AND start_dts>=?3 AND start_dts<?4 AND end_dts>?5 ORDER BY start_dts",
             )?;
-            let rows = st.query_map(params![camera_id, stream, start, end], Self::row_segment)?;
+            let rows = st.query_map(params![camera_id, stream, start - MAX_SPAN, end, start], Self::row_segment)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -856,9 +903,15 @@ impl Db {
 
     /// Oldest segments on a storage (for retention).
     pub fn oldest_segments(&self, storage_id: i64, limit: usize) -> Result<Vec<Segment>> {
+        self.oldest_segments_after(storage_id, i64::MIN, limit)
+    }
+
+    /// Oldest segments on a storage starting after `after_start_dts` (paging
+    /// for a loop that skips some rows).
+    pub fn oldest_segments_after(&self, storage_id: i64, after_start_dts: i64, limit: usize) -> Result<Vec<Segment>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 ORDER BY start_dts LIMIT ?2")?;
-            let rows = st.query_map(params![storage_id, limit as i64], Self::row_segment)?;
+            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 AND start_dts>?2 ORDER BY start_dts LIMIT ?3")?;
+            let rows = st.query_map(params![storage_id, after_start_dts, limit as i64], Self::row_segment)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -875,8 +928,14 @@ impl Db {
 
     pub fn delete_segment(&self, id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM segment WHERE id=?1", params![id])?;
-            Ok(())
+            c.execute_batch("BEGIN")?;
+            let r = (|| -> Result<()> {
+                c.execute("UPDATE storage SET used_bytes=used_bytes-(SELECT bytes FROM segment WHERE id=?1) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
+                c.execute("DELETE FROM segment WHERE id=?1", params![id])?;
+                Ok(())
+            })();
+            c.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+            r
         })
     }
 
@@ -884,9 +943,9 @@ impl Db {
     pub fn coverage(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<(i64, i64, u8)>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT start_dts,end_dts,motion_max FROM segment WHERE camera_id=?1 AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+                "SELECT start_dts,end_dts,motion_max FROM segment WHERE camera_id=?1 AND start_dts>=?2 AND start_dts<?3 AND end_dts>?4 ORDER BY start_dts",
             )?;
-            let rows = st.query_map(params![camera_id, start, end], |r| {
+            let rows = st.query_map(params![camera_id, start - MAX_SPAN, end, start], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u8))
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -908,7 +967,10 @@ impl Db {
     /// Bytes recorded since `dts` per (camera, storage), main + sub.
     pub fn ingest_since(&self, dts: i64) -> Result<Vec<(i64, i64, i64)>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT camera_id, storage_id, SUM(bytes) FROM segment WHERE start_dts>=?1 GROUP BY camera_id, storage_id")?;
+            // INDEXED BY: the planner would otherwise scan the whole table to
+            // avoid a temp b-tree for the GROUP BY; the window is a day of a
+            // million rows
+            let mut st = c.prepare("SELECT camera_id, storage_id, SUM(bytes) FROM segment INDEXED BY segment_start WHERE start_dts>=?1 GROUP BY camera_id, storage_id")?;
             let rows = st.query_map(params![dts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
@@ -1086,9 +1148,9 @@ impl Db {
     pub fn events_in_range(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<Event>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT * FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+                "SELECT * FROM event WHERE camera_id=?1 AND start_dts>=?2 AND start_dts<?3 AND end_dts IS NOT NULL AND end_dts>?4 ORDER BY start_dts",
             )?;
-            let rows = st.query_map(params![camera_id, start, end], Self::row_event)?;
+            let rows = st.query_map(params![camera_id, start - MAX_SPAN, end, start], Self::row_event)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }

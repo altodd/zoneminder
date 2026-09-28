@@ -51,6 +51,8 @@ pub struct StorageHealth {
     pub max_bytes: Option<i64>,
     pub reserve_bytes: i64,
     pub archive_to: Option<i64>,
+    /// bytes past the archive cutoff still on this primary (tiering backlog)
+    pub archive_backlog_bytes: i64,
     /// bytes written to this storage in the last 24 h
     pub ingest_24h: i64,
     /// bytes retention may still fill before it starts deleting
@@ -138,8 +140,9 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
         let oldest_st = db.oldest_segment_per_storage()?;
         for s in db.storages()? {
             let p = Path::new(&s.path);
-            let available = p.is_dir();
+            let available = crate::retention::storage_mounted(&s);
             let used = db.storage_used_bytes(s.id)?;
+            let archive_backlog_bytes = crate::tier::backlog_bytes(db, &s).unwrap_or(0);
             let free = crate::retention::fs_free_bytes(p).unwrap_or(0);
             let ingest_24h: i64 = ingest.iter().filter(|(_, st, _)| *st == s.id).map(|(_, _, b)| *b).sum();
             // room left before the budget deletes: min(cap - used, free - reserve)
@@ -148,7 +151,10 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
             let capacity = used + headroom;
             let effective_days = (ingest_24h > 0).then(|| capacity as f64 / ingest_24h as f64);
             if !available {
-                issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: "volume not mounted".into() });
+                let why = if p.is_dir() { format!("volume not mounted (no {} marker)", crate::retention::MARKER) } else { "volume not mounted".to_string() };
+                issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: why });
+            } else if free < s.reserve_bytes as u64 / 2 && s.archive_to.is_some() {
+                issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: format!("free space {:.1} GB is under half the reserve: tiering cannot keep up, retention is deleting on the primary", free as f64 / 1e9) });
             } else if free < s.reserve_bytes as u64 {
                 issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: format!("free space {:.1} GB is under the {:.1} GB reserve", free as f64 / 1e9, s.reserve_bytes as f64 / 1e9) });
             } else if let Some(d) = effective_days {
@@ -157,14 +163,16 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
                 }
             }
             if let Some(a) = s.archive_to {
-                let ok = db.storage(a)?.map(|x| Path::new(&x.path).is_dir()).unwrap_or(false);
+                let ok = db.storage(a)?.map(|x| crate::retention::storage_mounted(&x)).unwrap_or(false);
                 if !ok {
                     issues.push(Issue { level: "warn".into(), subject: s.path.clone(), text: format!("archive volume (storage {a}) unavailable; retention deletes here instead") });
+                } else if ingest_24h > 0 && archive_backlog_bytes > ingest_24h {
+                    issues.push(Issue { level: "warn".into(), subject: s.path.clone(), text: format!("archive backlog {:.1} GB (more than a day of ingest): raise archive_rate_mbps", archive_backlog_bytes as f64 / 1e9) });
                 }
             }
             storages.push(StorageHealth {
                 id: s.id, path: s.path.clone(), available, used_bytes: used, free_bytes: free, max_bytes: s.max_bytes, reserve_bytes: s.reserve_bytes,
-                archive_to: s.archive_to, ingest_24h, headroom_bytes: headroom, effective_days, oldest_ms: oldest_st.get(&s.id).map(|d| dts_to_ms(*d)),
+                archive_to: s.archive_to, archive_backlog_bytes, ingest_24h, headroom_bytes: headroom, effective_days, oldest_ms: oldest_st.get(&s.id).map(|d| dts_to_ms(*d)),
             });
         }
     }
@@ -222,6 +230,7 @@ pub fn prometheus(r: &HealthReport) -> String {
         line("zmng_storage_headroom_bytes", &l, s.headroom_bytes as f64);
         line("zmng_storage_ingest_bytes_24h", &l, s.ingest_24h as f64);
         line("zmng_storage_effective_days", &l, s.effective_days.unwrap_or(0.0));
+        line("zmng_storage_archive_backlog_bytes", &l, s.archive_backlog_bytes as f64);
     }
     o
 }
@@ -343,7 +352,13 @@ pub async fn doctor(cfg: &crate::config::Config, probe_cameras: bool) -> Vec<Che
     }
     for s in &storages {
         let p = Path::new(&s.path);
-        let access = if s.read_only { p.is_dir().then_some(()).ok_or_else(|| "not a directory".to_string()) } else { writable(p) };
+        let access = if s.read_only {
+            p.is_dir().then_some(()).ok_or_else(|| "not a directory".to_string())
+        } else if !crate::retention::storage_mounted(s) {
+            Err(if p.is_dir() { format!("no {} marker: volume not mounted, or run add-storage again", crate::retention::MARKER) } else { "not a directory".to_string() })
+        } else {
+            writable(p)
+        };
         match access {
             Ok(()) => {
                 let free = crate::retention::fs_free_bytes(p).unwrap_or(0);
@@ -354,7 +369,7 @@ pub async fn doctor(cfg: &crate::config::Config, probe_cameras: bool) -> Vec<Che
             Err(e) => out.push(check(&format!("storage {}", s.id), Verdict::Fail, format!("{}: {e}", s.path))),
         }
         if let Some(a) = s.archive_to {
-            let ok = storages.iter().any(|x| x.id == a && Path::new(&x.path).is_dir());
+            let ok = storages.iter().any(|x| x.id == a && crate::retention::storage_mounted(x));
             out.push(check(&format!("storage {} archive", s.id), if ok { Verdict::Pass } else { Verdict::Warn }, format!("archive_to storage {a}{}", if ok { "" } else { " is not mounted" })));
         }
     }
@@ -520,7 +535,7 @@ mod tests {
         let r = HealthReport {
             version: "0".into(), started_ms: 0, now_ms: 1000, uptime_secs: 1,
             cameras: vec![CameraHealth { id: 1, name: "Front \"door\"".into(), enabled: true, storage_id: 1, recording: true, codec: None, width: 0, height: 0, fps: 18.0, kbps: 2000.0, last_frame_ms: None, reconnects: 2, last_error: None, sub_recording: None, detect_running: true, detect_fps: 5.0, in_event: Some(3), last_event_ms: None, events_24h: 7, ingest_24h: 1000, oldest_ms: None }],
-            storages: vec![StorageHealth { id: 1, path: "/vol".into(), available: true, used_bytes: 10, free_bytes: 90, max_bytes: None, reserve_bytes: 5, archive_to: None, ingest_24h: 20, headroom_bytes: 85, effective_days: Some(4.75), oldest_ms: None }],
+            storages: vec![StorageHealth { id: 1, path: "/vol".into(), available: true, used_bytes: 10, free_bytes: 90, max_bytes: None, reserve_bytes: 5, archive_to: None, archive_backlog_bytes: 0, ingest_24h: 20, headroom_bytes: 85, effective_days: Some(4.75), oldest_ms: None }],
             issues: vec![Issue { level: "warn".into(), subject: "x".into(), text: "y".into() }],
             load: [0.0; 3],
         };

@@ -207,7 +207,7 @@ async fn thumbnail_task_publishes_jpeg_and_event_update() {
     let ev = fx.db.insert_event(cam, t0, "motion").unwrap();
     fx.db.close_event(ev, t0 + 2 * zmng::mp4::TIMESCALE as i64, None, "{}").unwrap();
     let mut rx = fx.bus.subscribe();
-    zmng::detect::thumbnail_task(&fx.db, "ffmpeg", &fx.thumb_dir, &fx.bus, cam, ev, t0 + zmng::mp4::TIMESCALE as i64).await;
+    zmng::detect::thumbnail_task(&fx.db, None, "ffmpeg", &fx.thumb_dir, &fx.bus, cam, ev, t0 + zmng::mp4::TIMESCALE as i64).await;
     let mut got_jpeg = false;
     let mut update = None;
     while let Ok(n) = rx.try_recv() {

@@ -110,6 +110,9 @@ pub struct CamHandle {
     /// Most recent init segment + last few fragments so a new live viewer can
     /// start immediately from a keyframe.
     pub recent: RwLock<Option<Recent>>,
+    /// The segment being written: path and the fragments flushed so far, so
+    /// a thumbnail or frame can be read before the segment closes.
+    pub open: RwLock<Option<OpenSegmentInfo>>,
     /// Shared between the main and sub recorder of a camera.
     pub motion: Arc<MotionLog>,
     pub stop: tokio::sync::watch::Sender<bool>,
@@ -119,6 +122,14 @@ pub struct Recent {
     pub params: Arc<VideoParams>,
     pub init: Bytes,
     pub frags: VecDeque<(i64, u32, Bytes)>,
+}
+
+/// What is known about the segment currently being written.
+#[derive(Clone, Debug)]
+pub struct OpenSegmentInfo {
+    pub abs_path: PathBuf,
+    pub init_len: u32,
+    pub frags: Vec<FragEntry>,
 }
 
 pub struct LiveHub {
@@ -230,6 +241,7 @@ pub async fn reconcile(ctx: Arc<RecorderCtx>) -> Result<()> {
                 status: RwLock::new(CamStatus::default()),
                 live: live_tx,
                 recent: RwLock::new(None),
+                open: RwLock::new(None),
                 motion,
                 stop: stop_tx,
             });
@@ -392,6 +404,10 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
         st.last_error = None;
     }
 
+    if !crate::retention::storage_mounted(storage) {
+        // a bare mount point would silently record onto the root filesystem
+        anyhow::bail!("storage {} is not mounted (no {} marker at {})", storage.id, crate::retention::MARKER, storage.path);
+    }
     let cam_root = match kind {
         StreamKind::Main => Path::new(&storage.path).join(cam.id.to_string()),
         StreamKind::Sub => Path::new(&storage.path).join(cam.id.to_string()).join("sub"),
@@ -689,6 +705,7 @@ fn flush_gop(gop: &mut Vec<Sample>, agop: &mut Vec<Sample>, seg: &mut Option<Ope
     s.pos += frag.len() as u64;
     s.frags.push(entry);
     gop.clear();
+    *h.open.write() = Some(OpenSegmentInfo { abs_path: s.abs_path.clone(), init_len: s.init_len, frags: s.frags.clone() });
 
     // live fan-out
     let (params, init) = {
@@ -719,6 +736,8 @@ async fn close_segment(
     for f in s.frags.iter_mut() {
         f.motion = f.motion.max(h.motion.max_in(f.dts, f.dts + f.duration as i64));
     }
+    // indexed rows win from here; the open-segment view is cleared once the row exists
+    let open_after = if s.frags.is_empty() { None } else { Some(OpenSegmentInfo { abs_path: s.abs_path.clone(), init_len: s.init_len, frags: s.frags.clone() }) };
     let (ctx, cam, storage, kind) = (ctx.clone(), cam.clone(), storage.clone(), h.kind);
     tokio::task::spawn_blocking(move || -> Result<()> {
         if ctx.fsync {
@@ -736,5 +755,10 @@ async fn close_segment(
         debug!(camera = cam.id, segment = id, path = %s.rel_path, secs = dur / TIMESCALE as i64, bytes = s.pos, frags = s.frags.len(), "closed segment");
         Ok(())
     })
-    .await?
+    .await??;
+    let mut o = h.open.write();
+    if o.as_ref().map(|x| Some(&x.abs_path) == open_after.as_ref().map(|y| &y.abs_path)).unwrap_or(false) {
+        *o = None;
+    }
+    Ok(())
 }
