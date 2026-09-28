@@ -90,11 +90,12 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
             warn!(storage = st.id, "archive volume unavailable: falling back to deleting oldest segments on the primary");
         }
         let mut used = db.storage_used_bytes(st.id)?;
-        for _round in 0..50 {
+        let over_budget = |used: i64| -> bool {
             let free = fs_free_bytes(p).unwrap_or(u64::MAX) as i64;
-            let over_cap = st.max_bytes.map(|m| used > m).unwrap_or(false);
-            let under_reserve = free < st.reserve_bytes;
-            if !over_cap && !under_reserve {
+            st.max_bytes.map(|m| used > m).unwrap_or(false) || free < st.reserve_bytes
+        };
+        'budget: for _round in 0..50 {
+            if !over_budget(used) {
                 break;
             }
             let victims = db.oldest_segments(st.id, 20)?;
@@ -106,6 +107,10 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
                 if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                     used -= s.bytes;
                     deleted += 1;
+                }
+                // re-check after every unlink: never delete a whole batch past the budget
+                if !over_budget(used) {
+                    break 'budget;
                 }
             }
         }
