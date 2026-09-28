@@ -22,6 +22,7 @@ const compat = new FlatCompat({
 
 module.exports = defineConfig([{
   "files": ["**/*.js", "**/*.js.php"],
+  "ignores": ["zmng/**"],
 
   "languageOptions": {
     sourceType: "script",
@@ -91,6 +92,29 @@ module.exports = defineConfig([{
 
   "languageOptions": {
     sourceType: "module",
+  },
+}, {
+  // zmng's no-build SPA: ES modules, dense style; correctness rules only
+  // (the Google style rules above are written for the legacy PHP-embedded JS).
+  "files": ["zmng/web/**/*.js"],
+
+  "languageOptions": {
+    sourceType: "module",
+    ecmaVersion: 2022,
+    globals: {
+      ...globals.browser,
+    },
+  },
+
+  "extends": [js.configs.recommended],
+
+  "rules": {
+    "no-unused-vars": ["error", {
+      "vars": "local",
+      "args": "none",
+      "caughtErrors": "none",
+    }],
+    "no-empty": ["error", {"allowEmptyCatch": true}],
   },
 }, globalIgnores([
   "**/*.min.js",
