@@ -102,3 +102,16 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 .grid.montage { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
 .grid.montage .tile { cursor: default; }
 .timeline.tall { height: 160px; }
+
+/* scrub preview + camera page */
+.timeline .preview { position: absolute; bottom: 100%; margin-bottom: 6px; width: 160px; background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; pointer-events: none; z-index: 5; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
+.timeline .preview img { width: 160px; height: 90px; object-fit: cover; display: block; background: #111; }
+.timeline .preview .ptime { font-size: 11px; padding: 2px 6px; color: var(--text); background: rgba(0,0,0,.7); }
+.timeline { overflow: visible; margin-top: 14px; }
+.player .livebadge { position: absolute; right: 10px; top: 8px; background: rgba(255,90,95,.85); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; }
+.filters label { margin: 0; }
+.filters input[type=datetime-local] { width: auto; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--text); cursor: pointer; margin: 0; }
+.chip input { width: auto; margin: 0; }
+.small { font-size: 12px; }
+.toolbar h2 { font-size: 18px; }

@@ -754,7 +754,11 @@ async fn frame_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<F
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
     let dts = video::ms_to_dts(q.t);
-    let segs = app.db.segments_in_range(id, dts, dts + 1).map_err(err500)?;
+    let kind = stream_of(&q.stream)?;
+    let mut segs = app.db.segments_in_range_stream(id, kind.as_str(), dts, dts + 1).map_err(err500)?;
+    if segs.is_empty() && kind == crate::recorder::StreamKind::Sub {
+        segs = app.db.segments_in_range(id, dts, dts + 1).map_err(err500)?; // fall back to main
+    }
     let seg = segs.first().ok_or_else(|| (StatusCode::NOT_FOUND, "no recording at that time").into_response())?;
     let frag = seg.index.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64).or_else(|| seg.index.first()).copied().ok_or_else(|| err500("empty segment"))?;
     let storage = app.db.storage(seg.storage_id).map_err(err500)?.ok_or_else(|| err500("storage missing"))?;
@@ -777,6 +781,8 @@ async fn frame_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<F
 struct FrameQ {
     t: i64,
     width: Option<u32>,
+    /// "sub" decodes the substream keyframe (~10x cheaper; use for scrub previews)
+    stream: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

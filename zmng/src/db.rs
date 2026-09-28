@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS camera (
   record_sub       INTEGER NOT NULL DEFAULT 1,
   -- segments overlapping an event are kept this long (0 = same as retention_days)
   event_retention_days REAL NOT NULL DEFAULT 0,
+  -- comma separated group names (Outside, Inside, ...), used for filtering
+  tags             TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL
 );
 
@@ -161,6 +163,11 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
                 anyhow::bail!("{k} must be a non-empty string");
             }
         }
+        "tags" => {
+            if !v.is_string() {
+                anyhow::bail!("tags must be a string");
+            }
+        }
         "sub_url" => {
             if !(v.is_null() || v.is_string()) {
                 anyhow::bail!("sub_url must be a string or null");
@@ -208,6 +215,9 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has_col("storage", "archive_to")? {
         c.execute_batch("ALTER TABLE storage ADD COLUMN archive_to INTEGER REFERENCES storage(id); ALTER TABLE storage ADD COLUMN archive_after_days REAL; ALTER TABLE storage ADD COLUMN archive_rate_mbps INTEGER NOT NULL DEFAULT 40;")?;
     }
+    if !has_col("camera", "tags")? {
+        c.execute_batch("ALTER TABLE camera ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
+    }
     if !has_col("camera", "record_sub")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN record_sub INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN event_retention_days REAL NOT NULL DEFAULT 0;")?;
     }
@@ -253,6 +263,7 @@ pub struct Camera {
     pub sort_order: i64,
     pub record_sub: bool,
     pub event_retention_days: f64,
+    pub tags: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -470,6 +481,7 @@ impl Db {
             sort_order: r.get("sort_order")?,
             record_sub: r.get::<_, i64>("record_sub")? != 0,
             event_retention_days: r.get("event_retention_days")?,
+            tags: r.get("tags")?,
         })
     }
 
@@ -503,7 +515,7 @@ impl Db {
             "name", "main_url", "sub_url", "enabled", "storage_id", "retention_days", "detect_fps",
             "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
             "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
-            "record_sub", "event_retention_days",
+            "record_sub", "event_retention_days", "tags",
         ];
         self.with(|c| {
             for (k, v) in patch {

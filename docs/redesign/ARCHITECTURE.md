@@ -213,3 +213,10 @@ Decisions taken with Aaron after the first review:
 * **zmNinjaNg compatibility layer** (`src/zmapi.rs`, research in `research/03-zmninjang-api.md`): ZoneMinder's JSON API under `/zm/api` (JWT `?token=` login/refresh, monitors, events with the path-segment filter grammar and pagination, archive/delete, notifications registration), `index.php?view=image|view_video|view_event_hls|request` and `cgi-bin/nph-zms` (single JPEG and MJPEG from the substream). Events are our motion intervals; `view_video` is a complete MP4 with `Accept-Ranges` cut from the continuous recording. Push delivery still needs the zmNinjaNg FCM relay key (or a rebuilt app); the ES websocket for desktop toasts is next.
 
 Verified locally against two real cameras (Front Door, Playground): main + sub recording, recorder-fed detection at 5 fps, tiering moves with checksum, substream range playback, ZM-API login → monitors → filtered events → thumbnail → MP4 with byte ranges → MJPEG live.
+
+### UI structure (revised 2026-09-28 with Aaron)
+* **Live** — tile wall of every camera (snapshots, substream MSE, or go2rtc WebRTC), filterable by group. Click a tile → the camera page.
+* **Camera page** — full-resolution live (MSE) with a **● Live** button, this camera's timeline (coverage, motion, events) directly under it, hover/drag scrubbing with snapshot previews (substream keyframes, ~30 ms each, cached), wheel zoom, keyboard, export, full-res frame.
+* **Review** — the multi-camera synchronized player with ZoneMinder-style filters: date/time range (with quick ranges), camera groups, individual cameras, "only cameras with motion in range"; per-camera timeline rows with previews of the row under the cursor; double-click a tile for full resolution at that instant.
+* **Events** — list with thumbnails, camera/group/score/date filters; opens the clip, the camera timeline, or Review at that time.
+* Camera **groups** are a comma-separated `tags` field per camera (Outside, Inside, Shelter, CBA…) used by Live, Review and Events filters; viewer permissions stay per camera.

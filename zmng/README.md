@@ -63,7 +63,7 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/playlist.m3u8?start&end` | HLS (fMP4, byte ranges) |
 | `GET /api/cameras/{id}/live.mp4` | live fMP4 (chunked) |
 | `GET /api/cameras/{id}/snapshot.jpg?width` | latest keyframe as JPEG |
-| `GET /api/cameras/{id}/frame.jpg?t&width` | keyframe nearest to time `t` |
+| `GET /api/cameras/{id}/frame.jpg?t&width[&stream=sub]` | keyframe nearest to time `t` (`stream=sub` ≈ 30 ms, used for scrub previews) |
 | `GET /api/segments/{id}/file.mp4` (Range), `/init.mp4`, `/frag/{n}.m4s` | raw media for HLS |
 | `GET /api/events?camera&start&end&min_score&archived&before&limit&order` | keyset-paged list |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
