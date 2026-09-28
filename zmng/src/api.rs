@@ -725,14 +725,7 @@ async fn segment_init(State(app): State<App>, Path(id): Path<i64>, user: Option<
     let seg = app.db.segment(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such segment").into_response())?;
     can_see(&app, u, seg.camera_id)?;
     let se = app.db.sample_entry(seg.sample_entry_id).map_err(err500)?.ok_or_else(|| err500("sample entry missing"))?;
-    let vp = crate::mp4::VideoParams {
-        codec: crate::mp4::Codec::parse(&se.codec).unwrap_or(crate::mp4::Codec::H264),
-        width: se.width,
-        height: se.height,
-        sample_entry: bytes::Bytes::from(se.data),
-        rfc6381: se.rfc6381,
-    };
-    let init = crate::mp4::init_segment(&vp);
+    let init = crate::mp4::init_segment(&se.video_params());
     Ok(([(header::CONTENT_TYPE, "video/mp4"), (header::CACHE_CONTROL, "private, max-age=31536000, immutable")], init).into_response())
 }
 

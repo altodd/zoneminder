@@ -57,11 +57,17 @@ pub struct VideoParams {
     pub sample_entry: Bytes,
     /// RFC 6381 codec string, e.g. `avc1.640028` or `hvc1.1.6.L153.B0`.
     pub rfc6381: String,
+    /// AAC audio track recorded alongside (opt-in per camera).
+    pub audio: Option<AudioParams>,
 }
 
 impl VideoParams {
+    /// MIME type for MSE, listing the audio codec too when present.
     pub fn mime(&self) -> String {
-        format!("video/mp4; codecs=\"{}\"", self.rfc6381)
+        match &self.audio {
+            Some(a) => format!("video/mp4; codecs=\"{},{}\"", self.rfc6381, a.rfc6381),
+            None => format!("video/mp4; codecs=\"{}\"", self.rfc6381),
+        }
     }
 }
 
@@ -98,8 +104,66 @@ impl BoxWriter {
     }
 }
 
-/// Build the init segment (`ftyp` + `moov`) for a single video track.
+/// AAC audio track parameters (opt-in audio passthrough).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioParams {
+    /// A complete `mp4a` sample entry box (with `esds`).
+    pub sample_entry: Bytes,
+    /// Track timescale = sample rate (AAC: 1024 samples per frame).
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// e.g. `mp4a.40.2`
+    pub rfc6381: String,
+}
+
+/// Build an `mp4a` sample entry with an `esds` carrying the given
+/// AudioSpecificConfig (2 bytes for AAC-LC).
+pub fn aac_sample_entry(sample_rate: u32, channels: u16, asc: &[u8]) -> Bytes {
+    let mut w = BoxWriter::new();
+    w.open(b"mp4a");
+    w.buf.put_slice(&[0u8; 6]); // reserved
+    w.buf.put_u16(1); // data_reference_index
+    w.buf.put_slice(&[0u8; 8]); // reserved
+    w.buf.put_u16(channels);
+    w.buf.put_u16(16); // sample size
+    w.buf.put_u32(0); // pre_defined + reserved
+    w.buf.put_u32(sample_rate << 16);
+    // esds: ES_Descriptor(3) > DecoderConfigDescriptor(4) > DecoderSpecificInfo(5), SLConfigDescriptor(6)
+    w.open_full(b"esds", 0, 0);
+    let dsi_len = asc.len();
+    let dcd_len = 13 + 2 + dsi_len;
+    let es_len = 3 + 2 + dcd_len + 3;
+    w.buf.put_u8(0x03);
+    w.buf.put_u8(es_len as u8);
+    w.buf.put_u16(1); // ES_ID
+    w.buf.put_u8(0); // flags
+    w.buf.put_u8(0x04);
+    w.buf.put_u8(dcd_len as u8);
+    w.buf.put_u8(0x40); // objectTypeIndication: Audio ISO/IEC 14496-3
+    w.buf.put_u8(0x15); // streamType audio (5 << 2) | reserved 1
+    w.buf.put_slice(&[0, 0, 0]); // bufferSizeDB
+    w.buf.put_u32(0); // maxBitrate
+    w.buf.put_u32(0); // avgBitrate
+    w.buf.put_u8(0x05);
+    w.buf.put_u8(dsi_len as u8);
+    w.buf.put_slice(asc);
+    w.buf.put_u8(0x06);
+    w.buf.put_u8(1);
+    w.buf.put_u8(0x02);
+    w.close();
+    w.close();
+    w.finish()
+}
+
+/// Build the init segment (`ftyp` + `moov`): the video track and, when
+/// `p.audio` is set, the AAC track.
 pub fn init_segment(p: &VideoParams) -> Bytes {
+    init_segment_av(p, p.audio.as_ref())
+}
+
+/// Init segment for a video track (id 1) and, optionally, an AAC audio
+/// track (id 2).
+pub fn init_segment_av(p: &VideoParams, audio: Option<&AudioParams>) -> Bytes {
     let mut w = BoxWriter::new();
     // ftyp
     w.open(b"ftyp");
@@ -126,7 +190,7 @@ pub fn init_segment(p: &VideoParams) -> Bytes {
             w.buf.put_u32(v);
         }
         w.buf.put_slice(&[0u8; 24]); // pre_defined
-        w.buf.put_u32(2); // next_track_id
+        w.buf.put_u32(if audio.is_some() { 3 } else { 2 }); // next_track_id
         w.close();
 
         // trak
@@ -206,15 +270,89 @@ pub fn init_segment(p: &VideoParams) -> Bytes {
         }
         w.close(); // trak
 
+        if let Some(a) = audio {
+            w.open(b"trak");
+            {
+                w.open_full(b"tkhd", 0, 0x7);
+                w.buf.put_u32(0);
+                w.buf.put_u32(0);
+                w.buf.put_u32(2); // track id
+                w.buf.put_u32(0);
+                w.buf.put_u32(0);
+                w.buf.put_u64(0);
+                w.buf.put_u16(0);
+                w.buf.put_u16(1); // alternate group
+                w.buf.put_u16(0x0100); // volume
+                w.buf.put_u16(0);
+                for v in UNITY_MATRIX {
+                    w.buf.put_u32(v);
+                }
+                w.buf.put_u32(0);
+                w.buf.put_u32(0);
+                w.close();
+                w.open(b"mdia");
+                {
+                    w.open_full(b"mdhd", 0, 0);
+                    w.buf.put_u32(0);
+                    w.buf.put_u32(0);
+                    w.buf.put_u32(a.sample_rate);
+                    w.buf.put_u32(0);
+                    w.buf.put_u16(0x55c4);
+                    w.buf.put_u16(0);
+                    w.close();
+                    w.open_full(b"hdlr", 0, 0);
+                    w.buf.put_u32(0);
+                    w.buf.put_slice(b"soun");
+                    w.buf.put_slice(&[0u8; 12]);
+                    w.buf.put_slice(b"SoundHandler\0");
+                    w.close();
+                    w.open(b"minf");
+                    {
+                        w.open_full(b"smhd", 0, 0);
+                        w.buf.put_u32(0);
+                        w.close();
+                        w.open(b"dinf");
+                        w.open_full(b"dref", 0, 0);
+                        w.buf.put_u32(1);
+                        w.open_full(b"url ", 0, 1);
+                        w.close();
+                        w.close();
+                        w.close();
+                        w.open(b"stbl");
+                        {
+                            w.open_full(b"stsd", 0, 0);
+                            w.buf.put_u32(1);
+                            w.buf.put_slice(&a.sample_entry);
+                            w.close();
+                            for b in [b"stts", b"stsc", b"stsz", b"stco"] {
+                                w.open_full(b, 0, 0);
+                                if b == b"stsz" {
+                                    w.buf.put_u32(0);
+                                }
+                                w.buf.put_u32(0);
+                                w.close();
+                            }
+                        }
+                        w.close();
+                    }
+                    w.close();
+                }
+                w.close();
+            }
+            w.close(); // audio trak
+        }
+
         // mvex
         w.open(b"mvex");
-        w.open_full(b"trex", 0, 0);
-        w.buf.put_u32(1); // track id
-        w.buf.put_u32(1); // default sample description index
-        w.buf.put_u32(0);
-        w.buf.put_u32(0);
-        w.buf.put_u32(0);
-        w.close();
+        for track in 1..=(if audio.is_some() { 2 } else { 1 }) {
+            w.open_full(b"trex", 0, 0);
+            w.buf.put_u32(track); // track id
+            w.buf.put_u32(1); // default sample description index
+            w.buf.put_u32(0);
+            w.buf.put_u32(0);
+            w.buf.put_u32(0);
+            w.close();
+        }
         w.close();
     }
     w.close(); // moov
@@ -235,6 +373,60 @@ pub struct Sample {
 
 /// Build a `moof` + `mdat` for a list of samples (a GOP).
 pub fn fragment(seq: u32, samples: &[Sample]) -> Bytes {
+    fragment_av(seq, samples, &[])
+}
+
+/// One `moof` with a `traf` per track (video = track 1, audio = track 2,
+/// audio sample dts/durations in the audio timescale) and one `mdat`
+/// holding the video payloads followed by the audio payloads.
+pub fn fragment_av(seq: u32, video: &[Sample], audio: &[Sample]) -> Bytes {
+    if audio.is_empty() {
+        return fragment_one(seq, video);
+    }
+    let traf_len = |n: usize| 8 + 16 + 20 + (12 + 4 + 4 + 12 * n);
+    let moof_len = 8 + 16 + traf_len(video.len()) + traf_len(audio.len());
+    let vbytes: usize = video.iter().map(|s| s.data.len()).sum();
+    let abytes: usize = audio.iter().map(|s| s.data.len()).sum();
+    let mut w = BoxWriter::new();
+    w.buf.reserve(moof_len + 8 + vbytes + abytes);
+    w.open(b"moof");
+    {
+        w.open_full(b"mfhd", 0, 0);
+        w.buf.put_u32(seq);
+        w.close();
+        for (track, samples, data_offset) in [(1u32, video, moof_len + 8), (2u32, audio, moof_len + 8 + vbytes)] {
+            w.open(b"traf");
+            {
+                w.open_full(b"tfhd", 0, 0x0002_0000);
+                w.buf.put_u32(track);
+                w.close();
+                w.open_full(b"tfdt", 1, 0);
+                w.buf.put_u64(samples.first().map(|s| s.dts).unwrap_or(0) as u64);
+                w.close();
+                w.open_full(b"trun", 0, 0x1 | 0x100 | 0x200 | 0x400);
+                w.buf.put_u32(samples.len() as u32);
+                w.buf.put_u32(data_offset as u32);
+                for s in samples {
+                    w.buf.put_u32(s.duration);
+                    w.buf.put_u32(s.data.len() as u32);
+                    w.buf.put_u32(if s.is_key { 0x0200_0000 } else { 0x0101_0000 });
+                }
+                w.close();
+            }
+            w.close();
+        }
+    }
+    w.close();
+    debug_assert_eq!(w.buf.len(), moof_len);
+    w.buf.put_u32((vbytes + abytes + 8) as u32);
+    w.buf.put_slice(b"mdat");
+    for s in video.iter().chain(audio.iter()) {
+        w.buf.put_slice(&s.data);
+    }
+    w.finish()
+}
+
+fn fragment_one(seq: u32, samples: &[Sample]) -> Bytes {
     let base_dts = samples.first().map(|s| s.dts).unwrap_or(0);
     let mdat_payload: usize = samples.iter().map(|s| s.data.len()).sum();
     // Box sizes are fully determined by the sample count, so the trun
@@ -624,7 +816,8 @@ fn parse_moof(moof: &[u8]) -> anyhow::Result<(i64, u32, u32)> {
             let traf = &moof[pos..pos + size];
             let mut p = 8;
             let mut default_dur = 0u32;
-            while p + 8 <= traf.len() {
+            let mut skip = false; // an audio traf (track != 1) does not count
+            while p + 8 <= traf.len() && !skip {
                 let s = rd32(traf, p)? as usize;
                 let t = &traf[p + 4..p + 8];
                 if s < 8 || p + s > traf.len() {
@@ -633,6 +826,10 @@ fn parse_moof(moof: &[u8]) -> anyhow::Result<(i64, u32, u32)> {
                 match t {
                     b"tfhd" => {
                         let flags = rd32(traf, p + 8)? & 0xff_ffff;
+                        if rd32(traf, p + 12)? != 1 {
+                            skip = true;
+                            continue;
+                        }
                         let mut q = p + 16;
                         if flags & 0x1 != 0 { q += 8; }
                         if flags & 0x2 != 0 { q += 4; }
@@ -729,6 +926,9 @@ pub fn parse_fragment_samples(frag: &[u8]) -> anyhow::Result<Vec<SampleInfo>> {
                 match &traf[p + 4..p + 8] {
                     b"tfhd" => {
                         let flags = rd32(traf, p + 8)? & 0xff_ffff;
+                        if rd32(traf, p + 12)? != 1 {
+                            break; // audio traf: not part of the video sample table
+                        }
                         base_is_moof = flags & 0x2_0000 != 0;
                         let mut q = p + 16;
                         if flags & 0x1 != 0 { q += 8; }
@@ -802,6 +1002,7 @@ mod tests {
                 Bytes::from(v)
             },
             rfc6381: "avc1.64001e".into(),
+            audio: None,
         }
     }
 
@@ -893,6 +1094,31 @@ mod tests {
     }
 
     #[test]
+    fn av_fragment_indexes_only_the_video_track() {
+        let v = |dts: i64| Sample { dts, duration: 9000, is_key: true, data: Bytes::from(vec![1u8; 20]) };
+        let a = |dts: i64| Sample { dts, duration: 1024, is_key: true, data: Bytes::from(vec![2u8; 8]) };
+        let f = fragment_av(3, &[v(90_000), v(99_000)], &[a(48_000), a(49_024), a(50_048)]);
+        let (dts, dur, n) = parse_moof(&f[..u32::from_be_bytes(f[0..4].try_into().unwrap()) as usize]).unwrap();
+        assert_eq!((dts, dur, n), (90_000, 18_000, 2));
+        let samples = parse_fragment_samples(&f).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(&f[samples[0].offset..samples[0].offset + 20], &[1u8; 20]);
+        // the audio payload follows the video payload inside the mdat
+        assert_eq!(&f[samples[1].offset + 20..samples[1].offset + 28], &[2u8; 8]);
+        let audio = AudioParams { sample_entry: aac_sample_entry(48_000, 1, &[0x11, 0x88]), sample_rate: 48_000, channels: 1, rfc6381: "mp4a.40.2".into() };
+        let init = init_segment_av(&params(), Some(&audio));
+        let (fourcc, _, _, _) = extract_sample_entry(&init).unwrap();
+        assert_eq!(fourcc, "avc1", "video stays the first track");
+        assert_eq!(VideoParams { audio: Some(audio.clone()), ..params() }.mime(), "video/mp4; codecs=\"avc1.64001e,mp4a.40.2\"");
+        assert_eq!(extract_audio_entry(&init).map(|(e, r, c)| (e[4..8].to_vec(), r, c)), Some((b"mp4a".to_vec(), 48_000, 1)));
+        assert!(extract_audio_entry(&init_segment(&params())).is_none());
+        let scanned = scan_segment(&[init.as_ref(), &f].concat()).unwrap();
+        assert_eq!(scanned.frags.len(), 1);
+        assert_eq!(scanned.frags[0].samples, 2);
+        assert_eq!(scanned.frags[0].duration, 18_000);
+    }
+
+    #[test]
     fn fragment_samples_roundtrip() {
         let s = |dts: i64, key: bool, n: usize| Sample { dts, duration: 3000, is_key: key, data: Bytes::from(vec![0xCD; n]) };
         let f = fragment(7, &[s(0, true, 50), s(3000, false, 10), s(6000, false, 20)]);
@@ -952,6 +1178,36 @@ pub fn extract_sample_entry(init: &[u8]) -> Option<(String, Vec<u8>, u32, u32)> 
     let w = u16::from_be_bytes(entry[32..34].try_into().ok()?) as u32;
     let h = u16::from_be_bytes(entry[34..36].try_into().ok()?) as u32;
     Some((fourcc, entry[..size].to_vec(), w, h))
+}
+
+/// From an init segment with an audio track (the `trak` whose handler is
+/// `soun`): (whole `mp4a` sample entry box, sample rate, channels).
+pub fn extract_audio_entry(init: &[u8]) -> Option<(Vec<u8>, u32, u16)> {
+    let moov = find_box(init, &[b"moov"])?;
+    let mut pos = 8;
+    while pos + 8 <= moov.len() {
+        let size = u32::from_be_bytes(moov[pos..pos + 4].try_into().ok()?) as usize;
+        if size < 8 || pos + size > moov.len() {
+            return None;
+        }
+        if &moov[pos + 4..pos + 8] == b"trak" {
+            let trak = &moov[pos..pos + size];
+            let hdlr = find_box(trak, &[b"trak", b"mdia", b"hdlr"]);
+            if hdlr.map(|h| h.len() >= 20 && &h[16..20] == b"soun").unwrap_or(false) {
+                let stsd = find_box(trak, &[b"trak", b"mdia", b"minf", b"stbl", b"stsd"])?;
+                let entry = stsd.get(16..)?;
+                let esize = u32::from_be_bytes(entry.get(0..4)?.try_into().ok()?) as usize;
+                if esize < 36 || esize > entry.len() {
+                    return None;
+                }
+                let channels = u16::from_be_bytes(entry[24..26].try_into().ok()?);
+                let rate = u32::from_be_bytes(entry[32..36].try_into().ok()?) >> 16;
+                return Some((entry[..esize].to_vec(), rate, channels));
+            }
+        }
+        pos += size;
+    }
+    None
 }
 
 /// Derive the RFC 6381 codec string from a sample entry (avcC / hvcC).

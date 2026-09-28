@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::db::{Camera, Db, Storage};
-use crate::mp4::{self, Codec, FragEntry, Sample, VideoParams, TIMESCALE};
+use crate::mp4::{self, AudioParams, Codec, FragEntry, Sample, VideoParams, TIMESCALE};
 
 /// One closed fragment, published to live viewers.
 #[derive(Clone)]
@@ -365,6 +365,20 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
         .setup(video_i, SetupOptions::default().transport(Transport::Tcp(Default::default())))
         .await
         .context("SETUP")?;
+    // opt-in AAC audio on the main stream (substream recordings stay video-only)
+    let mut audio_i = if cam.record_audio && kind == StreamKind::Main {
+        session.streams().iter().position(|s| s.media() == "audio" && s.encoding_name() == "aac")
+    } else {
+        None
+    };
+    if let Some(ai) = audio_i {
+        if let Err(e) = session.setup(ai, SetupOptions::default().transport(Transport::Tcp(Default::default()))).await {
+            warn!(camera = cam.id, "audio SETUP failed, recording video only: {e}");
+            audio_i = None;
+        }
+    } else if cam.record_audio && kind == StreamKind::Main {
+        warn!(camera = cam.id, "record_audio is on but the camera offers no AAC track");
+    }
     let playing = session
         .play(PlayOptions::default().enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()))
         .await
@@ -388,6 +402,8 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     let mut sample_entry_id: i64 = 0;
     let mut seg: Option<OpenSegment> = None;
     let mut gop: Vec<Sample> = Vec::new();
+    let mut agop: Vec<Sample> = Vec::new(); // audio frames of the current GOP (audio timescale)
+    let mut audio_rate: u32 = 0;
     let mut pending: Option<Pending> = None;
     // wallclock anchoring: (rtp elapsed at anchor, dts at anchor)
     let mut anchor: Option<(i64, i64)> = None;
@@ -415,6 +431,17 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
         };
         let frame = match item {
             CodecItem::VideoFrame(f) if f.stream_id() == video_i => f,
+            CodecItem::AudioFrame(a) if Some(a.stream_id()) == audio_i => {
+                // only once video is flowing and anchored; timestamps follow the video clock mapping
+                if let (Some((a_rtp, a_wall)), true) = (anchor, audio_rate > 0 && (seg.is_some() || !gop.is_empty() || pending.is_some())) {
+                    let ts = a.timestamp();
+                    let elapsed_90k = (ts.elapsed() as i128 * TIMESCALE as i128 / ts.clock_rate().get() as i128) as i64;
+                    let dts90k = a_wall + (elapsed_90k - a_rtp);
+                    let dts = (dts90k as i128 * audio_rate as i128 / TIMESCALE as i128) as i64;
+                    agop.push(Sample { dts, duration: a.frame_length().get(), is_key: true, data: Bytes::copy_from_slice(a.data()) });
+                }
+                continue;
+            }
             _ => continue,
         };
         let is_key = frame.is_random_access_point();
@@ -432,26 +459,43 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
             let codec = Codec::parse(stream.encoding_name()).unwrap_or(Codec::H264);
             let (w, hgt) = p.pixel_dimensions();
             let entry = p.mp4_sample_entry().build().map_err(|e| anyhow::anyhow!("sample entry: {e}"))?;
+            let audio: Option<AudioParams> = audio_i.and_then(|ai| match demuxed.streams()[ai].parameters() {
+                Some(retina::codec::ParametersRef::Audio(a)) => match a.mp4_sample_entry().build() {
+                    Ok(e) => Some(AudioParams {
+                        sample_entry: Bytes::from(e),
+                        sample_rate: a.clock_rate(),
+                        channels: a.channels().get(),
+                        rfc6381: a.rfc6381_codec().unwrap_or("mp4a.40.2").to_string(),
+                    }),
+                    Err(e) => {
+                        warn!(camera = cam.id, "audio sample entry: {e}; recording video only");
+                        None
+                    }
+                },
+                _ => None,
+            });
+            audio_rate = audio.as_ref().map(|a| a.sample_rate).unwrap_or(0);
             let vp = Arc::new(VideoParams {
                 codec,
                 width: w,
                 height: hgt,
                 sample_entry: Bytes::from(entry),
                 rfc6381: p.rfc6381_codec().to_string(),
+                audio,
             });
             if params.as_ref().map(|old| **old != *vp).unwrap_or(true) {
-                info!(camera = cam.id, stream = kind.as_str(), codec = %codec, width = w, height = hgt, rfc6381 = %vp.rfc6381, "video parameters");
+                info!(camera = cam.id, stream = kind.as_str(), codec = %codec, width = w, height = hgt, rfc6381 = %vp.rfc6381, audio = vp.audio.as_ref().map(|a| a.rfc6381.as_str()).unwrap_or("none"), "video parameters");
                 // a codec change forces a new segment: flush what we have under the OLD sample entry
                 if seg.is_some() {
                     if let Some(prev) = pending.take() {
                         let dur = gop.last().map(|x| x.duration).unwrap_or(TIMESCALE / 18);
                         gop.push(Sample { dts: prev.dts, duration: dur, is_key: prev.is_key, data: prev.data });
                     }
-                    flush_gop(&mut gop, &mut seg, h)?;
+                    flush_gop(&mut gop, &mut agop, &mut seg, h)?;
                     close_segment(ctx, h, cam, storage, sample_entry_id, seg.take()).await?;
                 }
                 init = mp4::init_segment(&vp);
-                sample_entry_id = ctx.db.intern_sample_entry(codec, &vp.rfc6381, w, hgt, &vp.sample_entry)?;
+                sample_entry_id = ctx.db.intern_sample_entry(codec, &vp.rfc6381, w, hgt, &vp.sample_entry, vp.audio.as_ref())?;
                 *h.recent.write() = Some(Recent { params: vp.clone(), init: init.clone(), frags: VecDeque::new() });
                 {
                     let mut st = h.status.write();
@@ -514,7 +558,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
                 if seg.is_none() {
                     seg = Some(open_segment(&cam_root, storage, cam, kind, &init, gop[0].dts)?);
                 }
-                flush_gop(&mut gop, &mut seg, h)?;
+                flush_gop(&mut gop, &mut agop, &mut seg, h)?;
                 let must_close = seg.as_ref().map(|s| dts - s.start_dts >= seg_len_dts).unwrap_or(false) || force_new_segment;
                 if must_close {
                     close_segment(ctx, h, cam, storage, sample_entry_id, seg.take()).await?;
@@ -560,7 +604,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
                 seg = Some(s);
             }
         }
-        if flush_gop(&mut gop, &mut seg, h).is_ok() {
+        if flush_gop(&mut gop, &mut agop, &mut seg, h).is_ok() {
             if let Err(e) = close_segment(ctx, h, cam, storage, sample_entry_id, seg.take()).await {
                 warn!(camera = cam.id, "closing segment at session end: {e:#}");
             }
@@ -614,13 +658,14 @@ fn open_segment(cam_root: &Path, storage: &Storage, cam: &Camera, kind: StreamKi
 /// A write failure (disk full, volume gone) is fatal for the session: the
 /// fragment is not indexed and the caller tears the session down so the
 /// supervisor reconnects with backoff instead of indexing garbage.
-fn flush_gop(gop: &mut Vec<Sample>, seg: &mut Option<OpenSegment>, h: &CamHandle) -> Result<()> {
-    let Some(s) = seg.as_mut() else { gop.clear(); return Ok(()) };
+fn flush_gop(gop: &mut Vec<Sample>, agop: &mut Vec<Sample>, seg: &mut Option<OpenSegment>, h: &CamHandle) -> Result<()> {
+    let Some(s) = seg.as_mut() else { gop.clear(); agop.clear(); return Ok(()) };
     if gop.is_empty() {
         return Ok(());
     }
     s.seq += 1;
-    let frag = mp4::fragment(s.seq, gop);
+    let frag = mp4::fragment_av(s.seq, gop, agop);
+    agop.clear();
     let dts = gop[0].dts;
     let duration: u32 = gop.iter().map(|x| x.duration).sum();
     let samples = gop.len() as u32;

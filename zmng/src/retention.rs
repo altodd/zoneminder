@@ -225,7 +225,8 @@ fn adopt_file(db: &Db, st: &crate::db::Storage, cam_id: i64, rel: &str, abs: &Pa
         .ok_or_else(|| anyhow::anyhow!("no sample entry in moov"))?;
     let codec = mp4::Codec::parse(&fourcc).ok_or_else(|| anyhow::anyhow!("unknown codec {fourcc}"))?;
     let rfc = mp4::rfc6381_from_sample_entry(codec, &entry).unwrap_or_else(|| codec.to_string());
-    let se = db.intern_sample_entry(codec, &rfc, w, h, &entry)?;
+    let audio = mp4::extract_audio_entry(&init).map(|(e, rate, ch)| mp4::AudioParams { sample_entry: bytes::Bytes::from(e), sample_rate: rate, channels: ch, rfc6381: "mp4a.40.2".into() });
+    let se = db.intern_sample_entry(codec, &rfc, w, h, &entry, audio.as_ref())?;
     let valid_len = scanned.frags.last().map(|f| f.offset + f.len as u64).unwrap_or(0);
     let stream = if rel.contains("/sub/") { "sub" } else { "main" };
     db.insert_segment_ext(cam_id, st.id, se, rel, valid_len as i64, scanned.init_len, &scanned.frags, 0, None, stream)?;

@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS camera (
   ptz              INTEGER NOT NULL DEFAULT 0,
   ptz_url          TEXT NOT NULL DEFAULT '',
   ptz_profile      TEXT NOT NULL DEFAULT '',
+  -- record the main stream's AAC audio track too (opt-in)
+  record_audio     INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL
 );
 
@@ -84,7 +86,12 @@ CREATE TABLE IF NOT EXISTS sample_entry (
   rfc6381  TEXT NOT NULL,
   width    INTEGER NOT NULL,
   height   INTEGER NOT NULL,
-  data     BLOB NOT NULL
+  data     BLOB NOT NULL,
+  -- optional AAC track recorded with the video (mp4a box, rate, channels, codec string)
+  audio_entry    BLOB,
+  audio_rate     INTEGER,
+  audio_channels INTEGER,
+  audio_rfc6381  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -194,7 +201,7 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
             }
         }
         "event_retention_days" => num(0.0, 3650.0)?,
-        "enabled" | "record_sub" | "objects" | "require_object" | "ptz" => {
+        "enabled" | "record_sub" | "objects" | "require_object" | "ptz" | "record_audio" => {
             if !(v.is_boolean() || v.as_i64().map(|i| i == 0 || i == 1).unwrap_or(false)) {
                 anyhow::bail!("enabled must be true/false");
             }
@@ -240,6 +247,12 @@ fn migrate(c: &Connection) -> Result<()> {
     }
     if !has_col("camera", "tags")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !has_col("sample_entry", "audio_entry")? {
+        c.execute_batch("ALTER TABLE sample_entry ADD COLUMN audio_entry BLOB; ALTER TABLE sample_entry ADD COLUMN audio_rate INTEGER; ALTER TABLE sample_entry ADD COLUMN audio_channels INTEGER; ALTER TABLE sample_entry ADD COLUMN audio_rfc6381 TEXT;")?;
+    }
+    if !has_col("camera", "record_audio")? {
+        c.execute_batch("ALTER TABLE camera ADD COLUMN record_audio INTEGER NOT NULL DEFAULT 0;")?;
     }
     if !has_col("camera", "ptz")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN onvif_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_user TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN onvif_pass TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz INTEGER NOT NULL DEFAULT 0; ALTER TABLE camera ADD COLUMN ptz_url TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN ptz_profile TEXT NOT NULL DEFAULT '';")?;
@@ -305,6 +318,7 @@ pub struct Camera {
     pub ptz: bool,
     pub ptz_url: String,
     pub ptz_profile: String,
+    pub record_audio: bool,
 }
 
 impl Camera {
@@ -316,7 +330,7 @@ impl Camera {
             min_blob_pct: 0.5, pre_secs: 5.0, post_secs: 8.0, cooldown_secs: 10.0, zones_json: "[]".into(), masks_json: "[]".into(),
             sort_order: 0, record_sub: true, event_retention_days: 0.0, tags: String::new(), objects: true, object_labels: String::new(),
             require_object: false, onvif_url: String::new(), onvif_user: String::new(), onvif_pass: String::new(), ptz: false,
-            ptz_url: String::new(), ptz_profile: String::new(),
+            ptz_url: String::new(), ptz_profile: String::new(), record_audio: false,
         }
     }
 }
@@ -330,6 +344,22 @@ pub struct SampleEntry {
     pub height: u32,
     #[serde(skip)]
     pub data: Vec<u8>,
+    #[serde(skip)]
+    pub audio: Option<mp4::AudioParams>,
+}
+
+impl SampleEntry {
+    /// The parameters needed to rebuild this entry's init segment.
+    pub fn video_params(&self) -> mp4::VideoParams {
+        mp4::VideoParams {
+            codec: mp4::Codec::parse(&self.codec).unwrap_or(mp4::Codec::H264),
+            width: self.width,
+            height: self.height,
+            sample_entry: bytes::Bytes::from(self.data.clone()),
+            rfc6381: self.rfc6381.clone(),
+            audio: self.audio.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -561,6 +591,7 @@ impl Db {
             ptz: r.get::<_, i64>("ptz")? != 0,
             ptz_url: r.get("ptz_url")?,
             ptz_profile: r.get("ptz_profile")?,
+            record_audio: r.get::<_, i64>("record_audio")? != 0,
         })
     }
 
@@ -595,7 +626,7 @@ impl Db {
             "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
             "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
             "record_sub", "event_retention_days", "tags", "objects", "object_labels", "require_object",
-            "onvif_url", "onvif_user", "onvif_pass", "ptz", "ptz_url", "ptz_profile",
+            "onvif_url", "onvif_user", "onvif_pass", "ptz", "ptz_url", "ptz_profile", "record_audio",
         ];
         self.with(|c| {
             for (k, v) in patch {
@@ -656,9 +687,17 @@ impl Db {
 
     // ----- sample entries ------------------------------------------------------
 
-    pub fn intern_sample_entry(&self, codec: mp4::Codec, rfc6381: &str, width: u32, height: u32, data: &[u8]) -> Result<i64> {
+    /// Deduplicated codec configuration; the hash covers the audio entry
+    /// too, so video-only and audio+video variants are distinct rows.
+    pub fn intern_sample_entry(&self, codec: mp4::Codec, rfc6381: &str, width: u32, height: u32, data: &[u8], audio: Option<&mp4::AudioParams>) -> Result<i64> {
         use sha2::Digest;
-        let sha = hex::encode(sha2::Sha256::digest(data));
+        let mut h = sha2::Sha256::new();
+        h.update(data);
+        if let Some(a) = audio {
+            h.update(b"|audio|");
+            h.update(&a.sample_entry);
+        }
+        let sha = hex::encode(h.finalize());
         self.with(|c| {
             if let Some(id) = c
                 .query_row("SELECT id FROM sample_entry WHERE sha256=?1", params![sha], |r| r.get::<_, i64>(0))
@@ -667,8 +706,9 @@ impl Db {
                 return Ok(id);
             }
             c.execute(
-                "INSERT INTO sample_entry(sha256,codec,rfc6381,width,height,data) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![sha, codec.to_string(), rfc6381, width, height, data],
+                "INSERT INTO sample_entry(sha256,codec,rfc6381,width,height,data,audio_entry,audio_rate,audio_channels,audio_rfc6381) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![sha, codec.to_string(), rfc6381, width, height, data,
+                    audio.map(|a| a.sample_entry.to_vec()), audio.map(|a| a.sample_rate as i64), audio.map(|a| a.channels as i64), audio.map(|a| a.rfc6381.clone())],
             )?;
             Ok(c.last_insert_rowid())
         })
@@ -677,9 +717,16 @@ impl Db {
     pub fn sample_entry(&self, id: i64) -> Result<Option<SampleEntry>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT id,codec,rfc6381,width,height,data FROM sample_entry WHERE id=?1",
+                "SELECT id,codec,rfc6381,width,height,data,audio_entry,audio_rate,audio_channels,audio_rfc6381 FROM sample_entry WHERE id=?1",
                 params![id],
                 |r| {
+                    let audio_entry: Option<Vec<u8>> = r.get(6)?;
+                    let audio = audio_entry.map(|e| mp4::AudioParams {
+                        sample_entry: bytes::Bytes::from(e),
+                        sample_rate: r.get::<_, Option<i64>>(7).ok().flatten().unwrap_or(48_000) as u32,
+                        channels: r.get::<_, Option<i64>>(8).ok().flatten().unwrap_or(1) as u16,
+                        rfc6381: r.get::<_, Option<String>>(9).ok().flatten().unwrap_or_else(|| "mp4a.40.2".into()),
+                    });
                     Ok(SampleEntry {
                         id: r.get(0)?,
                         codec: r.get(1)?,
@@ -687,6 +734,7 @@ impl Db {
                         width: r.get::<_, i64>(3)? as u32,
                         height: r.get::<_, i64>(4)? as u32,
                         data: r.get(5)?,
+                        audio,
                     })
                 },
             )
@@ -1279,9 +1327,15 @@ mod tests {
         let db = Db::open(&dir.join("t.db")).unwrap();
         let sid = db.add_storage("/tmp/x", None, 0).unwrap();
         let cid = db.add_camera("cam", "rtsp://x/1", Some("rtsp://x/2"), sid).unwrap();
-        let se = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc").unwrap();
-        let se2 = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc").unwrap();
+        let se = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc", None).unwrap();
+        let se2 = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc", None).unwrap();
         assert_eq!(se, se2);
+        let audio = mp4::AudioParams { sample_entry: bytes::Bytes::from_static(b"mp4a"), sample_rate: 16_000, channels: 2, rfc6381: "mp4a.40.2".into() };
+        let se3 = db.intern_sample_entry(mp4::Codec::H265, "hvc1.1.6.L153.B0", 2688, 1520, b"abc", Some(&audio)).unwrap();
+        assert_ne!(se, se3);
+        let got = db.sample_entry(se3).unwrap().unwrap();
+        assert_eq!(got.audio.as_ref().map(|a| (a.sample_rate, a.channels)), Some((16_000, 2)));
+        assert!(db.sample_entry(se).unwrap().unwrap().audio.is_none());
         let idx = vec![
             FragEntry { dts: 1000, duration: 180_000, offset: 900, len: 5000, samples: 40, motion: 3 },
             FragEntry { dts: 181_000, duration: 180_000, offset: 5900, len: 5000, samples: 40, motion: 200 },

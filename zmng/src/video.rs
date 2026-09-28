@@ -72,13 +72,7 @@ pub fn plan_range_stream(db: &Db, camera_id: i64, stream: &str, start: i64, end:
         let path = PathBuf::from(&storage.path).join(&seg.path);
         if cur_se != Some(seg.sample_entry_id) {
             if let Some(se) = db.sample_entry(seg.sample_entry_id)? {
-                let vp = crate::mp4::VideoParams {
-                    codec: crate::mp4::Codec::parse(&se.codec).unwrap_or(crate::mp4::Codec::H264),
-                    width: se.width,
-                    height: se.height,
-                    sample_entry: Bytes::from(se.data.clone()),
-                    rfc6381: se.rfc6381.clone(),
-                };
+                let vp = se.video_params();
                 let init = crate::mp4::init_segment(&vp);
                 bytes += init.len() as u64;
                 if mime.is_none() {

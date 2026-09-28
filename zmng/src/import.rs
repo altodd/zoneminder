@@ -134,7 +134,7 @@ fn import_one(
     let codec = mp4::Codec::parse(&fourcc).ok_or_else(|| anyhow::anyhow!("unsupported codec {fourcc}"))?;
     mp4::prefer_hvc1(&mut entry);
     let rfc = mp4::rfc6381_from_sample_entry(codec, &entry).unwrap_or_else(|| codec.to_string());
-    let se = db.intern_sample_entry(codec, &rfc, w, h, &entry)?;
+    let se = db.intern_sample_entry(codec, &rfc, w, h, &entry, None)?;
 
     // absolute start = event StartDateTime; the file's first tfdt is the origin
     let start_dts = start_s * TIMESCALE as i64;

@@ -61,7 +61,7 @@ pub fn parse_encoded(file: &[u8]) -> Encoded {
     let codec = mp4::Codec::parse(&fourcc).unwrap();
     mp4::prefer_hvc1(&mut entry);
     let rfc = mp4::rfc6381_from_sample_entry(codec, &entry).unwrap();
-    let params = mp4::VideoParams { codec, width: w, height: h, sample_entry: Bytes::from(entry), rfc6381: rfc };
+    let params = mp4::VideoParams { codec, width: w, height: h, sample_entry: Bytes::from(entry), rfc6381: rfc, audio: None };
     let mut samples = Vec::new();
     for f in &scanned.frags {
         let frag = &file[f.offset as usize..(f.offset + f.len as u64) as usize];
@@ -111,7 +111,7 @@ impl Fixture {
     /// and index it. `motion(frag_index)` supplies per-fragment scores.
     pub fn write_segment(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8) -> i64 {
         let init = mp4::init_segment(&enc.params);
-        let se = self.db.intern_sample_entry(enc.params.codec, &enc.params.rfc6381, enc.params.width, enc.params.height, &enc.params.sample_entry).unwrap();
+        let se = self.db.intern_sample_entry(enc.params.codec, &enc.params.rfc6381, enc.params.width, enc.params.height, &enc.params.sample_entry, enc.params.audio.as_ref()).unwrap();
         let secs = start_dts / TIMESCALE as i64;
         let t = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap();
         let prefix = if stream == "sub" { format!("{cam}/sub") } else { cam.to_string() };

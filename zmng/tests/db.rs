@@ -48,7 +48,7 @@ fn phase1_database_upgrades_in_place() {
     // every new column is writable and the new indexes exist
     db.update_camera(1, serde_json::json!({"tags": "Outside", "record_sub": false, "objects": false, "require_object": true, "object_labels": "person", "event_retention_days": 3}).as_object().unwrap()).unwrap();
     db.update_storage(1, serde_json::json!({"read_only": true, "archive_after_days": 2.0}).as_object().unwrap()).unwrap();
-    let se = db.intern_sample_entry(zmng::mp4::Codec::H264, "avc1.64001e", 640, 360, b"x").unwrap();
+    let se = db.intern_sample_entry(zmng::mp4::Codec::H264, "avc1.64001e", 640, 360, b"x", None).unwrap();
     let idx = vec![zmng::mp4::FragEntry { dts: 1000, duration: 90_000, offset: 0, len: 10, samples: 1, motion: 0 }];
     db.insert_segment_ext(1, 1, se, "1/sub/x.mp4", 10, 0, &idx, 0, None, "sub").unwrap();
     assert_eq!(db.segments_in_range_stream(1, "sub", 0, i64::MAX).unwrap().len(), 1);

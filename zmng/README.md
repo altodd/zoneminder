@@ -164,6 +164,10 @@ Every event start/end, camera outage/recovery, storage warning and service start
 
 Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive (delete is admin-only) with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration, PTZ control for probed cameras, and the event-server websocket at `/zm/ws`. Not yet: push delivery (needs the zmNinjaNg FCM relay).
 
+## Audio (opt-in)
+
+`record_audio` on a camera (Admin → Cameras → Edit) records the main stream's AAC track alongside the video: a second `trak` in the init segment and a second `traf` per fragment, still one file per minute and one index row per segment (the index counts video only). Playback, HLS and export carry the audio; the MSE MIME type becomes `video/mp4; codecs="hvc1…,mp4a.40.2"`; the camera page's player has the browser's own mute control. Cameras without an AAC track, or whose audio SETUP fails, record video only with a warning. Substream recordings and the detector never carry audio. Off by default: audio is a legal question before it is a technical one.
+
 ## Storage tiering and retention
 
 * `zmng add-storage /raid --archive-to <archive id> --archive-after-days 3` (or edit in Admin → Storage): segments older than 3 days are copied to the archive volume (checksummed, rate limited), then removed from the RAID. Space pressure on the RAID also triggers moves. A missing archive volume never stops recording.
