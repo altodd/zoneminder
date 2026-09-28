@@ -1,6 +1,6 @@
 # Quick wins on the current production ZoneMinder (10.10.100.100)
 
-**Nothing here has been applied. Every item changes production and needs Aaron's go-ahead.** Ranked by payoff ÷ risk. Evidence in `reviews/*.md` (file:line references) and `research/00-live-server-profile.md`.
+**Status 2026-09-27 21:41 ET:** items A1–A4, B7, B9, C11 applied and verified (see the ops log for evidence). **B6/"Decoding=KeyFrames" was tried and reverted**: on 1.38.4 the analysis loop waits for every packet to be decoded, so keyframe-only decoding stops motion detection entirely (AnalysisFPS 0.00 on all cameras). The decode cost therefore stays until the new core replaces `zmc`. D14 dropped by Aaron's decision (recent footage of every camera must stay on the RAID). Ranked by payoff ÷ risk. Evidence in `reviews/*.md` (file:line references) and `research/00-live-server-profile.md`.
 
 ## A. Database (highest payoff, low risk)
 
@@ -17,7 +17,7 @@
    * *Detect monitor*: substream `…/Channels/102` (640x360 H.264), `Decoding=Always` **software** (no cuda), `Analysing=Always`, `Recording=None`, zones redrawn, `LinkedMonitors` = the record monitor so alarms mark the recording.
    Try it on 2 cameras first. Expected: NVDEC 100 % → <10 %, ~20 cores → ~3.
    Alternative with no re-configuration of zones: just set `Decoding=KeyFrames` on all 23 (motion detection then sees one frame per GOP — acceptable for Mocord since recording is continuous anyway, but detection quality drops).
-7. **Redraw every zone.** Current zones are 1920x1080/1280x720 pixel polygons covering only the top-left ~51 % of the 2688x1520 frame (`zm_zone.cpp:76-79`). Use **percent units** so they survive resolution changes.
+7. **Zone thresholds.** (Corrected: the polygons on this install already cover the full 2688x1520 frame; the review's "51 %" applied to the stored `Area`, not the coordinates.) `Area` and all `*Pixels` thresholds were still derived from the old 1080p/720p area, making detection 2–9x more sensitive than configured. Fixed by rescaling (`phase0-zones.sql`). Draw future zones in **percent units**.
 8. **Fix the 4K "Field" monitor** dimensions (currently declared 3840x2160 but scaled per frame bicubic 8→4 Mpx, `zm_monitor.cpp:3250-3256`): declare the real size or set the record monitor to Decoding=KeyFrames.
 9. `ZM_TIMESTAMP_ON_CAPTURE=0` (the camera already burns in a timestamp; ZM's Annotate is a per-frame CPU pass), `ZM_BULK_FRAME_INTERVAL` 100 → 1000.
 
