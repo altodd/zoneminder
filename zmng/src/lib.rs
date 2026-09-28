@@ -10,6 +10,7 @@ pub mod health;
 pub mod import;
 pub mod mp4;
 pub mod notify;
+pub mod preview;
 pub mod recorder;
 pub mod retention;
 pub mod thumbs;

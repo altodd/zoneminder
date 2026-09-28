@@ -73,6 +73,8 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/live.mp4` | live fMP4 (chunked) |
 | `GET /api/cameras/{id}/snapshot.jpg?width` | latest keyframe as JPEG |
 | `GET /api/cameras/{id}/frame.jpg?t&width[&stream=sub]` | keyframe nearest to time `t` (`stream=sub` ≈ 30 ms, used for scrub previews) |
+| `GET /api/cameras/{id}/preview.jpg?t` | scrub-preview tile (160 px, colour) nearest `t`, taken from the detector's frames every `preview_secs`; one small file read, no decode |
+| `GET /api/cameras/{id}/previews`, `GET /api/cameras/{id}/previews/{YYYYMMDDHH}.jpg|.json` | hours with previews; an hour as a sprite sheet (30 columns) plus its manifest `{cols, tile_w, tile_h, times}` |
 | `GET /api/segments/{id}/file.mp4` (Range), `/init.mp4`, `/frag/{n}.m4s` | raw media for HLS |
 | `GET /api/events?camera&start&end&min_score&archived&before&limit&order` | keyset-paged list |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
@@ -116,6 +118,7 @@ Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/ref
 ```
 <storage>/<camera_id>/<YYYYMMDD>/<HHMMSS>.mp4     60 s fMP4 segments (UTC names)
 <thumb_dir>/<camera_id>/<event_id>.jpg            event thumbnails
+<thumb_dir>/<camera_id>/preview/<YYYYMMDDHH>.pvs  scrub-preview tiles (append-only, one file per hour, ~2 MB)
 zmng.db                                           SQLite index (WAL)
 ```
 A segment file is self-describing: `zmng reindex` re-adopts anything not in the index (also done automatically at startup).

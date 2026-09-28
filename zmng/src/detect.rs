@@ -30,6 +30,8 @@ pub struct DetectCtx {
     pub ffmpeg: String,
     pub thumb_dir: PathBuf,
     pub bus: Arc<crate::notify::Bus>,
+    /// seconds between preview tiles (0 = off)
+    pub preview_secs: u32,
 }
 
 pub struct DetectorHandle {
@@ -340,7 +342,7 @@ async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Re
     let mut child = cmd
         .args([
             "-an", "-sn", "-dn",
-            "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=gray"),
+            "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=yuv420p"),
             "-f", "rawvideo", "pipe:1",
         ])
         .stdin(Stdio::null())
@@ -364,8 +366,8 @@ async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Re
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started");
     h.status.write().running = true;
 
-    let mut run = DetectRun::new(cam);
-    let mut frame = vec![0u8; w * hh];
+    let mut run = DetectRun::new(ctx, cam);
+    let mut frame = vec![0u8; w * hh * 3 / 2];
     // pipeline latency of the substream decode is small (< 300 ms); we stamp frames with wallclock at read time
     loop {
         tokio::time::timeout(Duration::from_secs(30), stdout.read_exact(&mut frame))
@@ -383,10 +385,13 @@ struct DetectRun {
     ev: EventState,
     fps_t: Instant,
     fps_n: u32,
+    preview: Option<crate::preview::PreviewWriter>,
+    w: usize,
+    h: usize,
 }
 
 impl DetectRun {
-    fn new(cam: &Camera) -> Self {
+    fn new(ctx: &DetectCtx, cam: &Camera) -> Self {
         let zones = parse_polys(&cam.zones_json);
         let masks = parse_polys(&cam.masks_json);
         DetectRun {
@@ -394,11 +399,21 @@ impl DetectRun {
             ev: EventState::default(),
             fps_t: Instant::now(),
             fps_n: 0,
+            preview: (ctx.preview_secs > 0).then(|| crate::preview::PreviewWriter::new(&ctx.thumb_dir, cam.id, ctx.preview_secs, cam.detect_width, cam.detect_height)),
+            w: cam.detect_width as usize,
+            h: cam.detect_height as usize,
         }
     }
 
+    /// `frame` is a planar yuv420p picture; the detector uses its Y plane,
+    /// the preview writer the whole thing.
     async fn on_frame(&mut self, ctx: &DetectCtx, cam: &Camera, h: &DetectorHandle, dts: i64, frame: &[u8]) -> Result<()> {
-        let score = self.det.feed(frame);
+        let score = self.det.feed(&frame[..self.w * self.h]);
+        if let Some(p) = self.preview.as_mut() {
+            if let Err(e) = p.maybe(dts, frame, self.w, self.h) {
+                warn!(camera = cam.id, "preview tile: {e:#}");
+            }
+        }
         self.fps_n += 1;
         if self.fps_t.elapsed() >= Duration::from_secs(5) {
             let mut st = h.status.write();
@@ -442,7 +457,7 @@ async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera,
             "-nostdin", "-loglevel", "info", "-nostats", "-threads", "1",
             "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "65536", "-analyzeduration", "0",
             "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
-            "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=gray,showinfo"),
+            "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=yuv420p,showinfo"),
             "-f", "rawvideo", "pipe:1",
         ])
         .stdin(Stdio::piped())
@@ -505,8 +520,8 @@ async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera,
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started (fed by substream recorder)");
     h.status.write().running = true;
 
-    let mut run = DetectRun::new(cam);
-    let mut frame = vec![0u8; w * hh];
+    let mut run = DetectRun::new(ctx, cam);
+    let mut frame = vec![0u8; w * hh * 3 / 2];
     loop {
         tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(30), stdout.read_exact(&mut frame)) => {

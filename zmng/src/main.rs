@@ -277,6 +277,7 @@ fn run(cfg: config::Config) -> Result<()> {
             ffmpeg: cfg.ffmpeg.clone(),
             thumb_dir: cfg.thumb_dir.clone(),
             bus: bus.clone(),
+            preview_secs: cfg.preview_secs,
         });
         detect::reconcile(dctx.clone()).await?;
 

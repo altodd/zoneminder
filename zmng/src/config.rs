@@ -42,6 +42,9 @@ pub struct Config {
     /// Where the daily index backup (VACUUM INTO) goes; ideally on the other
     /// volume. Default: next to the database.
     pub backup_dir: Option<PathBuf>,
+    /// Seconds between scrub-preview tiles taken from the detector's frames
+    /// (0 disables). Tiles are ~3 KB, so 5 s ≈ 2 MB per camera-hour.
+    pub preview_secs: u32,
 }
 
 impl Default for Config {
@@ -62,6 +65,7 @@ impl Default for Config {
             alert_after_minutes: 3,
             mqtt: None,
             backup_dir: None,
+            preview_secs: 5,
         }
     }
 }

@@ -780,6 +780,55 @@ async fn frame_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<F
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], jpeg).into_response())
 }
 
+/// Scrub preview tile nearest `t` (no decode: one small file read).
+async fn preview_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<PreviewQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    can_see(&app, u, id)?;
+    let dts = video::ms_to_dts(q.t);
+    let max_delta = (app.cfg.preview_secs.max(1) as i64) * TIMESCALE as i64;
+    let store = crate::preview::Store::new(&app.cfg.thumb_dir);
+    let tile = tokio::task::spawn_blocking(move || store.nearest(id, dts, max_delta)).await.map_err(err500)?.map_err(err500)?;
+    match tile {
+        Some(jpeg) => Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], jpeg).into_response()),
+        None => Err((StatusCode::NOT_FOUND, "no preview at that time").into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewQ {
+    t: i64,
+}
+
+/// Hours (UTC, `YYYYMMDDHH`) that have preview strips.
+async fn preview_hours(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    can_see(&app, u, id)?;
+    let hours = crate::preview::Store::new(&app.cfg.thumb_dir).hours(id);
+    Ok(Json(serde_json::json!({"interval_secs": app.cfg.preview_secs, "hours": hours})).into_response())
+}
+
+/// `<hour>.jpg` = sprite sheet of that hour, `<hour>.json` = its manifest.
+async fn preview_sprite(State(app): State<App>, Path((id, hour)): Path<(i64, String)>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    can_see(&app, u, id)?;
+    let (key, want_json) = match hour.rsplit_once('.') {
+        Some((k, "jpg")) => (k.to_string(), false),
+        Some((k, "json")) => (k.to_string(), true),
+        _ => return Err(bad("use <hour>.jpg or <hour>.json")),
+    };
+    if key.len() != 10 || !key.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("hour must be YYYYMMDDHH"));
+    }
+    let store = crate::preview::Store::new(&app.cfg.thumb_dir);
+    let res = tokio::task::spawn_blocking(move || store.sprite(id, &key)).await.map_err(err500)?.map_err(err500)?;
+    let Some((jpeg, manifest)) = res else { return Err((StatusCode::NOT_FOUND, "no previews for that hour").into_response()) };
+    if want_json {
+        Ok(([(header::CACHE_CONTROL, "private, max-age=300")], Json(manifest)).into_response())
+    } else {
+        Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=300")], jpeg).into_response())
+    }
+}
+
 #[derive(Deserialize)]
 struct FrameQ {
     t: i64,
@@ -1009,6 +1058,9 @@ pub fn router(app: App) -> Router {
         .route("/api/cameras/{id}/live.mp4", get(live))
         .route("/api/cameras/{id}/snapshot.jpg", get(snapshot))
         .route("/api/cameras/{id}/frame.jpg", get(frame_at))
+        .route("/api/cameras/{id}/preview.jpg", get(preview_at))
+        .route("/api/cameras/{id}/previews", get(preview_hours))
+        .route("/api/cameras/{id}/previews/{hour}", get(preview_sprite))
         .route("/api/segments/{id}/file.mp4", get(segment_file))
         .route("/api/segments/{id}/init.mp4", get(segment_init))
         .route("/api/segments/{id}/frag/{fi}/seg.m4s", get(segment_frag))

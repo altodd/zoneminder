@@ -184,7 +184,9 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
     if (cache.has(key)) { $('img', preview).src = cache.get(key); return; }
     previewTimer = setTimeout(async () => {
       try {
-        const r = await fetch(`/api/cameras/${row.id}/frame.jpg?t=${Math.round(t)}&width=320&stream=sub`);
+        // preview tiles (no decode) first; keyframe decode of the substream as the fallback
+        let r = await fetch(`/api/cameras/${row.id}/preview.jpg?t=${Math.round(t)}`);
+        if (r.status === 404) r = await fetch(`/api/cameras/${row.id}/frame.jpg?t=${Math.round(t)}&width=320&stream=sub`);
         if (!r.ok) return;
         const url = URL.createObjectURL(await r.blob());
         cache.set(key, url); if (cache.size > 400) { const k = cache.keys().next().value; URL.revokeObjectURL(cache.get(k)); cache.delete(k); }

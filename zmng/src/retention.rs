@@ -53,6 +53,10 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
         let cutoff = now - (cam.retention_days * 86_400.0 * TIMESCALE as f64) as i64;
         let ev_days = if cam.event_retention_days > 0.0 { cam.event_retention_days } else { cam.retention_days };
         let event_cutoff = now - (ev_days * 86_400.0 * TIMESCALE as f64) as i64;
+        let pruned = crate::preview::Store::new(thumb_dir).prune(cam.id, cutoff.min(event_cutoff));
+        if pruned > 0 {
+            debug!(camera = cam.id, pruned, "removed old preview hours");
+        }
         let mut skip_before = 0i64;
         loop {
             let old: Vec<_> = db.segments_older_than(cam.id, cutoff, 200)?.into_iter().filter(|s| s.start_dts > skip_before).collect();
