@@ -1,7 +1,8 @@
 [Unit]
 Description=ZoneMinder NG recorder/API
-After=network-online.target
-Wants=network-online.target
+# recordings are timestamped with the wall clock: wait for time sync
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 User=zmng
@@ -11,8 +12,10 @@ ExecStart=/usr/local/bin/zmng -c /etc/zmng/zmng.toml run
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+# the index holds RTSP credentials
+UMask=0077
 # recording volumes must be writable by the zmng user
-ReadWritePaths=/var/lib/zmng /var/cache/zmng /media
+ReadWritePaths=/var/lib/zmng /var/cache/zmng /var/cache/zoneminder /media
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true

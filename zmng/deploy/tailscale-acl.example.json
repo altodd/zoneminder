@@ -1,0 +1,14 @@
+{
+  "//": "Tailscale ACL after the cut over: guests reach only HTTPS on the security server. The per-monitor ZoneMinder ports 10001-10023 are gone. Users are viewers inside zmng with an explicit camera list.",
+  "groups": {
+    "group:staff": ["alice@example.com", "bob@example.com"],
+    "group:cba": ["guest1@example.com", "guest2@example.com"]
+  },
+  "tagOwners": {
+    "tag:security": ["group:staff"]
+  },
+  "acls": [
+    { "action": "accept", "src": ["group:staff"], "dst": ["tag:security:443", "tag:security:22"] },
+    { "action": "accept", "src": ["group:cba"], "dst": ["tag:security:443"] }
+  ]
+}

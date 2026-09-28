@@ -5,6 +5,7 @@ Start with **`ARCHITECTURE.md`** (diagnosis, design, plan). Then:
 | Document | What it is |
 |---|---|
 | `ARCHITECTURE.md` | Root causes measured on the production box, the new design (passthrough segments + substream detection + browser-native playback), data model, phases, decisions, risks |
+| `CUTOVER.md` | Phase 2 runbook: install next to ZoneMinder, storage tiering set-up, in-place import of the old events, TLS/Tailscale/Home Assistant, parallel-run checklist, the cut over itself, roll back, restore drill |
 | `QUICK-WINS-PRODUCTION.md` | Ranked config/patch changes for the *current* ZoneMinder install; nothing applied yet, all need approval |
 | `research/00-live-server-profile.md` | Read-only profile of 10.10.100.100 (hardware, GPU, monitors, DB sizes, filters, zones) taken 2026-09-27 |
 | `research/01-online-research.md` | ZoneMinder GitHub issues/forums on the same pain points; how Frigate, moonfire-nvr, UniFi Protect, Blue Iris, Nx, mediamtx, go2rtc solve them; browser HEVC support in 2026; Quadro P2200 limits; 20 design implications |

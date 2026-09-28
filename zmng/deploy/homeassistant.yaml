@@ -1,0 +1,63 @@
+# Home Assistant recipes for zmng.
+#
+# 1. MQTT (nothing to declare): with [mqtt] configured in zmng.toml every camera is
+#    discovered as a device with binary_sensor.<name>_motion, binary_sensor.<name>_recording,
+#    sensor.<name>_last_event (attributes = the event JSON: id, score, kind, objects, thumb)
+#    and camera.<name>_last_event_thumbnail.
+#
+# 2. Live images through the REST API (long-lived token from Admin -> "Create API token"):
+camera:
+  - platform: generic
+    name: Front Door
+    still_image_url: https://security.church.example/api/cameras/1/snapshot.jpg?width=1280
+    authentication: basic   # ignored: the bearer header below carries the token
+    verify_ssl: true
+    # Home Assistant's generic camera cannot set arbitrary headers; use a `rest`-style
+    # proxy or pass the token in the query string instead:
+    # still_image_url: https://security.church.example/api/cameras/1/snapshot.jpg?width=1280&token=YOUR_LONG_LIVED_TOKEN
+
+# 3. Health as a sensor (issues count) polled every minute:
+sensor:
+  - platform: rest
+    name: zmng issues
+    resource: https://security.church.example/api/status
+    headers:
+      Authorization: Bearer YOUR_LONG_LIVED_TOKEN
+    value_template: "{{ value_json.issues | length }}"
+    json_attributes:
+      - issues
+      - uptime_secs
+    scan_interval: 60
+
+# 4. Automations
+automation:
+  - alias: Front door person at night
+    trigger:
+      - platform: mqtt
+        topic: zmng/camera/1/event
+    condition:
+      - condition: template
+        value_template: "{{ trigger.payload_json.event == 'event_start' and 'person' in (trigger.payload_json.objects | map(attribute='label') | list) }}"
+      - condition: sun
+        after: sunset
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          message: "Person at the front door"
+          data:
+            image: "https://security.church.example{{ trigger.payload_json.thumb }}?token=YOUR_LONG_LIVED_TOKEN"
+
+  - alias: Camera down
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door_recording
+        to: "off"
+        for: "00:05:00"
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          message: "Front Door has not recorded for 5 minutes"
+
+# 5. Alternatively, without MQTT: alert_webhook = "https://ha.local/api/webhook/zmng" in zmng.toml
+#    and a webhook trigger; the JSON body is the same notification object
+#    ({"event": "event_start" | "event_end" | "camera_down" | "camera_up" | "storage_low", ...}).

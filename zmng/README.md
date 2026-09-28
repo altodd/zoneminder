@@ -36,7 +36,7 @@ Detector test without a camera: `--sub-url "lavfi:testsrc=size=640x360:rate=5"`.
 
 ## Deploy (Ubuntu 24.04 VM)
 
-`sudo deploy/install-ubuntu.sh` installs the binary, web files, a `zmng` user, `/etc/zmng/zmng.toml` and a systemd unit. See the script's output for the next steps.
+`sudo deploy/install-ubuntu.sh` installs the binary, web files, a `zmng` user, `/etc/zmng/zmng.toml` and a systemd unit. See the script's output for the next steps. Production cut over from ZoneMinder (storage hand-over, legacy import, TLS with `deploy/Caddyfile`, Tailscale ACL, Home Assistant recipes, roll back and restore drill): `../docs/redesign/CUTOVER.md`.
 
 ## Operating it
 

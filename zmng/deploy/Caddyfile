@@ -1,0 +1,19 @@
+# Caddy in front of zmng: TLS, HTTP/2, websocket + SSE pass-through.
+#
+#   LAN with a real name:  replace the host and Caddy fetches a certificate.
+#   LAN without DNS:       use `tls internal` and install Caddy's local CA on the staff machines.
+#   Tailscale guests:      `tailscale serve --bg https / http://127.0.0.1:8080` needs no Caddy at all.
+#
+# zmng.toml: listen = "127.0.0.1:8080", secure_cookies = true
+
+security.church.example {
+	# tls internal
+	encode zstd gzip
+
+	# media and the live fMP4 are already compressed; long-lived and streaming responses
+	# must not be buffered
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
