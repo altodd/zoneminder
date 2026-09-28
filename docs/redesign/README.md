@@ -17,5 +17,8 @@ Start with **`ARCHITECTURE.md`** (diagnosis, design, plan). Then:
 | `reviews/05-architecture-design-review.md` | Independent design review of `ARCHITECTURE.md` |
 | `reviews/06-phase2-code-review.md` | Code review of the phase-2 work (notifications, health, backup/restore); findings fixed in-session |
 | `reviews/07-coverage-audit.md` | Test-coverage audit after phase 2 (61 % lines) with the prioritized test list |
+| `reviews/08-phase3-code-review.md` | Code review of the phase-3 work (previews, objects, transcode, PTZ, federation, audio, PWA); H1/M1–M7 and the lows fixed in-session |
+| `reviews/09-phase3-architecture-review.md` | Architecture review against ARCHITECTURE.md at 23 cameras / 17 TB; the must-fix table's items are addressed in §10.5, the rest listed there as deferred |
+| `reviews/10-coverage-audit-2.md` | Second test-coverage audit (72 % lines) after phase 3 |
 
 Code: `../zmng/` (README inside). ZoneMinder fork (reference, phase-0 patches): `../zoneminder/`.

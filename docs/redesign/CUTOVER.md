@@ -28,7 +28,7 @@ Edit `/etc/zmng/zmng.toml`:
 db_path   = "/var/lib/zmng/zmng.db"      # on the system SSD, never on a recording volume
 listen    = "127.0.0.1:8080"             # Caddy fronts it (step 4); use 0.0.0.0:8080 only on a trusted LAN
 web_dir   = "/usr/local/share/zmng"
-thumb_dir = "/var/lib/zmng/thumbs"
+thumb_dir = "/media/zmoverflow/zmng-thumbs"   # see the sizing note below
 backup_dir = "/media/zmoverflow/zmng-backups"   # daily VACUUM INTO on the *other* volume
 secure_cookies = true                    # behind HTTPS
 alert_webhook = "https://ntfy.sh/…"      # or Home Assistant's /api/webhook/<id>
@@ -39,16 +39,21 @@ password = "…"
 ```
 Extra RTSP clients are harmless to Hikvision cameras (they allow six), so zmng can pull every camera while `zmc` still does.
 
+**`thumb_dir` sizing.** Besides event thumbnails it holds the scrub-preview tiles: about 2 MB per camera-hour at the default `preview_secs = 5`, so ≈ 1.2 GB/day for 23 cameras and ≈ 35 GB at the 30-day default retention. Put it on a recording volume (as above), not on the system SSD, or set `preview_secs = 0` to disable previews.
+
 ## 2. Storage: two volumes, tiered, nothing copied by hand
 
 The design keeps the most recent footage of every camera on the RAID and moves whole 60 s segments to the USB disk as they age (checksummed, rate-limited); nothing is ever purged "when full".
 
-Create the directories next to ZoneMinder's data (do **not** point zmng at ZoneMinder's event directories as recording targets):
+Create the directories next to ZoneMinder's data (do **not** point zmng at ZoneMinder's event directories as recording targets). Storage ids are assigned in order, and `--archive-to` must name a storage that already exists, so the archive volume is added **first**:
 ```
 sudo install -d -o zmng -g zmng /var/cache/zoneminder/zmng /media/zmoverflow/zmng
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/zmng --reserve-gb 150 --archive-to 2 --archive-after-days 3   # storage 1 (RAID)
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/zmng --reserve-gb 300                                                   # storage 2 (USB)
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/zmng --reserve-gb 300                                                   # storage 1 (USB, the archive)
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/zmng --reserve-gb 150 --archive-to 1 --archive-after-days 3   # storage 2 (RAID, the primary)
 ```
+`add-storage` writes a `.zmng-storage` marker at each root; zmng treats a root without it as an unmounted volume and refuses to record, delete or move there (Status and `zmng doctor` say so). The unit file's `RequiresMountsFor=` covers both mounts, so a boot with the USB disk missing leaves zmng stopped rather than recording onto the root filesystem. Pull the USB disk once during the parallel week (§6) and watch Status.
+
+Tiering keeps the newest 3 days on the RAID and moves older segments at `archive_rate_mbps` (Admin → Storage; 40 Mbit/s by default, raise it to at least twice the aggregate ingest, ≈ 160 Mbit/s here) and unthrottled under space pressure. If the archive still falls behind, Status shows the backlog and, under half the reserve, retention deletes the oldest segments on the RAID rather than let the recorders hit a full disk.
 While ZoneMinder still owns most of both disks, give zmng a **byte cap** on each (`Admin → Storage → Cap`) that fits in today's free space; raise the caps as ZoneMinder's events are deleted (step 7). Capacity math at the current 70–80 Mbit/s aggregate (≈ 0.85 TB/day): 17 TB ≈ 17 days of everything; use `event_retention_days` per camera to keep motion longer than continuous footage.
 
 Add the cameras (main + sub URLs; the names become the UI names, the `tags` field the groups):
@@ -75,7 +80,7 @@ The files are not touched; each event becomes a legacy segment (timestamps shift
 
 ## 4. TLS and the network
 
-* **LAN**: Caddy in front (`deploy/Caddyfile`): HTTPS with a local CA or a real certificate, HTTP/2 (the live wall opens many connections), websocket and SSE pass-through. `secure_cookies = true` in `zmng.toml`.
+* **LAN**: Caddy in front (`deploy/Caddyfile`): HTTPS with a local CA or a real certificate, HTTP/2, websocket and SSE pass-through. `secure_cookies = true` in `zmng.toml`. **HTTP/2 is required for the "Substream video (MSE)" wall mode**: browsers allow six HTTP/1.1 connections per host, and a 23-tile wall opens 23 streams plus the SSE feed. Straight to `:8080` without Caddy, keep the wall on "Snapshots every 2 s" (which decodes the substream, not the 4 MP main stream).
 * **Guests (CBA group) over Tailscale**: `tailscale serve --bg https / http://127.0.0.1:8080` or the Caddy vhost on the tailnet address, and replace the per-monitor `10001–10023` port rules with one rule for port 443 (`deploy/tailscale-acl.example.json`). Their accounts are *viewers* with only the cameras they may see.
 * **go2rtc** stays bound to the LAN only (`api: listen: 10.10.100.100:1984`); guests never reach it. The UI marks the WebRTC option accordingly.
 * **zmNinjaNg**: portal URL `https://<host>/zm`, event server `wss://<host>/zm/ws`.
@@ -84,7 +89,7 @@ The files are not touched; each event becomes a legacy segment (timestamps shift
 
 `deploy/homeassistant.yaml` has the pieces:
 * MQTT discovery creates one device per camera (Motion, Recording, Last event, Last event thumbnail) as soon as `[mqtt]` is configured; nothing to add in HA.
-* Live images: `camera: platform: generic` on `/api/cameras/<id>/snapshot.jpg?width=1280` with a long-lived token from `Admin → Create API token` (`Authorization: Bearer …`).
+* Live images: `camera: platform: generic` on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<token>` with a long-lived token from `Admin → Create API token`. HA's generic camera cannot send a bearer header, so the token goes in the query string (the URL lives in HA's config only; the snapshot is decoded from the substream unless `stream=main` is added).
 * Automations: trigger on `binary_sensor.<camera>_motion` or the `zmng/camera/<id>/event` topic (payload = the event JSON); or point `alert_webhook` at an HA webhook trigger.
 * Health: `sensor` on `/api/status` or scrape `/api/metrics` with Prometheus/Grafana.
 
@@ -115,3 +120,17 @@ sudo -u zmng zmng -c /etc/zmng/zmng.toml restore /media/zmoverflow/zmng-backups/
 systemctl start zmng            # reindex on start re-adopts any segment files written after the backup
 ```
 Motion scores of segments recorded after the backup are lost (re-adopted files carry none); events after the backup are lost unless they are in a newer backup. Segments that retention deleted *after* the backup was taken come back as index rows without files: the timeline shows coverage that 404s and used-bytes is overstated until the next retention passes unlink them as missing. That is the whole blast radius. `restore` refuses to run while the service holds `zmng.db.lock`, and keeps the old index, WAL included, as `zmng.db.before-restore`.
+
+## 10. Upgrading zmng
+
+Schema changes are applied by the binary itself at start (`migrate()` in `db.rs`, idempotent, and every upgrade is tested against a phase-1 database in `tests/db.rs`). The procedure:
+
+```
+sudo -u zmng zmng -c /etc/zmng/zmng.toml backup      # index snapshot next to the daily one
+systemctl stop zmng
+sudo install -m 755 target/release/zmng /usr/local/bin/zmng
+sudo cp -r zmng/web/* /usr/local/share/zmng/           # UI is versioned with the binary
+sudo -u zmng zmng -c /etc/zmng/zmng.toml doctor        # config, ffmpeg, storages, markers
+systemctl start zmng && journalctl -u zmng -f          # "index opened", reindex count, recorders up
+```
+Downgrade: stop, put the old binary and web files back, `restore` the backup taken above (`--stopped`), start. Recording gaps are the stop/start window only; segments written by the newer build are re-adopted by the older one as long as the file format did not change (it has not since phase 1).

@@ -224,10 +224,10 @@ Verified locally against two real cameras (Front Door, Playground): main + sub r
 
 ## 10. Phase 2 and 3 build log (2026-09-28, cloud session)
 
-Built on the `redesign` branch while the phase-1 prototype ran on the VM; nothing here has touched a real camera yet (see §10.4). Every feature landed as its own commit with tests; the independent reviews that ran during the session are in `reviews/06-…` to `reviews/09-…` and their findings were fixed in the same session (commit `fix(zmng): address the phase-2 code review…` and follow-ups).
+Built on the `redesign` branch while the phase-1 prototype ran on the VM; nothing here has touched a real camera yet (see §10.4). Every feature landed as its own commit with tests; the independent reviews that ran during the session are in `reviews/06-…` to `reviews/10-…` and their findings were fixed in the same session (§10.5).
 
 ### 10.1 Foundation
-* **Library + CLI split** (`src/lib.rs`), `api::router()` factored out of `serve()`, and a **test harness** (`tests/common`) that writes real segment files from ffmpeg-encoded H.264/HEVC through our own fMP4 writer and drives the axum router in-process. The suite went from 11 unit tests to 85 tests (unit + integration) covering the HTTP API, ACLs, retention/tiering/reindex, notifications, health, previews, objects, transcode, PTZ, federation and audio; line coverage 61 % after phase 2 (recorder.rs is the remaining gap: it needs an RTSP source).
+* **Library + CLI split** (`src/lib.rs`), `api::router()` factored out of `serve()`, and a **test harness** (`tests/common`) that writes real segment files from ffmpeg-encoded H.264/HEVC through our own fMP4 writer and drives the axum router in-process. The suite went from 11 unit tests to 99 tests (unit + integration) covering the HTTP API, ACLs, retention/tiering/reindex, notifications, health, previews, objects, transcode, PTZ, federation and audio; line coverage 61 % after phase 2 and 72 % after phase 3 (recorder.rs is the remaining gap: it needs an RTSP source).
 * Found on the way: the space-budget retention loop deleted a whole batch of 20 segments past the budget; a phase-1 database could not be opened by newer builds because indexes were created before migrations; the global detector registry made tests interfere.
 
 ### 10.2 Phase 2 — cut over
@@ -257,3 +257,22 @@ Built on the `redesign` branch while the phase-1 prototype ran on the VM; nothin
 4. **ONVIF on Hikvision**: profile selection (`Profile_2` is usually the PTZ one), `GotoHomePosition` support, credential rules (ONVIF user may differ from the RTSP user).
 5. **MQTT with the real broker + HA** (discovery entity names; retained `event` payloads).
 6. The recorder itself has no automated test (needs RTSP); a fake RTSP server in the test suite is the next testing investment.
+
+### 10.5 Review round after phase 3: fixed and deferred
+The three reports in `reviews/08–10` were run on the finished phase-3 tree. Everything below landed in two commits (`fix(zmng): address the phase-3 code review…` and `fix(zmng): architecture review must-fix items…`); the suite is at 99 tests.
+
+**Fixed (code review 08):** peer proxy path normalisation and host pinning (H1); audio `tfdt` shifted in its own timescale and never negative (M1); `detect_key` covers object settings, `record_audio` restarts the recorder, the handle's camera is refreshed on rename (M2); detections tagged with their event, a `require_object` close deferred while a detection is in flight (M3); label list kept on the event (M4); PTZ presets admin-only (M5); bounds-checked `stsd` walking (M6); `maybe_transcode` returns whether it transcoded (M7); percent-decoded credentials, no redirects and capped bodies for camera/detector replies, self-closing tags in the ONVIF scanner, PTZ timer re-armed after the move, peer 401/403 → 502, service-worker cache guard, atomic sprite writes, DELETE of an unknown camera → 404.
+
+**Fixed (architecture review 09, must-fix table):**
+| Item | What changed |
+|---|---|
+| Tiering starves, retention refuses | Tiering is its own task (a throttled backlog copy never blocks alerts/reconcile/retention) and re-runs at once after a full batch; **unthrottled under space pressure**; retention has a **hard floor** (under half the reserve it deletes on the primary even with a reachable archive) and skips archived-event footage until that floor; Status/metrics carry `archive_backlog_bytes` and warn when it exceeds a day of ingest |
+| Unmounted volume records onto the root SSD | `add-storage` writes a `.zmng-storage` marker; recorder, retention, tiering and reindex refuse a writable root without it; Status and `doctor` say "not mounted"; the unit has `RequiresMountsFor=` |
+| SQLite scans at 1 M rows | `segments_in_range*`, `coverage` and `events_in_range` are bounded on both sides of `start_dts` (index-covered; `MAX_SPAN` = 4 h); `storage.used_bytes` is a maintained counter (recounted at open) instead of `SUM(bytes)` every 30 s; `ingest_since` uses a new `start_dts` index |
+| Live wall decodes the 4 MP main stream | `snapshot.jpg` decodes the **substream** unless `stream=main` or the requested width needs the main stream, never upscales, and says which in `X-Stream`; zmNinja MJPEG streams have their own decoder pool |
+| Runbook errors | `CUTOVER.md`: archive storage created first, marker/`RequiresMountsFor`, `archive_rate_mbps` guidance, `thumb_dir` sizing and placement, HTTP/2 requirement for the MSE wall, HA generic camera uses `?token=`, new §10 upgrade procedure |
+| Thumbnails 1–2 min late | The recorder exposes its open segment (`CamHandle.open`); the thumbnail is read from it a few seconds after the event ends |
+| Federation leaks URLs with an admin peer token | Proxied camera JSON is stripped of RTSP/ONVIF URLs and credentials whatever the peer returned |
+
+**Deferred (design decisions for the VM week, not code fixes):** per-user peer ACLs / `operator` role (today: one ACL per site, the peer token should be a viewer); preview store byte budget (documented sizing instead); transcode `-hwaccel cuda` and a doctor encoder check (needs the P2200); supervisor split with `WatchdogSec`/`sd_notify`; per-IP login limiter; streamed `segment_file`; module splits (`auth.rs`, `ffmpeg.rs`, `supervisor.rs`); HLS `EXT-X-MAP` per segment; PNG PWA icons; the fake RTSP server for recorder tests.
+
