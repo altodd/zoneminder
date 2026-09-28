@@ -15,5 +15,7 @@ Start with **`ARCHITECTURE.md`** (diagnosis, design, plan). Then:
 | `reviews/03-storage-db-review.md` | Frames/Stats/Events schema and triggers, zmfilter/zmaudit/AutoMove behaviour, deletion cost, proposed segment schema, migration approach |
 | `reviews/04-zmng-code-review.md` | Independent code review of the new Rust core (`../zmng`) |
 | `reviews/05-architecture-design-review.md` | Independent design review of `ARCHITECTURE.md` |
+| `reviews/06-phase2-code-review.md` | Code review of the phase-2 work (notifications, health, backup/restore); findings fixed in-session |
+| `reviews/07-coverage-audit.md` | Test-coverage audit after phase 2 (61 % lines) with the prioritized test list |
 
 Code: `../zmng/` (README inside). ZoneMinder fork (reference, phase-0 patches): `../zoneminder/`.

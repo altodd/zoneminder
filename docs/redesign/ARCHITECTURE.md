@@ -220,3 +220,40 @@ Verified locally against two real cameras (Front Door, Playground): main + sub r
 * **Review** — the multi-camera synchronized player with ZoneMinder-style filters: date/time range (with quick ranges), camera groups, individual cameras, "only cameras with motion in range"; per-camera timeline rows with previews of the row under the cursor; double-click a tile for full resolution at that instant.
 * **Events** — list with thumbnails, camera/group/score/date filters; opens the clip, the camera timeline, or Review at that time.
 * Camera **groups** are a comma-separated `tags` field per camera (Outside, Inside, Shelter, CBA…) used by Live, Review and Events filters; viewer permissions stay per camera.
+
+
+## 10. Phase 2 and 3 build log (2026-09-28, cloud session)
+
+Built on the `redesign` branch while the phase-1 prototype ran on the VM; nothing here has touched a real camera yet (see §10.4). Every feature landed as its own commit with tests; the independent reviews that ran during the session are in `reviews/06-…` to `reviews/09-…` and their findings were fixed in the same session (commit `fix(zmng): address the phase-2 code review…` and follow-ups).
+
+### 10.1 Foundation
+* **Library + CLI split** (`src/lib.rs`), `api::router()` factored out of `serve()`, and a **test harness** (`tests/common`) that writes real segment files from ffmpeg-encoded H.264/HEVC through our own fMP4 writer and drives the axum router in-process. The suite went from 11 unit tests to 85 tests (unit + integration) covering the HTTP API, ACLs, retention/tiering/reindex, notifications, health, previews, objects, transcode, PTZ, federation and audio; line coverage 61 % after phase 2 (recorder.rs is the remaining gap: it needs an RTSP source).
+* Found on the way: the space-budget retention loop deleted a whole batch of 20 segments past the budget; a phase-1 database could not be opened by newer builds because indexes were created before migrations; the global detector registry made tests interfere.
+
+### 10.2 Phase 2 — cut over
+| Item | Where |
+|---|---|
+| Notification bus; webhook, MQTT + Home Assistant discovery (motion/recording/last-event/thumbnail entities), SSE for the UI, zmNinja event-server websocket | `notify.rs`, `api.rs` (`/api/events/stream`), `zmapi.rs` (`/zm/ws`) |
+| Status report + Prometheus metrics (per camera recording/detector/last event/ingest; per volume headroom and effective retention days; issues) and the UI **Status** page; `storage_low`/`camera_down` transitions | `health.rs`, `/api/status`, `/api/metrics` |
+| `zmng doctor` (read-only pre-flight incl. RTSP DESCRIBE per camera), `zmng backup` (own read-only connection, fsync, refuses an unmounted volume), `zmng restore` (checkpointed, service lock, kept copy) | `health.rs`, `main.rs` |
+| Read-only storages for the imported ZoneMinder event trees; retention/tiering/doctor honour them; unit mounts them `ReadOnlyPaths` | `db.rs`, `retention.rs`, `tier.rs`, `deploy/zmng.service` |
+| Cut-over runbook, Caddy, Tailscale ACL, Home Assistant recipes | `CUTOVER.md`, `zmng/deploy/` |
+
+### 10.3 Phase 3 — depth
+| Item | Design | Where |
+|---|---|---|
+| Scrub previews | The detector's yuv420p frames become 160 px colour tiles every 5 s in an hourly append-only file (~2 MB/camera-hour); `preview.jpg?t` is one small read, sprite sheets per hour for filmstrips; pruned with retention | `preview.rs` |
+| Object detection | External DeepStack/CodeProject.AI-API server (reference ONNX Runtime server in `deploy/detector/`, CUDA when present); motion-gated, rate-limited, filtered by label/confidence/zones; `event.kind` = best label, best box per label in `meta_json`; `require_object` discards objectless events; events view filters by kind | `objects.rs`, `detect.rs` |
+| H.264 fallback | `?codec=h264` pipes the fMP4 through ffmpeg (nvenc/libx264), every `moof` re-stamped to the absolute timeline so the player is unchanged; session cap; UI picks it when the browser lacks HEVC | `transcode.rs` |
+| PTZ | ONVIF SOAP with WS-Security digest: probe (capabilities + PTZ profile), continuous move with auto-stop, presets, home; zmNinja control mapping; pad on the camera page | `onvif.rs` |
+| Federation | `[[peers]]` with a token issued on the peer; allow-listed read proxy under `/api/peers/<name>/api/…`; the UI merges peer cameras (`name @peer`) into Live/Review/Events | `peers.rs` |
+| Audio | Opt-in AAC track in the same fMP4 (second trak/traf); index stays video-only; init regenerated with both tracks | `mp4.rs`, `recorder.rs` |
+| PWA | Manifest, shell-only service worker, phone layout | `web/` |
+
+### 10.4 What still needs the real cameras (VM week)
+1. **Recorder audio**: the timestamp mapping and `frame_length` handling are exercised only with ffmpeg-generated AAC frames through the writer; a Hikvision AAC/G.711 stream (G.711 is *not* supported: AAC only) must be tried on one camera.
+2. **HEVC MSE in the office browsers** and the transcode path on the P2200 (`h264_nvenc`, `max_sessions`).
+3. **Object detection** with a real model on the GPU (`deploy/detector/test_server.py` only proves the plumbing); tune `interval_secs` and `min_confidence`; check the zone semantics (bottom-centre of the box) against the real scenes.
+4. **ONVIF on Hikvision**: profile selection (`Profile_2` is usually the PTZ one), `GotoHomePosition` support, credential rules (ONVIF user may differ from the RTSP user).
+5. **MQTT with the real broker + HA** (discovery entity names; retained `event` payloads).
+6. The recorder itself has no automated test (needs RTSP); a fake RTSP server in the test suite is the next testing investment.

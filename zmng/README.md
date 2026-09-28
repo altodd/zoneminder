@@ -8,7 +8,10 @@ A small Rust NVR core built for high-resolution HEVC/H.264 IP cameras:
 * **Browser-native playback**: any time range is served as fMP4 for MSE, or as an HLS byte-range playlist; live view is the same fMP4 tapped at the GOP boundary. The browser decodes (Safari, Chrome/Edge with hardware HEVC; H.264 everywhere).
 * **Retention as policy**: days per camera plus byte budget per volume; whole segments are unlinked, nothing is ever copied between volumes.
 * **Users, roles, per-camera permissions** (viewers fail closed).
-* **Import of existing ZoneMinder events** in place (no re-encode).
+* **Import of existing ZoneMinder events** in place (no re-encode), served from read-only storages.
+* **Notifications**: webhook, MQTT with Home Assistant discovery, server-sent events for the UI, zmNinjaNg event-server websocket.
+* **Operability**: Status page and Prometheus metrics with effective retention days per volume; `doctor`, `backup`, `restore`.
+* **Depth (phase 3)**: scrub-preview strips from the detector's frames, motion-gated object detection through an external detector, on-demand H.264 transcode for browsers without HEVC, ONVIF PTZ, federation of several servers behind one UI, opt-in AAC audio, installable PWA.
 
 Design and rationale: `../docs/ARCHITECTURE.md`.
 
