@@ -36,6 +36,8 @@ pub struct App {
     pub bus: Arc<crate::notify::Bus>,
     /// epoch milliseconds when this process started
     pub started_ms: i64,
+    /// on-demand H.264 transcode (None = not configured)
+    pub transcoder: Option<Arc<crate::transcode::Transcoder>>,
 }
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
@@ -295,6 +297,7 @@ async fn me(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> 
         "cameras": visible_cameras(&app, u),
         "setup_needed": app.db.user_count().unwrap_or(0) == 0,
         "go2rtc_url": app.cfg.go2rtc_url,
+        "transcode": app.transcoder.is_some(),
     }))
     .into_response())
 }
@@ -581,6 +584,36 @@ struct VideoQ {
     end: i64,
     /// "main" (default) or "sub"
     stream: Option<String>,
+    /// "h264" transcodes an HEVC source on demand (needs [transcode])
+    codec: Option<String>,
+}
+
+/// Whether the client asked for H.264 (`codec=h264`); anything else is 400.
+fn wants_h264(codec: &Option<String>) -> Result<bool, Response> {
+    match codec.as_deref() {
+        None | Some("") => Ok(false),
+        Some("h264") | Some("avc") | Some("avc1") => Ok(true),
+        _ => Err(bad("codec must be h264")),
+    }
+}
+
+/// Wrap an fMP4 stream in a transcode session when the client wants H.264
+/// and the source is not H.264 already. Returns (mime, body).
+async fn maybe_transcode(app: &App, want_h264: bool, source_mime: &str, first_dts: i64, fps: f64, body: impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static) -> Result<(String, Body), Response> {
+    if !want_h264 || source_mime.contains("avc1") {
+        return Ok((source_mime.to_string(), Body::from_stream(body)));
+    }
+    let Some(t) = app.transcoder.as_ref() else {
+        return Err((StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "no [transcode] configured; use the substream"}))).into_response());
+    };
+    let tc = match t.start(body, first_dts, fps).await {
+        Ok(tc) => tc,
+        Err(e) if e.to_string().contains("sessions are in use") => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+        Err(e) => return Err(err500(e)),
+    };
+    use futures::StreamExt;
+    let init = futures::stream::once(async move { Ok::<_, std::io::Error>(tc.init) });
+    Ok((tc.mime, Body::from_stream(init.chain(tc.frags))))
 }
 
 fn stream_of(q: &Option<String>) -> Result<crate::recorder::StreamKind, Response> {
@@ -598,21 +631,25 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
         return Err(bad("range must be 0 < end-start <= 6h"));
     }
     let kind = stream_of(&q.stream)?;
+    let want_h264 = wants_h264(&q.codec)?;
     let plan = video::plan_range_stream(&app.db, id, kind.as_str(), video::ms_to_dts(q.start), video::ms_to_dts(q.end)).map_err(err500)?;
     if plan.items.is_empty() {
         return Err((StatusCode::NOT_FOUND, "no recording in range").into_response());
     }
-    let mime = plan.mime.clone().unwrap_or_else(|| "video/mp4".into());
-    let first = plan.first_dts.map(video::dts_to_ms).unwrap_or(q.start);
+    let source_mime = plan.mime.clone().unwrap_or_else(|| "video/mp4".into());
+    let first_dts = plan.first_dts.unwrap_or(video::ms_to_dts(q.start));
+    let first = video::dts_to_ms(first_dts);
     let len = plan.bytes;
     let exact = plan.exact_len;
-    let body = Body::from_stream(video::stream_plan(plan));
+    let fps = app.hub.get(id).map(|h| h.status.read().fps as f64).filter(|f| *f > 0.5).unwrap_or(18.0);
+    let (mime, body) = maybe_transcode(&app, want_h264, &source_mime, first_dts, fps, video::stream_plan(plan)).await?;
+    let transcoded = mime != source_mime;
     let mut b = Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, "private, max-age=3600")
         .header(header::ACCEPT_RANGES, "none")
         .header("X-First-Dts-Ms", first.to_string());
-    if exact {
+    if exact && !transcoded {
         b = b.header(header::CONTENT_LENGTH, len);
     }
     Ok(b.body(body).unwrap())
@@ -720,26 +757,30 @@ fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {
 #[derive(Deserialize)]
 struct StreamQ {
     stream: Option<String>,
+    codec: Option<String>,
 }
 
 async fn live(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<StreamQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
     let kind = stream_of(&q.stream)?;
+    let want_h264 = wants_h264(&q.codec)?;
     let h = app.hub.get_stream(id, kind).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "stream not running").into_response())?;
-    let (mime, first_ms) = {
+    let (source_mime, first_dts) = {
         let r = h.recent.read();
         (
             r.as_ref().map(|r| r.params.mime()).unwrap_or_else(|| "video/mp4".into()),
-            r.as_ref().and_then(|r| r.frags.back().map(|f| video::dts_to_ms(f.0))).unwrap_or_else(|| crate::db::now_dts() / 90),
+            r.as_ref().and_then(|r| r.frags.back().map(|f| f.0)).unwrap_or_else(crate::db::now_dts),
         )
     };
+    let fps = h.status.read().fps as f64;
+    let (mime, body) = maybe_transcode(&app, want_h264, &source_mime, first_dts, if fps > 0.5 { fps } else { 18.0 }, video::live_mp4(h)).await?;
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, "no-store")
         .header("X-Accel-Buffering", "no")
-        .header("X-First-Dts-Ms", first_ms.to_string())
-        .body(Body::from_stream(video::live_mp4(h)))
+        .header("X-First-Dts-Ms", video::dts_to_ms(first_dts).to_string())
+        .body(body)
         .unwrap())
 }
 
@@ -1042,6 +1083,7 @@ impl App {
     /// Assemble the shared application state. The setup token is printed by
     /// `serve` when no users exist yet.
     pub fn new(cfg: Config, db: Db, hub: Arc<LiveHub>, bus: Arc<crate::notify::Bus>) -> App {
+        let transcoder = cfg.transcode.clone().map(|t| Arc::new(crate::transcode::Transcoder::new(t, cfg.ffmpeg.clone())));
         App {
             cfg: Arc::new(cfg),
             db,
@@ -1051,6 +1093,7 @@ impl App {
             login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
             started_ms: crate::db::now_dts() / 90,
+            transcoder,
         }
     }
 }

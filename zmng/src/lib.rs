@@ -16,5 +16,6 @@ pub mod recorder;
 pub mod retention;
 pub mod thumbs;
 pub mod tier;
+pub mod transcode;
 pub mod video;
 pub mod zmapi;

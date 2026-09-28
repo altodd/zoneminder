@@ -68,9 +68,9 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `POST /api/login`, `POST /api/logout`, `GET /api/me` | session cookie `zmng_session` or `Authorization: Bearer` |
 | `GET/POST /api/cameras`, `GET/PATCH/DELETE /api/cameras/{id}` | cameras (admin for writes; viewers never see RTSP URLs) |
 | `GET /api/cameras/{id}/timeline?start&end[&bucket]` | coverage intervals, motion histogram, events |
-| `GET /api/cameras/{id}/video.mp4?start&end` | fMP4 for the range (≤ 6 h); header `X-First-Dts-Ms` |
+| `GET /api/cameras/{id}/video.mp4?start&end[&stream=sub][&codec=h264]` | fMP4 for the range (≤ 6 h); header `X-First-Dts-Ms`; `codec=h264` transcodes HEVC on demand |
 | `GET /api/cameras/{id}/playlist.m3u8?start&end` | HLS (fMP4, byte ranges) |
-| `GET /api/cameras/{id}/live.mp4` | live fMP4 (chunked) |
+| `GET /api/cameras/{id}/live.mp4[?stream=sub][&codec=h264]` | live fMP4 (chunked) |
 | `GET /api/cameras/{id}/snapshot.jpg?width` | latest keyframe as JPEG |
 | `GET /api/cameras/{id}/frame.jpg?t&width[&stream=sub]` | keyframe nearest to time `t` (`stream=sub` ≈ 30 ms, used for scrub previews) |
 | `GET /api/cameras/{id}/preview.jpg?t` | scrub-preview tile (160 px, colour) nearest `t`, taken from the detector's frames every `preview_secs`; one small file read, no decode |
@@ -83,6 +83,21 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
+
+## H.264 fallback for browsers without HEVC
+
+Safari, and Chrome/Edge on machines with an HEVC decoder, play the 4 MP HEVC recording directly. Everything else (Firefox, Linux desktops, older Windows boxes) gets the H.264 substream — or, with a transcoder configured, the full-resolution picture re-encoded on demand:
+
+```toml
+[transcode]
+encoder = "h264_nvenc"   # or libx264 (CPU), h264_vaapi, h264_qsv
+preset = "p4"            # nvenc; libx264: veryfast
+max_height = 1080        # 0 = source size
+bitrate_kbps = 4000
+gop_secs = 1             # keyframe = fragment = live latency
+max_sessions = 3         # the P2200 has one NVENC engine; a 4th viewer gets 503
+```
+`GET /api/cameras/{id}/video.mp4?codec=h264&start&end` and `live.mp4?codec=h264` then pipe the fMP4 through ffmpeg and re-stamp every fragment with the recording's absolute timestamps, so the browser treats the result exactly like a native stream (same `X-First-Dts-Ms`, same MSE code). An H.264 source is passed through untouched; without `[transcode]` the request is answered with 501 and the UI keeps using the substream. `GET /api/me` reports `transcode: true` when it is available.
 
 ## Object detection (people, vehicles, animals)
 

@@ -47,6 +47,9 @@ pub struct Config {
     pub preview_secs: u32,
     /// External object-detection server (DeepStack / CodeProject.AI API).
     pub objects: Option<crate::objects::ObjectsConfig>,
+    /// On-demand H.264 transcode for clients without HEVC decode
+    /// (`video.mp4?codec=h264`, `live.mp4?codec=h264`).
+    pub transcode: Option<crate::transcode::TranscodeConfig>,
 }
 
 impl Default for Config {
@@ -69,6 +72,7 @@ impl Default for Config {
             backup_dir: None,
             preview_secs: 5,
             objects: None,
+            transcode: None,
         }
     }
 }

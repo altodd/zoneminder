@@ -59,6 +59,10 @@ const support = {
   nativeHls: (() => { const v = document.createElement('video'); return v.canPlayType('application/vnd.apple.mpegurl') !== ''; })(),
 };
 const canPlayMain = (c) => support.mse && (c.status?.codec?.startsWith('avc') ? support.h264Mse : support.hevcMse);
+// full resolution through the server-side H.264 transcode (HEVC camera, no HEVC decoder here, [transcode] configured)
+const canTranscode = (c) => support.mse && support.h264Mse && !canPlayMain(c) && !!state.me?.transcode;
+// query suffix that picks the best full-resolution main-stream representation for this browser
+const mainQuery = (c) => (canPlayMain(c) ? '' : canTranscode(c) ? '&codec=h264' : null);
 
 // ---------------------------------------------------------------------------
 // MSE player for our fMP4 streams (live or range). Absolute tfdt: we shift
@@ -320,10 +324,11 @@ async function viewCamera(main, camId, atMs) {
   function shift(d) { range.end = Math.min(Date.now(), range.end + d); range.start = range.end - windowMs; tl.load(); }
   async function goLive() {
     mode = 'live'; liveBadge.hidden = false; liveBtn.disabled = true; overlay.textContent = 'connecting…';
-    const url = canPlayMain(cam) ? `/api/cameras/${cam.id}/live.mp4` : (support.h264Mse && cam.sub_status ? `/api/cameras/${cam.id}/live.mp4?stream=sub` : null);
+    const mq = mainQuery(cam);
+    const url = mq !== null ? `/api/cameras/${cam.id}/live.mp4?${mq.slice(1)}` : (support.h264Mse && cam.sub_status ? `/api/cameras/${cam.id}/live.mp4?stream=sub` : null);
     if (!url) { overlay.textContent = 'browser cannot decode this stream — snapshots'; snapshots(); return; }
     mse.onLiveEnded = () => { if (mode === 'live') setTimeout(goLive, 2000); };
-    try { await mse.play(url, { live: true }); overlay.textContent = url.includes('stream=sub') ? 'live (substream)' : 'live'; }
+    try { await mse.play(url, { live: true }); overlay.textContent = url.includes('stream=sub') ? 'live (substream)' : url.includes('codec=h264') ? 'live (transcoded)' : 'live'; }
     catch (e) { overlay.textContent = `${e.message} — snapshots`; snapshots(); }
   }
   let snapTimer = null;
@@ -334,7 +339,8 @@ async function viewCamera(main, camId, atMs) {
     const s = Math.max(playhead - 1500, 0), e = Math.min(Date.now(), s + CHUNK); playRange = [s, e];
     overlay.textContent = 'loading…';
     try {
-      const url = canPlayMain(cam) ? `/api/cameras/${cam.id}/video.mp4?start=${Math.round(s)}&end=${Math.round(e)}` : `/api/cameras/${cam.id}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`;
+      const mq = mainQuery(cam);
+      const url = mq !== null ? `/api/cameras/${cam.id}/video.mp4?start=${Math.round(s)}&end=${Math.round(e)}${mq}` : `/api/cameras/${cam.id}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`;
       if (support.mse) await mse.play(url, { startMs: s });
       else if (support.nativeHls) { video.src = `/api/cameras/${cam.id}/playlist.m3u8?start=${Math.round(s)}&end=${Math.round(e)}`; video.play(); }
     } catch (err) { overlay.textContent = err.message; }
@@ -521,8 +527,8 @@ function openEvent(ev) {
       h('button', { class: 'small', onclick: async () => { await api.patch(`/api/events/${ev.id}`, { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
   document.body.append(modal);
   const mse = new MsePlayer(video);
-  const stream = cam && canPlayMain(cam) ? 'main' : 'sub';
-  const url = `/api/cameras/${ev.camera_id}/video.mp4?stream=${stream}&start=${ev.start}&end=${ev.end || ev.start + 60000}`;
+  const mq = cam ? mainQuery(cam) : null;
+  const url = mq !== null ? `/api/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}${mq}` : `/api/cameras/${ev.camera_id}/video.mp4?stream=sub&start=${ev.start}&end=${ev.end || ev.start + 60000}`;
   if (support.mse) mse.play(url, { startMs: ev.start }).catch((e) => { video.replaceWith(h('p', { class: 'err' }, e.message)); });
   else video.src = url;
   function close() { mse.stop(); modal.remove(); }
@@ -588,7 +594,7 @@ async function viewAdmin(main) {
     h('div', { class: 'card', style: 'grid-column:1/-1' }, h('h2', {}, 'Cameras'), camTable, h('div', { style: 'margin-top:10px' }, addCam)),
     h('div', { class: 'card' }, h('h2', {}, 'Users'), userTable, h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted' }, 'Viewers see only the cameras assigned to them (fails closed). '), tokenBtn),
     h('div', { class: 'card' }, h('h2', {}, 'Storage'), stor, h('p', { class: 'muted' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
-    h('div', { class: 'card' }, h('h2', {}, 'Browser'), h('p', {}, `MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL.'))));
+    h('div', { class: 'card' }, h('h2', {}, 'Browser'), h('p', {}, `MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL.'))));
 }
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
 function editCamera(c) {
