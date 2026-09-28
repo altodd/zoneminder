@@ -12,7 +12,6 @@
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -51,14 +50,8 @@ pub struct DetectStatus {
     pub last_error: Option<String>,
 }
 
-static DETECTORS: std::sync::OnceLock<RwLock<HashMap<i64, Arc<DetectorHandle>>>> = std::sync::OnceLock::new();
-
-fn detectors() -> &'static RwLock<HashMap<i64, Arc<DetectorHandle>>> {
-    DETECTORS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub fn status(camera_id: i64) -> Option<DetectStatus> {
-    detectors().read().get(&camera_id).map(|d| d.status.read().clone())
+pub fn status(hub: &LiveHub, camera_id: i64) -> Option<DetectStatus> {
+    hub.detectors.read().get(&camera_id).map(|d| d.status.read().clone())
 }
 
 /// Relevant subset of camera config; a change restarts the detector.
@@ -72,7 +65,7 @@ fn detect_key(c: &Camera) -> String {
 
 pub async fn reconcile(ctx: Arc<DetectCtx>) -> Result<()> {
     let cams = ctx.db.cameras()?;
-    let mut map = detectors().write();
+    let mut map = ctx.hub.detectors.write();
     let keep: Vec<i64> = cams.iter().filter(|c| c.enabled).map(|c| c.id).collect();
     for id in map.keys().filter(|id| !keep.contains(id)).copied().collect::<Vec<_>>() {
         if let Some(d) = map.remove(&id) {
@@ -654,17 +647,8 @@ impl EventState {
         *self = EventState::default();
         // thumbnail in the background (waits for the segment to close if needed)
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let db = ctx.db.clone();
-            let ffmpeg = ctx.ffmpeg.clone();
-            let thumb_dir = ctx.thumb_dir.clone();
-            let bus = ctx.bus.clone();
-            let cam_id = cam.id;
-            rt.spawn(async move {
-                match make_thumbnail(&db, &ffmpeg, &thumb_dir, cam_id, id, peak_dts).await {
-                    Ok(jpeg) => bus.publish(crate::notify::Notification::EventThumbnail { event_id: id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) }),
-                    Err(e) => error!(camera = cam_id, event = id, "thumbnail: {e:#}"),
-                }
-            });
+            let (db, ffmpeg, thumb_dir, bus, cam_id) = (ctx.db.clone(), ctx.ffmpeg.clone(), ctx.thumb_dir.clone(), ctx.bus.clone(), cam.id);
+            rt.spawn(async move { thumbnail_task(&db, &ffmpeg, &thumb_dir, &bus, cam_id, id, peak_dts).await });
         }
         Ok(())
     }
@@ -726,6 +710,19 @@ impl EventState {
             }
         }
         Ok(())
+    }
+}
+
+/// Make the thumbnail of a closed event, then tell everyone: the JPEG bytes
+/// for MQTT, and an `event_update` whose `thumb` URL is now set (the
+/// `event_end` went out before the picture existed).
+pub async fn thumbnail_task(db: &Db, ffmpeg: &str, thumb_dir: &std::path::Path, bus: &crate::notify::Bus, cam_id: i64, event_id: i64, peak_dts: i64) {
+    match make_thumbnail(db, ffmpeg, thumb_dir, cam_id, event_id, peak_dts).await {
+        Ok(jpeg) => {
+            bus.publish(crate::notify::Notification::EventThumbnail { event_id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) });
+            bus.publish_event(db, event_id, crate::notify::Notification::EventUpdate);
+        }
+        Err(e) => error!(camera = cam_id, event = event_id, "thumbnail: {e:#}"),
     }
 }
 

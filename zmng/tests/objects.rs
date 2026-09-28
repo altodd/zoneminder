@@ -143,7 +143,7 @@ async fn require_object_discards_eventless_motion() {
     // the event opens after the warm-up and stays open until ffmpeg exits (~2 s)
     let mut id = None;
     for _ in 0..400 {
-        if let Some(e) = zmng::detect::status(cam).and_then(|s| s.in_event) { id = Some(e); break; }
+        if let Some(e) = zmng::detect::status(&fx.hub, cam).and_then(|s| s.in_event) { id = Some(e); break; }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let id = id.expect("an event row was opened while motion ran");
@@ -152,6 +152,10 @@ async fn require_object_discards_eventless_motion() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(fx.db.event(id).unwrap().is_none(), "event without objects must be discarded");
+    for _ in 0..50 {
+        if *calls.lock().unwrap() >= 1 { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(*calls.lock().unwrap() >= 1, "the detector was asked");
     // nothing was announced for it
     let mut announced = false;

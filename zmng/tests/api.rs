@@ -67,6 +67,40 @@ async fn login_sets_cookie_and_throttles_failures() {
     assert_eq!(s.status, 403);
 }
 
+/// While no user exists, an unauthenticated request is a pseudo-admin only
+/// for /api/me; it must not be able to create accounts, cameras or tokens
+/// and skip the setup token.
+#[tokio::test]
+async fn setup_mode_cannot_be_used_to_create_users_without_the_token() {
+    let fx = Fixture::new();
+    fx.add_camera("front");
+    let app = fx.app();
+    let r = zmng::api::router(app.clone());
+    let me = call(&r, "GET", "/api/me", None, None).await;
+    assert_eq!(me.status, 200);
+    assert_eq!(me.json()["setup_needed"], true);
+    for (m, p, b) in [
+        ("POST", "/api/users", Some(json!({"username": "evil", "password": "password123", "role": "admin"}))),
+        ("POST", "/api/cameras", Some(json!({"name": "x", "main_url": "rtsp://x/"}))),
+        ("POST", "/api/tokens", None),
+        ("GET", "/api/cameras", None),
+        ("PATCH", "/api/cameras/1", Some(json!({"name": "y"}))),
+    ] {
+        let res = call(&r, m, p, None, b).await;
+        assert!(res.status == 403 || res.status == 401, "{m} {p} -> {}", res.status);
+    }
+    assert_eq!(fx.db.user_count().unwrap(), 0);
+    // the proper path: wrong token 403, short password 400, right token 200, then login works
+    let bad = call(&r, "POST", "/api/setup", None, Some(json!({"username": "admin", "password": "password123", "setup_token": "nope"}))).await;
+    assert_eq!(bad.status, 403);
+    let short = call(&r, "POST", "/api/setup", None, Some(json!({"username": "admin", "password": "short", "setup_token": app.setup_token.as_str()}))).await;
+    assert_eq!(short.status, 400);
+    let ok = call(&r, "POST", "/api/setup", None, Some(json!({"username": "admin", "password": "password123", "setup_token": app.setup_token.as_str()}))).await;
+    assert_eq!(ok.status, 200, "{}", ok.text());
+    assert_eq!(fx.db.user_count().unwrap(), 1);
+    assert_eq!(call(&r, "GET", "/api/cameras", None, None).await.status, 401);
+}
+
 #[tokio::test]
 async fn viewers_fail_closed_and_never_see_rtsp_urls() {
     let w = world();
@@ -233,6 +267,58 @@ async fn camera_admin_validates_patches() {
     let st = get(&r, "/api/storages", &w.admin_tok).await.json();
     assert!(st[0]["used_bytes"].as_i64().unwrap() > 0);
     assert_eq!(st[0]["available"], true);
+}
+
+/// HEVC main streams: hvc1 sample entries, RFC 6381 codec string, decodable range.
+#[tokio::test]
+async fn hevc_segments_serve_with_hvc1_codec_string() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("hevc");
+    let enc = parse_encoded(&encode_fmp4(3, "libx265", 320, 180));
+    assert_eq!(enc.params.codec, zmng::mp4::Codec::H265);
+    assert!(enc.params.rfc6381.starts_with("hvc1."), "{}", enc.params.rfc6381);
+    assert_eq!(&enc.params.sample_entry[4..8], b"hvc1");
+    fx.write_segment(cam, "main", &enc, dts(T0), |_| 0);
+    let admin = fx.add_admin("admin", "password123");
+    let tok = fx.token_for(admin);
+    let r = fx.router();
+    let res = get(&r, &format!("/api/cameras/{cam}/video.mp4?start={}&end={}", ms(T0), ms(T0 + 2)), &tok).await;
+    assert_eq!(res.status, 200);
+    assert!(res.header("content-type").unwrap().starts_with("video/mp4; codecs=\"hvc1."), "{:?}", res.header("content-type"));
+    assert_eq!(count_frames(&res.body), 20);
+    let c = get(&r, &format!("/api/cameras/{cam}"), &tok).await.json();
+    assert_eq!(c["name"], "hevc");
+    // the ffmpeg-written file used hev1 or hvc1; our init always says hvc1
+    let mut hev = enc.params.sample_entry.to_vec();
+    hev[4..8].copy_from_slice(b"hev1");
+    zmng::mp4::prefer_hvc1(&mut hev);
+    assert_eq!(&hev[4..8], b"hvc1");
+}
+
+/// Deleting events through the ZoneMinder-compatible API is an admin act;
+/// viewers may still archive and annotate.
+#[tokio::test]
+async fn zm_event_delete_is_admin_only() {
+    let w = world();
+    let r = w.fx.router();
+    let id = w.fx.db.events(Some(&[w.cam]), None, None, 0, false, None, 1, false, None).unwrap()[0].id;
+    let del = call(&r, "DELETE", &format!("/zm/api/events/{id}.json?token={}", w.viewer_tok), None, None).await;
+    assert_eq!(del.status, 403);
+    assert!(w.fx.db.event(id).unwrap().is_some());
+    let put = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/zm/api/events/{id}.json?token={}", w.viewer_tok))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from("Event%5BArchived%5D=1&Event%5BNotes%5D=cat"))
+        .unwrap();
+    let res = tower::ServiceExt::oneshot(r.clone(), put).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let e = w.fx.db.event(id).unwrap().unwrap();
+    assert!(e.archived);
+    assert_eq!(e.notes.as_deref(), Some("cat"));
+    let del = call(&r, "DELETE", &format!("/zm/api/events/{id}.json?token={}", w.admin_tok), None, None).await;
+    assert_eq!(del.status, 200);
+    assert!(w.fx.db.event(id).unwrap().is_none());
 }
 
 #[tokio::test]

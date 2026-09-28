@@ -103,11 +103,11 @@ fn backup_and_restore_roundtrip() {
     let cam = fx.add_camera("front");
     fx.add_admin("admin", "password123");
     let dest = fx.dir.path().join("backups").join("zmng.db.backup");
-    zmng::health::backup(&fx.db, &dest).unwrap();
+    zmng::health::backup(&fx.cfg.db_path, &dest).unwrap();
     assert!(dest.exists());
     // second backup keeps the previous copy
     fx.add_camera("second");
-    zmng::health::backup(&fx.db, &dest).unwrap();
+    zmng::health::backup(&fx.cfg.db_path, &dest).unwrap();
     assert!(fx.dir.path().join("backups").join("zmng.db.backup.1").exists());
     // restore into a fresh location and read it back
     let target = fx.dir.path().join("restored.db");
@@ -132,5 +132,61 @@ fn backup_and_restore_roundtrip() {
     assert!(zmng::health::backup_path(&cfg).ends_with("zmng.db.backup"));
     cfg.backup_dir = Some(std::path::PathBuf::from("/mnt/archive/zmng"));
     assert_eq!(zmng::health::backup_path(&cfg), std::path::PathBuf::from("/mnt/archive/zmng/zmng.db.backup"));
+    // an unmounted backup volume is an error, not a silent copy onto the root filesystem
+    let e = zmng::health::backup(&fx.cfg.db_path, &fx.dir.path().join("not-mounted").join("zmng-backups").join("zmng.db.backup")).unwrap_err().to_string();
+    assert!(e.contains("not available"), "{e}");
     let _ = json!({});
+}
+
+/// The kept copy must contain everything, including rows that were still in
+/// the WAL, and restore must refuse while the service holds its lock.
+#[test]
+fn restore_keeps_wal_contents_and_respects_the_service_lock() {
+    let fx = Fixture::new();
+    let dest = fx.dir.path().join("zmng.db.backup");
+    zmng::health::backup(&fx.cfg.db_path, &dest).unwrap();
+    // rows written after the backup live in the WAL until a checkpoint
+    fx.add_camera("after-backup");
+    assert!(std::fs::metadata(format!("{}-wal", fx.cfg.db_path.display())).map(|m| m.len() > 0).unwrap_or(false), "expected a non-empty WAL");
+    // running service => locked
+    let lock = zmng::health::ServiceLock::acquire(&fx.cfg.db_path).unwrap();
+    let e = zmng::health::ServiceLock::acquire(&fx.cfg.db_path).unwrap_err().to_string();
+    assert!(e.contains("service is running"), "{e}");
+    drop(lock);
+    let _lock = zmng::health::ServiceLock::acquire(&fx.cfg.db_path).unwrap();
+    drop(fx.db.clone());
+    zmng::health::restore(&dest, &fx.cfg.db_path).unwrap();
+    // the restored index has no cameras; the kept copy has the WAL-only camera
+    let restored = zmng::db::Db::open(&fx.cfg.db_path).unwrap();
+    assert!(restored.cameras().unwrap().is_empty());
+    let kept = zmng::db::Db::open(&fx.cfg.db_path.with_extension("db.before-restore")).unwrap();
+    assert_eq!(kept.cameras().unwrap().len(), 1);
+    assert_eq!(kept.cameras().unwrap()[0].name, "after-backup");
+    // same file as source and destination is refused
+    assert!(zmng::health::restore(&fx.cfg.db_path, &fx.cfg.db_path).is_err());
+}
+
+/// doctor never writes: a database it cannot migrate is reported, not changed.
+#[tokio::test]
+async fn doctor_is_read_only() {
+    let fx = Fixture::new();
+    fx.add_camera("c");
+    let wal = format!("{}-wal", fx.cfg.db_path.display());
+    // checkpoint so the WAL is empty, snapshot the file, then make sure doctor changes neither
+    fx.db.with(|c| { c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?; Ok(()) }).unwrap();
+    let before = std::fs::read(&fx.cfg.db_path).unwrap();
+    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let mut cfg = fx.cfg.clone();
+    cfg.thumb_dir = fx.dir.path().join("no-thumbs-yet");
+    let checks = zmng::health::doctor(&cfg, false).await;
+    assert!(!cfg.thumb_dir.exists(), "doctor must not create directories");
+    assert_eq!(std::fs::read(&fx.cfg.db_path).unwrap(), before);
+    assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), wal_len);
+    let t = checks.iter().find(|c| c.name == "thumb_dir").unwrap();
+    assert_eq!(t.verdict, zmng::health::Verdict::Warn);
+    // a missing database is a warning (fresh install), not a crash or a created file
+    cfg.db_path = fx.dir.path().join("nope.db");
+    let checks = zmng::health::doctor(&cfg, false).await;
+    assert_eq!(checks.iter().find(|c| c.name == "database").unwrap().verdict, zmng::health::Verdict::Warn);
+    assert!(!cfg.db_path.exists());
 }

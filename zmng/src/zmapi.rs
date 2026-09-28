@@ -235,7 +235,7 @@ fn monitor_json(app: &App, c: &crate::db::Camera, seq: usize) -> Value {
         "Monitor_Status": {
             "MonitorId": c.id.to_string(),
             "Status": if st.connected { "Connected" } else { "NotRunning" },
-            "CaptureFPS": format!("{:.1}", st.fps), "AnalysisFPS": format!("{:.1}", crate::detect::status(c.id).map(|d| d.fps).unwrap_or(0.0)),
+            "CaptureFPS": format!("{:.1}", st.fps), "AnalysisFPS": format!("{:.1}", crate::detect::status(&app.hub, c.id).map(|d| d.fps).unwrap_or(0.0)),
             "CaptureBandwidth": ((st.kbps * 125.0) as i64).to_string()
         }
     })
@@ -415,6 +415,10 @@ async fn event_put(State(app): State<App>, Path(id): Path<String>, user: Option<
 
 async fn event_delete(State(app): State<App>, Path(id): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
+    if u.role != "admin" {
+        // viewers may archive and annotate; deleting footage metadata is an admin act
+        return Err(err(StatusCode::FORBIDDEN, "Insufficient privileges"));
+    }
     let id = parse_id(&id).ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid event"))?;
     let e = app.db.event(id).map_err(e500)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid event"))?;
     if !crate::api::visible_cameras_pub(&app, u).contains(&e.camera_id) {

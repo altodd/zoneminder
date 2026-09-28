@@ -164,6 +164,11 @@ async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> 
         None => None,
     };
     match user {
+        // the setup pseudo-admin may only look at /api/me (the UI needs it to
+        // show the setup form); everything else waits for the real first admin
+        Some(u) if u.id == 0 && path != "/api/me" && !public => {
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"create the first admin with the setup token first"}))).into_response()
+        }
         Some(u) => {
             req.extensions_mut().insert(AuthUser(u));
             next.run(req).await
@@ -315,7 +320,7 @@ struct CameraOut {
 fn camera_out(app: &App, c: crate::db::Camera, admin: bool) -> CameraOut {
     let status = app.hub.get(c.id).map(|h| h.status.read().clone()).unwrap_or_default();
     let sub_status = app.hub.get_stream(c.id, crate::recorder::StreamKind::Sub).map(|h| h.status.read().clone());
-    let detect = crate::detect::status(c.id);
+    let detect = crate::detect::status(&app.hub, c.id);
     let mut c = c;
     if !admin || app.db.user_count().unwrap_or(1) == 0 {
         // never leak RTSP credentials to viewers
@@ -924,7 +929,7 @@ async fn storages(State(app): State<App>, user: Option<axum::Extension<AuthUser>
         let used = app.db.storage_used_bytes(s.id).unwrap_or(0);
         let free = crate::retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(0);
         out.push(serde_json::json!({"id": s.id, "path": s.path, "max_bytes": s.max_bytes, "reserve_bytes": s.reserve_bytes, "used_bytes": used, "free_bytes": free,
-            "archive_to": s.archive_to, "archive_after_days": s.archive_after_days, "archive_rate_mbps": s.archive_rate_mbps, "available": std::path::Path::new(&s.path).is_dir()}));
+            "archive_to": s.archive_to, "archive_after_days": s.archive_after_days, "archive_rate_mbps": s.archive_rate_mbps, "read_only": s.read_only, "available": std::path::Path::new(&s.path).is_dir()}));
     }
     Ok(Json(out).into_response())
 }
@@ -962,7 +967,7 @@ async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
     for id in vis {
         if let Some(h) = app.hub.get(id) {
             let sub = app.hub.get_stream(id, crate::recorder::StreamKind::Sub).map(|s| s.status.read().clone());
-            cams.push(serde_json::json!({"id": id, "status": h.status.read().clone(), "sub_status": sub, "detect": crate::detect::status(id)}));
+            cams.push(serde_json::json!({"id": id, "status": h.status.read().clone(), "sub_status": sub, "detect": crate::detect::status(&app.hub, id)}));
         }
     }
     Ok(Json(serde_json::json!({"earliest_ms": earliest, "now_ms": crate::db::now_dts() / 90, "cameras": cams})).into_response())
@@ -973,11 +978,11 @@ async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
 async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
     let u = require(user.as_ref().map(|e| &e.0))?;
-    let admin = u.role == "admin";
-    let vis = visible_cameras(&app, u);
+    let user = u.clone();
     let rx = app.bus.subscribe();
+    let app2 = app.clone();
     let stream = futures::stream::unfold(rx, move |mut rx| {
-        let vis = vis.clone();
+        let (app, user) = (app2.clone(), user.clone());
         async move {
             loop {
                 match rx.recv().await {
@@ -985,9 +990,12 @@ async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthU
                         if !n.is_external() {
                             continue;
                         }
+                        // re-evaluated per notification (one indexed query) so a
+                        // revoked camera or deleted account stops the feed at once
+                        let user = app.db.session_user_by_id(user.id).ok().flatten()?;
                         let allowed = match n.camera_id() {
-                            Some(c) => vis.contains(&c),
-                            None => admin,
+                            Some(c) => visible_cameras(&app, &user).contains(&c),
+                            None => user.role == "admin",
                         };
                         if !allowed {
                             continue;
@@ -1009,7 +1017,9 @@ async fn status(State(app): State<App>, user: Option<axum::Extension<AuthUser>>)
     let u = require(user.as_ref().map(|e| &e.0))?;
     let vis = visible_cameras(&app, u);
     let admin = u.role == "admin";
-    let r = crate::health::report(&app.db, &app.hub, app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000, &vis, admin).map_err(err500)?;
+    let (db, hub, started, after) = (app.db.clone(), app.hub.clone(), app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000);
+    // statvfs on a hung mount must not stall a runtime worker
+    let r = tokio::task::spawn_blocking(move || crate::health::report(&db, &hub, started, after, &vis, admin)).await.map_err(err500)?.map_err(err500)?;
     Ok(Json(r).into_response())
 }
 
@@ -1017,7 +1027,8 @@ async fn status(State(app): State<App>, user: Option<axum::Extension<AuthUser>>)
 async fn metrics(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require_admin(user.as_ref().map(|e| &e.0))?;
     let vis = visible_cameras(&app, u);
-    let r = crate::health::report(&app.db, &app.hub, app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000, &vis, true).map_err(err500)?;
+    let (db, hub, started, after) = (app.db.clone(), app.hub.clone(), app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000);
+    let r = tokio::task::spawn_blocking(move || crate::health::report(&db, &hub, started, after, &vis, true)).await.map_err(err500)?.map_err(err500)?;
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::health::prometheus(&r)).into_response())
 }
 

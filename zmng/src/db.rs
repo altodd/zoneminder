@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS storage (
   -- pressure) to this storage, oldest first, rate limited; NULL = never
   archive_to          INTEGER REFERENCES storage(id),
   archive_after_days  REAL,
-  archive_rate_mbps   INTEGER NOT NULL DEFAULT 40
+  archive_rate_mbps   INTEGER NOT NULL DEFAULT 40,
+  -- never delete, move or write here (imported ZoneMinder event trees)
+  read_only           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS camera (
@@ -98,10 +100,6 @@ CREATE TABLE IF NOT EXISTS segment (
   stream           TEXT NOT NULL DEFAULT 'main',
   created_at       INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS segment_cam_start ON segment(camera_id, start_dts);
-CREATE INDEX IF NOT EXISTS segment_cam_stream_start ON segment(camera_id, stream, start_dts);
-CREATE INDEX IF NOT EXISTS segment_cam_end   ON segment(camera_id, end_dts);
-CREATE INDEX IF NOT EXISTS segment_storage   ON segment(storage_id, start_dts);
 
 CREATE TABLE IF NOT EXISTS event (
   id          INTEGER PRIMARY KEY,
@@ -117,8 +115,6 @@ CREATE TABLE IF NOT EXISTS event (
   notes       TEXT,
   created_at  INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS event_cam_start ON event(camera_id, start_dts);
-CREATE INDEX IF NOT EXISTS event_start     ON event(start_dts);
 
 CREATE TABLE IF NOT EXISTS user (
   id         INTEGER PRIMARY KEY,
@@ -152,6 +148,17 @@ CREATE TABLE IF NOT EXISTS session (
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+"#;
+
+/// Indexes are created after `migrate()` so a database from an older build
+/// (whose tables lack the newer columns) can be opened and upgraded.
+const INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS segment_cam_start ON segment(camera_id, start_dts);
+CREATE INDEX IF NOT EXISTS segment_cam_stream_start ON segment(camera_id, stream, start_dts);
+CREATE INDEX IF NOT EXISTS segment_cam_end   ON segment(camera_id, end_dts);
+CREATE INDEX IF NOT EXISTS segment_storage   ON segment(storage_id, start_dts);
+CREATE INDEX IF NOT EXISTS event_cam_start ON event(camera_id, start_dts);
+CREATE INDEX IF NOT EXISTS event_start     ON event(start_dts);
 "#;
 
 fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
@@ -220,6 +227,9 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has_col("storage", "archive_to")? {
         c.execute_batch("ALTER TABLE storage ADD COLUMN archive_to INTEGER REFERENCES storage(id); ALTER TABLE storage ADD COLUMN archive_after_days REAL; ALTER TABLE storage ADD COLUMN archive_rate_mbps INTEGER NOT NULL DEFAULT 40;")?;
     }
+    if !has_col("storage", "read_only")? {
+        c.execute_batch("ALTER TABLE storage ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;")?;
+    }
     if !has_col("camera", "tags")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
     }
@@ -246,6 +256,7 @@ pub struct Storage {
     pub archive_to: Option<i64>,
     pub archive_after_days: Option<f64>,
     pub archive_rate_mbps: i64,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -357,10 +368,20 @@ impl Db {
         )?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        conn.execute_batch(INDEXES)?;
         conn.execute(
             "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        Ok(Db { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// Open without creating, migrating or writing anything (doctor, tools
+    /// run as another user).
+    pub fn open_read_only(path: &Path) -> Result<Db> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(|| format!("opening {}", path.display()))?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -373,7 +394,7 @@ impl Db {
 
     pub fn storages(&self) -> Result<Vec<Storage>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id,path,max_bytes,reserve_bytes,archive_to,archive_after_days,archive_rate_mbps FROM storage ORDER BY id")?;
+            let mut st = c.prepare("SELECT id,path,max_bytes,reserve_bytes,archive_to,archive_after_days,archive_rate_mbps,read_only FROM storage ORDER BY id")?;
             let rows = st.query_map([], |r| {
                 Ok(Storage {
                     id: r.get(0)?,
@@ -383,6 +404,7 @@ impl Db {
                     archive_to: r.get(4)?,
                     archive_after_days: r.get(5)?,
                     archive_rate_mbps: r.get(6)?,
+                    read_only: r.get::<_, i64>(7)? != 0,
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -407,12 +429,14 @@ impl Db {
         self.with(|c| {
             for (k, v) in patch {
                 let sql = match k.as_str() {
-                    "max_bytes" | "reserve_bytes" | "archive_to" | "archive_after_days" | "archive_rate_mbps" => format!("UPDATE storage SET {k}=?1 WHERE id=?2"),
+                    "max_bytes" | "reserve_bytes" | "archive_to" | "archive_after_days" | "archive_rate_mbps" | "read_only" => format!("UPDATE storage SET {k}=?1 WHERE id=?2"),
                     _ => anyhow::bail!("field {k} is not updatable"),
                 };
                 let val: rusqlite::types::Value = match v {
-                    serde_json::Value::Null => rusqlite::types::Value::Null,
-                    serde_json::Value::Number(n) => n.as_i64().map(rusqlite::types::Value::Integer).unwrap_or_else(|| rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.0))),
+                    serde_json::Value::Null if k != "read_only" => rusqlite::types::Value::Null,
+                    serde_json::Value::Bool(b) if k == "read_only" => rusqlite::types::Value::Integer(*b as i64),
+                    serde_json::Value::Number(n) if k != "read_only" => n.as_i64().map(rusqlite::types::Value::Integer).unwrap_or_else(|| rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.0))),
+                    _ if k == "read_only" => anyhow::bail!("read_only must be true/false"),
                     _ => anyhow::bail!("{k} must be a number or null"),
                 };
                 if k == "archive_to" {
@@ -1179,6 +1203,18 @@ impl Db {
             Ok(c.query_row(
                 "SELECT u.id,u.username,u.role,u.pass_hash FROM session s JOIN user u ON u.id=s.user_id WHERE s.token=?1 AND s.expires_at>?2",
                 params![token, now_secs()],
+                |r| Ok(User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? }),
+            )
+            .optional()?)
+        })
+    }
+
+    /// Current row of a user (None once deleted).
+    pub fn session_user_by_id(&self, id: i64) -> Result<Option<User>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT id,username,role,pass_hash FROM user WHERE id=?1",
+                params![id],
                 |r| Ok(User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? }),
             )
             .optional()?)

@@ -100,7 +100,7 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
     for cam in db.cameras()?.into_iter().filter(|c| visible.contains(&c.id)) {
         let st = hub.get(cam.id).map(|h| h.status.read().clone()).unwrap_or_default();
         let sub = hub.get_stream(cam.id, crate::recorder::StreamKind::Sub).map(|h| h.status.read().connected);
-        let det = crate::detect::status(cam.id);
+        let det = crate::detect::status(hub, cam.id);
         let stale = st.last_frame_dts > 0 && dts_to_ms(now - st.last_frame_dts) > alert_after_ms;
         let recording = st.connected && !stale;
         if cam.enabled && !recording {
@@ -181,6 +181,11 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
     })
 }
 
+/// Escape a label value per the Prometheus text format.
+fn prom_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
 /// Prometheus text exposition of the report.
 pub fn prometheus(r: &HealthReport) -> String {
     let mut o = String::new();
@@ -198,7 +203,7 @@ pub fn prometheus(r: &HealthReport) -> String {
     line("zmng_issues", "level=\"error\"", r.issues.iter().filter(|i| i.level == "error").count() as f64);
     line("zmng_issues", "level=\"warn\"", r.issues.iter().filter(|i| i.level == "warn").count() as f64);
     for c in &r.cameras {
-        let l = format!("camera=\"{}\",name=\"{}\"", c.id, c.name.replace('"', "'"));
+        let l = format!("camera=\"{}\",name=\"{}\"", c.id, prom_escape(&c.name));
         line("zmng_camera_recording", &l, c.recording as i64 as f64);
         line("zmng_camera_fps", &l, c.fps as f64);
         line("zmng_camera_kbps", &l, c.kbps as f64);
@@ -210,7 +215,7 @@ pub fn prometheus(r: &HealthReport) -> String {
         line("zmng_camera_ingest_bytes_24h", &l, c.ingest_24h as f64);
     }
     for s in &r.storages {
-        let l = format!("storage=\"{}\",path=\"{}\"", s.id, s.path.replace('"', "'"));
+        let l = format!("storage=\"{}\",path=\"{}\"", s.id, prom_escape(&s.path));
         line("zmng_storage_available", &l, s.available as i64 as f64);
         line("zmng_storage_used_bytes", &l, s.used_bytes as f64);
         line("zmng_storage_free_bytes", &l, s.free_bytes as f64);
@@ -241,6 +246,13 @@ pub struct Check {
 
 fn check(name: &str, v: Verdict, detail: impl Into<String>) -> Check {
     Check { name: name.into(), verdict: v, detail: detail.into() }
+}
+
+/// Some(owner uid) when the file belongs to another user.
+fn file_owner_mismatch(p: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(p).ok()?.uid();
+    (uid != unsafe { libc::geteuid() }).then_some(uid)
 }
 
 fn writable(dir: &Path) -> std::result::Result<(), String> {
@@ -284,10 +296,13 @@ pub async fn doctor(cfg: &crate::config::Config, probe_cameras: bool) -> Vec<Che
     } else {
         out.push(check("web_dir", Verdict::Fail, format!("{} has no index.html", cfg.web_dir.display())));
     }
-    let _ = std::fs::create_dir_all(&cfg.thumb_dir);
-    match writable(&cfg.thumb_dir) {
-        Ok(()) => out.push(check("thumb_dir", Verdict::Pass, cfg.thumb_dir.display().to_string())),
-        Err(e) => out.push(check("thumb_dir", Verdict::Fail, format!("{}: {e}", cfg.thumb_dir.display()))),
+    if !cfg.thumb_dir.exists() {
+        out.push(check("thumb_dir", Verdict::Warn, format!("{} does not exist yet; the service creates it at start", cfg.thumb_dir.display())));
+    } else {
+        match writable(&cfg.thumb_dir) {
+            Ok(()) => out.push(check("thumb_dir", Verdict::Pass, cfg.thumb_dir.display().to_string())),
+            Err(e) => out.push(check("thumb_dir", Verdict::Fail, format!("{}: {e}", cfg.thumb_dir.display()))),
+        }
     }
     if let Some(b) = &cfg.backup_dir {
         match writable(b) {
@@ -295,8 +310,16 @@ pub async fn doctor(cfg: &crate::config::Config, probe_cameras: bool) -> Vec<Che
             Err(e) => out.push(check("backup_dir", Verdict::Warn, format!("{}: {e}", b.display()))),
         }
     }
-    // database
-    let db = match Db::open(&cfg.db_path) {
+    // database: opened read-only so a pre-flight run as the wrong user can
+    // neither migrate the schema nor leave root-owned -wal/-shm files behind
+    if !cfg.db_path.exists() {
+        out.push(check("database", Verdict::Warn, format!("{} does not exist yet; the service creates it at start", cfg.db_path.display())));
+        return out;
+    }
+    if let Some(owner) = file_owner_mismatch(&cfg.db_path) {
+        out.push(check("database owner", Verdict::Warn, format!("{} is owned by uid {owner} but this runs as uid {}; run doctor as the service user", cfg.db_path.display(), unsafe { libc::geteuid() })));
+    }
+    let db = match Db::open_read_only(&cfg.db_path) {
         Ok(db) => {
             match db.integrity_check() {
                 Ok(msg) if msg == "ok" => out.push(check("database", Verdict::Pass, cfg.db_path.display().to_string())),
@@ -320,11 +343,13 @@ pub async fn doctor(cfg: &crate::config::Config, probe_cameras: bool) -> Vec<Che
     }
     for s in &storages {
         let p = Path::new(&s.path);
-        match writable(p) {
+        let access = if s.read_only { p.is_dir().then_some(()).ok_or_else(|| "not a directory".to_string()) } else { writable(p) };
+        match access {
             Ok(()) => {
                 let free = crate::retention::fs_free_bytes(p).unwrap_or(0);
-                let v = if free < s.reserve_bytes as u64 { Verdict::Warn } else { Verdict::Pass };
-                out.push(check(&format!("storage {}", s.id), v, format!("{} free {:.1} GB (reserve {:.1} GB)", s.path, free as f64 / 1e9, s.reserve_bytes as f64 / 1e9)));
+                let v = if !s.read_only && free < s.reserve_bytes as u64 { Verdict::Warn } else { Verdict::Pass };
+                let what = if s.read_only { "read-only, " } else { "" };
+                out.push(check(&format!("storage {}", s.id), v, format!("{} {what}free {:.1} GB (reserve {:.1} GB)", s.path, free as f64 / 1e9, s.reserve_bytes as f64 / 1e9)));
             }
             Err(e) => out.push(check(&format!("storage {}", s.id), Verdict::Fail, format!("{}: {e}", s.path))),
         }
@@ -379,22 +404,61 @@ async fn probe_rtsp(c: &crate::db::Camera) -> Check {
 // backup / restore
 // ---------------------------------------------------------------------------
 
-/// Write a consistent copy of the index to `dest` (VACUUM INTO), keeping the
-/// previous copy as `<dest>.1`.
-pub fn backup(db: &Db, dest: &Path) -> Result<()> {
-    if let Some(p) = dest.parent() {
-        std::fs::create_dir_all(p)?;
+/// Write a consistent copy of the index at `db_path` to `dest` (VACUUM INTO),
+/// keeping the previous copy as `<dest>.1`. Uses its own read-only
+/// connection: in WAL mode a reader never blocks the recorders' writer, so
+/// a multi-hundred-MB copy to a slow USB disk stalls nothing. The output is
+/// fsynced (VACUUM INTO itself does not sync).
+pub fn backup(db_path: &Path, dest: &Path) -> Result<()> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.exists() {
+        // only create the final directory, never a whole tree: a missing
+        // grandparent means the backup volume is not mounted
+        let gp = parent.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        if !gp.exists() {
+            anyhow::bail!("backup directory {} is not available (volume not mounted?)", parent.display());
+        }
+        std::fs::create_dir(parent)?;
     }
     let prev = dest.with_extension(format!("{}.1", dest.extension().and_then(|e| e.to_str()).unwrap_or("db")));
     if dest.exists() {
         let _ = std::fs::rename(dest, &prev);
     }
-    db.with(|c| {
-        c.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
-        Ok(())
-    })
-    .with_context(|| format!("VACUUM INTO {}", dest.display()))?;
+    let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA busy_timeout=30000;")?;
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()]).with_context(|| format!("VACUUM INTO {}", dest.display()))?;
+    std::fs::File::open(dest)?.sync_all()?;
+    if let Ok(d) = std::fs::File::open(parent) {
+        let _ = d.sync_all();
+    }
     Ok(())
+}
+
+/// Advisory lock on `<db>.lock` held by the running service so `restore`
+/// cannot swap the index underneath it.
+#[derive(Debug)]
+pub struct ServiceLock {
+    _file: std::fs::File,
+}
+
+impl ServiceLock {
+    pub fn lock_path(db_path: &Path) -> std::path::PathBuf {
+        let mut p = db_path.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    }
+    /// Non-blocking; fails when another process holds it.
+    pub fn acquire(db_path: &Path) -> Result<ServiceLock> {
+        use std::os::unix::io::AsRawFd;
+        let path = Self::lock_path(db_path);
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            anyhow::bail!("{} is locked: the zmng service is running (stop it first)", path.display());
+        }
+        Ok(ServiceLock { _file: file })
+    }
 }
 
 /// Default backup location: `backup_dir/zmng.db.backup` or next to the db.
@@ -406,8 +470,15 @@ pub fn backup_path(cfg: &crate::config::Config) -> std::path::PathBuf {
 }
 
 /// Replace the live index with a backup after checking it is a healthy
-/// zmng database. Only safe while the service is stopped; the caller checks.
+/// zmng database. The caller holds the [`ServiceLock`] (so the service is
+/// not running); the previous index is checkpointed and kept complete as
+/// `*.before-restore`.
 pub fn restore(src: &Path, db_path: &Path) -> Result<()> {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(src), std::fs::canonicalize(db_path)) {
+        if a == b {
+            anyhow::bail!("source and destination are the same file");
+        }
+    }
     let conn = rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| format!("opening {}", src.display()))?;
     let ok: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if ok != "ok" {
@@ -421,6 +492,11 @@ pub fn restore(src: &Path, db_path: &Path) -> Result<()> {
     }
     drop(conn);
     if db_path.exists() {
+        // fold the WAL into the main file so the kept copy is complete, then
+        // there is nothing in -wal/-shm worth keeping
+        let old = rusqlite::Connection::open(db_path).with_context(|| format!("opening {}", db_path.display()))?;
+        old.execute_batch("PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);").context("checkpointing the old index")?;
+        drop(old);
         let keep = db_path.with_extension("db.before-restore");
         std::fs::rename(db_path, &keep).with_context(|| format!("moving the old index to {}", keep.display()))?;
     }
@@ -428,6 +504,10 @@ pub fn restore(src: &Path, db_path: &Path) -> Result<()> {
         let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
     }
     std::fs::copy(src, db_path).with_context(|| format!("copying to {}", db_path.display()))?;
+    std::fs::File::open(db_path)?.sync_all()?;
+    if let Some(d) = db_path.parent().and_then(|p| std::fs::File::open(p).ok()) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -445,9 +525,10 @@ mod tests {
             load: [0.0; 3],
         };
         let p = prometheus(&r);
-        assert!(p.contains("zmng_camera_recording{camera=\"1\",name=\"Front 'door'\"} 1\n"));
-        assert!(p.contains("zmng_camera_in_event{camera=\"1\",name=\"Front 'door'\"} 1\n"));
+        assert!(p.contains("zmng_camera_recording{camera=\"1\",name=\"Front \\\"door\\\"\"} 1\n"), "{p}");
+        assert!(p.contains("zmng_camera_in_event{camera=\"1\",name=\"Front \\\"door\\\"\"} 1\n"));
         assert!(p.contains("zmng_storage_effective_days{storage=\"1\",path=\"/vol\"} 4.75\n"));
         assert!(p.contains("zmng_issues{level=\"warn\"} 1\n"));
+        assert_eq!(prom_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 }

@@ -126,11 +126,13 @@ pub struct LiveHub {
     pub cams: RwLock<HashMap<i64, Arc<CamHandle>>>,
     /// substream recorders by camera id (only when `record_sub` is on)
     pub subs: RwLock<HashMap<i64, Arc<CamHandle>>>,
+    /// motion/object detectors by camera id
+    pub detectors: RwLock<HashMap<i64, Arc<crate::detect::DetectorHandle>>>,
 }
 
 impl LiveHub {
     pub fn new() -> Self {
-        LiveHub { cams: RwLock::new(HashMap::new()), subs: RwLock::new(HashMap::new()) }
+        LiveHub { cams: RwLock::new(HashMap::new()), subs: RwLock::new(HashMap::new()), detectors: RwLock::new(HashMap::new()) }
     }
     pub fn get(&self, id: i64) -> Option<Arc<CamHandle>> {
         self.cams.read().get(&id).cloned()
@@ -146,13 +148,16 @@ impl LiveHub {
         v.extend(self.subs.read().values().cloned());
         v
     }
-    /// Stop and forget every recorder of a camera.
+    /// Stop and forget every recorder and detector of a camera.
     pub fn remove_camera(&self, id: i64) {
         if let Some(h) = self.cams.write().remove(&id) {
             let _ = h.stop.send(true);
         }
         if let Some(h) = self.subs.write().remove(&id) {
             let _ = h.stop.send(true);
+        }
+        if let Some(d) = self.detectors.write().remove(&id) {
+            let _ = d.stop.send(true);
         }
     }
 }

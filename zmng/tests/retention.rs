@@ -124,6 +124,40 @@ fn tiering_moves_old_segments_to_the_archive_volume() {
     assert_eq!(st.moved, 0);
 }
 
+/// A read-only storage (imported ZoneMinder events) is never deleted from or
+/// drained by tiering, whatever its age or budget says.
+#[test]
+fn read_only_storage_is_never_touched() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 1}).as_object().unwrap()).unwrap();
+    let legacy = fx.dir.path().join("legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let ro = fx.db.add_storage(legacy.to_str().unwrap(), Some(1), 0).unwrap();
+    fx.db.update_storage(ro, serde_json::json!({"read_only": true, "archive_to": fx.storage_id, "archive_after_days": 0.5}).as_object().unwrap()).unwrap();
+    assert!(fx.db.storage(ro).unwrap().unwrap().read_only);
+    assert!(fx.db.update_storage(ro, serde_json::json!({"read_only": "yes"}).as_object().unwrap()).is_err());
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    // write the file under the legacy root and index it there, 10 days old
+    let old = now_secs() - 10 * 86_400;
+    let tmp = fx.write_segment(cam, "main", &enc, dts(old), |_| 0);
+    let seg = fx.db.segment(tmp).unwrap().unwrap();
+    let dst = legacy.join(&seg.path);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    std::fs::rename(fx.storage_path().join(&seg.path), &dst).unwrap();
+    fx.db.move_segment(tmp, ro).unwrap();
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    let st = zmng::tier::run_once(&fx.db, 10).unwrap();
+    assert_eq!(st.moved, 0);
+    assert!(fx.db.segment(tmp).unwrap().is_some(), "row kept");
+    assert!(dst.exists(), "file kept");
+    // deleting the camera drops the row but leaves the read-only file alone
+    let n = zmng::retention::delete_camera_files(&fx.db, &fx.thumb_dir, cam).unwrap();
+    assert_eq!(n, 1);
+    assert!(dst.exists());
+    assert!(fx.db.segment(tmp).unwrap().is_none());
+}
+
 fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(root).unwrap().flatten() {

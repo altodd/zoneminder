@@ -33,7 +33,7 @@ pub struct TierStats {
 pub fn run_once(db: &Db, max_per_pass: usize) -> Result<TierStats> {
     let storages = db.storages()?;
     let mut stats = TierStats { moved: 0, bytes: 0 };
-    for src in storages.iter().filter(|s| s.archive_to.is_some()) {
+    for src in storages.iter().filter(|s| s.archive_to.is_some() && !s.read_only) {
         let Some(dst) = storages.iter().find(|s| Some(s.id) == src.archive_to) else {
             warn!(storage = src.id, "archive_to points at a missing storage");
             continue;

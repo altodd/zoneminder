@@ -2,19 +2,20 @@
 #
 # 1. MQTT (nothing to declare): with [mqtt] configured in zmng.toml every camera is
 #    discovered as a device with binary_sensor.<name>_motion, binary_sensor.<name>_recording,
-#    sensor.<name>_last_event (attributes = the event JSON: id, score, kind, objects, thumb)
+#    sensor.<name>_last_event (attributes = the latest event JSON: id, score, kind, objects; thumb once the thumbnail exists)
 #    and camera.<name>_last_event_thumbnail.
 #
-# 2. Live images through the REST API (long-lived token from Admin -> "Create API token"):
-camera:
-  - platform: generic
-    name: Front Door
-    still_image_url: https://security.church.example/api/cameras/1/snapshot.jpg?width=1280
-    authentication: basic   # ignored: the bearer header below carries the token
-    verify_ssl: true
-    # Home Assistant's generic camera cannot set arbitrary headers; use a `rest`-style
-    # proxy or pass the token in the query string instead:
-    # still_image_url: https://security.church.example/api/cameras/1/snapshot.jpg?width=1280&token=YOUR_LONG_LIVED_TOKEN
+# 2. Pictures. The MQTT camera entity (camera.<name>_last_event_thumbnail) needs no token
+#    and shows the latest event. For live stills the generic camera platform cannot send an
+#    Authorization header, so the token would have to go in the URL (it then shows up in
+#    Caddy and HA logs). If you do that, create a dedicated *viewer* account limited to the
+#    cameras HA needs and use ITS token (Admin -> Users, then "Create API token" while
+#    logged in as that user), never an admin token:
+# camera:
+#   - platform: generic
+#     name: Front Door
+#     still_image_url: https://security.church.example/api/cameras/1/snapshot.jpg?width=1280&token=VIEWER_TOKEN
+#     verify_ssl: true
 
 # 3. Health as a sensor (issues count) polled every minute:
 sensor:
@@ -29,7 +30,8 @@ sensor:
       - uptime_secs
     scan_interval: 60
 
-# 4. Automations
+# 4. Automations. event_start has no picture yet; objects arrive with event_update, and the
+#    thumbnail exists after event_end (announced by one more event_update with `thumb` set).
 automation:
   - alias: Front door person at night
     trigger:
@@ -37,7 +39,7 @@ automation:
         topic: zmng/camera/1/event
     condition:
       - condition: template
-        value_template: "{{ trigger.payload_json.event == 'event_start' and 'person' in (trigger.payload_json.objects | map(attribute='label') | list) }}"
+        value_template: "{{ trigger.payload_json.event == 'event_update' and 'person' in (trigger.payload_json.objects | map(attribute='label') | list) }}"
       - condition: sun
         after: sunset
     action:
@@ -45,7 +47,8 @@ automation:
         data:
           message: "Person at the front door"
           data:
-            image: "https://security.church.example{{ trigger.payload_json.thumb }}?token=YOUR_LONG_LIVED_TOKEN"
+            # the MQTT camera entity holds the event thumbnail once it exists; no token needed
+            entity_id: camera.front_door_last_event_thumbnail
 
   - alias: Camera down
     trigger:

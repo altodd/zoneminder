@@ -42,8 +42,8 @@ Detector test without a camera: `--sub-url "lavfi:testsrc=size=640x360:rate=5"`.
 
 ```
 zmng doctor [--cameras]      # ffmpeg, clock, database integrity, volumes writable + free space, camera URLs (and an RTSP DESCRIBE per camera with --cameras); exit 1 on any FAIL
-zmng backup [--to FILE]      # consistent copy of the index (VACUUM INTO); the service also does this daily into backup_dir (put it on the other volume)
-zmng restore FILE --stopped  # replace the index with a backup after checking it; the old file is kept as *.before-restore
+zmng backup [--to FILE]      # consistent copy of the index (VACUUM INTO on its own read-only connection, fsynced); the service also does this daily into backup_dir (put it on the other volume; a missing volume is an error, never a copy onto the root disk)
+zmng restore FILE --stopped  # replace the index with a backup after checking it; refuses while the service holds its lock; the old index is checkpointed and kept complete as *.before-restore
 ```
 The **Status** page in the UI shows the same report as `GET /api/status`: recording/detector state and last event per camera, ingest per day, and for every volume how many days of footage fit at the current rate before retention deletes. Issues (camera down, detector stopped, volume missing or under its reserve, archive unreachable) are listed at the top; `camera_down`/`camera_up`/`storage_low` notifications go to the webhook/MQTT/SSE sinks on state changes.
 
@@ -79,7 +79,7 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/events?camera&start&end&min_score&kind&archived&before&limit&order` | keyset-paged list (`kind`: comma list of `motion`, `person`, `car`, ...); each event carries `objects` |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
-| `GET /api/events/stream` | server-sent events: `event_start`, `event_end`, `camera_down`, `camera_up`, `storage_low` |
+| `GET /api/events/stream` | server-sent events: `event_start`, `event_update`, `event_end`, `camera_down`, `camera_up`, `storage_low` (ACL re-checked per message) |
 | `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
@@ -105,7 +105,7 @@ Servers that work: CodeProject.AI (`/v1/vision/detection`, YOLO on CUDA), DeepSt
 
 Every event start/end, camera outage/recovery, storage warning and service start is published on an in-process bus and delivered by whichever sinks are configured:
 
-* **Webhook** — `alert_webhook = "https://host/hook"` in `zmng.toml`: one JSON POST per notification, `{"event": "event_start" | "event_end" | "camera_down" | "camera_up" | "storage_low" | "service_started", ...}`. Event payloads carry `id`, `camera_id`, `camera_name`, `start_ms`, `end_ms`, `score`, `kind`, `thumb` (URL) and `objects` (phase 3 detections).
+* **Webhook** — `alert_webhook = "https://host/hook"` in `zmng.toml`: one JSON POST per notification, `{"event": "event_start" | "event_update" | "event_end" | "camera_down" | "camera_up" | "storage_low" | "service_started", ...}`. Event payloads carry `id`, `camera_id`, `camera_name`, `start_ms`, `end_ms`, `score`, `kind`, `thumb` (URL) and `objects`. `event_start` fires as soon as motion is confirmed (so `thumb` is still null and `objects` empty); `event_update` follows whenever objects are detected and once more when the thumbnail exists after `event_end`, so automations that want a picture trigger on `event_update` with `thumb` set (or on the MQTT thumbnail entity).
 * **MQTT + Home Assistant discovery** —
   ```toml
   [mqtt]
@@ -116,17 +116,18 @@ Every event start/end, camera outage/recovery, storage warning and service start
   topic_prefix = "zmng"                # zmng/status, zmng/camera/<id>/{motion,recording,event,thumbnail}
   discovery_prefix = "homeassistant"   # "" disables discovery
   ```
-  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280` with a long-lived token (`Authorization: Bearer`, see `POST /api/tokens`).
+  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. While the broker is unreachable, notifications are dropped (state topics are republished on reconnect); a camera removed from zmng keeps its stale discovery entry in HA until you delete the device there. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280` with a long-lived token (`Authorization: Bearer`, see `POST /api/tokens`).
 * **UI** — `GET /api/events/stream` is a server-sent-events feed of the same notifications, filtered to the cameras the user may see; the web UI shows toasts from it.
 * **zmNinjaNg** — `/zm/ws` speaks the zmeventnotification websocket protocol (auth, `control/version`, `control/filter` with `monlist`/`intlist`, `push/token` registration, `alarm` messages with `DetectionJson`). Point the app's event-server URL at `ws(s)://<host>/zm/ws`.
 
 ## ZoneMinder-compatible API (zmNinjaNg)
 
-Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive/delete with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration. Not yet: push delivery (needs the zmNinjaNg FCM relay), PTZ, ES websocket.
+Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive (delete is admin-only) with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration, and the event-server websocket at `/zm/ws`. Not yet: push delivery (needs the zmNinjaNg FCM relay), PTZ.
 
 ## Storage tiering and retention
 
 * `zmng add-storage /raid --archive-to <archive id> --archive-after-days 3` (or edit in Admin → Storage): segments older than 3 days are copied to the archive volume (checksummed, rate limited), then removed from the RAID. Space pressure on the RAID also triggers moves. A missing archive volume never stops recording.
+* `zmng add-storage /var/cache/zoneminder/events --read-only`: a read-only storage is never deleted from, never drained by tiering and never written to (doctor only checks it is readable); use it for imported ZoneMinder event trees. Flip the flag in Admin → Storage when those files may finally go.
 * Per camera: `retention_days` (continuous footage) and `event_retention_days` (segments that overlap a motion event); archived events keep their footage.
 * Substream recording (`record_sub`, default on) stores `<camera>/sub/<day>/*.mp4`; use `?stream=sub` on the video/playlist/live endpoints.
 

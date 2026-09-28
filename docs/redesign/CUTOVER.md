@@ -16,7 +16,7 @@ Run the pre-flight on the production binary and config:
 ```
 sudo -u zmng zmng -c /etc/zmng/zmng.toml doctor --cameras
 ```
-Every line must be `PASS` (a `WARN` on `users` is fine before the first admin exists).
+Every line must be `PASS` (a `WARN` on `users` is fine before the first admin exists). Always run it as the service user: doctor opens the index read-only and creates nothing, but a `WARN` on *database owner* means the files belong to someone else.
 
 ## 1. Install on the production box (ZoneMinder still running)
 
@@ -64,10 +64,10 @@ On the ZoneMinder host, one TSV per ZoneMinder storage:
 mysql -B -N zm -e "SELECT Id,MonitorId,UNIX_TIMESTAMP(StartDateTime),UNIX_TIMESTAMP(EndDateTime),DATE(StartDateTime),Length,Frames,AlarmFrames,MaxScore,Archived,IFNULL(Notes,''),DefaultVideo,StorageId FROM Events WHERE EndDateTime IS NOT NULL AND StorageId=1 ORDER BY Id" > /var/lib/zmng/events-storage1.tsv
 mysql -B -N zm -e "… AND StorageId=2 …" > /var/lib/zmng/events-storage2.tsv
 ```
-Register ZoneMinder's event roots as **read-only legacy storages** (no cap, big reserve so retention never deletes there before you decide to) and import:
+Register ZoneMinder's event roots as **read-only legacy storages** (`--read-only`: retention, tiering and doctor never delete, move or write there) and import:
 ```
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/events --reserve-gb 100000     # storage 3
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/events       --reserve-gb 100000     # storage 4
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/events --read-only     # storage 3
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/events       --read-only     # storage 4
 sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm /var/lib/zmng/events-storage1.tsv --storage 3 --camera-map 1=1,2=2,…   # ZM MonitorId=zmng camera id
 sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm /var/lib/zmng/events-storage2.tsv --storage 4 --camera-map …
 ```
@@ -98,7 +98,7 @@ Daily, on the Status page: every camera recording, detector fps ≈ 5, reconnect
 2. Stop ZoneMinder's capture and filters, keep its web UI for reference:
    `systemctl stop zoneminder` (this stops `zmc`, `zma`, `zmfilter`, `zmaudit`, `zmwatch`); `systemctl disable zoneminder`.
 3. Raise zmng's byte caps (`Admin → Storage`) to the real budgets: RAID ≈ 5.8 TB, USB ≈ 10 TB, reserves ≈ 150 GB / 300 GB.
-4. Decide what happens to the imported ZoneMinder files: leave storages 3/4 with the huge reserve (never deleted, browsable as long as the disks last) or lower the reserve so zmng's retention starts deleting the oldest imported events too. Deleting them is what frees the space for the caps in step 3, so most installs will lower the reserve to the same value as the new storage on that disk.
+4. Decide what happens to the imported ZoneMinder files. As long as storages 3/4 stay *read-only* nothing there is ever touched (that is what makes step 8 a real roll back). Freeing that space for the caps in step 3 is a separate, deliberate and **irreversible** step: in `Admin → Storage` clear *Read-only* on storage 3/4 and give them a reserve; zmng's retention then deletes the oldest imported events like any other footage, and ZoneMinder can no longer be restarted over them.
 5. Tailscale ACL: apply the port-443-only policy; remove the `10001–10023` rules.
 6. MySQL: keep it running read-only for 30 days (`SET GLOBAL read_only=1`) in case a re-import is needed, then `systemctl disable --now mysql`.
 7. Cron/systemd: nothing to add; zmng runs retention, tiering, backups and alerts itself. Watch `journalctl -u zmng -f` for the first hour.
@@ -114,4 +114,4 @@ systemctl stop zmng
 sudo -u zmng zmng -c /etc/zmng/zmng.toml restore /media/zmoverflow/zmng-backups/zmng.db.backup --stopped
 systemctl start zmng            # reindex on start re-adopts any segment files written after the backup
 ```
-Motion scores of segments recorded after the backup are lost (re-adopted files carry none); events after the backup are lost unless they are in a newer backup. That is the whole blast radius.
+Motion scores of segments recorded after the backup are lost (re-adopted files carry none); events after the backup are lost unless they are in a newer backup. Segments that retention deleted *after* the backup was taken come back as index rows without files: the timeline shows coverage that 404s and used-bytes is overstated until the next retention passes unlink them as missing. That is the whole blast radius. `restore` refuses to run while the service holds `zmng.db.lock`, and keeps the old index, WAL included, as `zmng.db.before-restore`.

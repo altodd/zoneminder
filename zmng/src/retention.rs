@@ -69,7 +69,7 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
                 if db.segment_pinned(&s, event_cutoff)? {
                     continue; // footage of an event worth keeping
                 }
-                if let Some(st) = storages.iter().find(|x| x.id == s.storage_id) {
+                if let Some(st) = storages.iter().find(|x| x.id == s.storage_id && !x.read_only) {
                     if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                         deleted += 1;
                         progressed = true;
@@ -84,7 +84,7 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
 
     // 2. per-storage space budget (oldest first, across cameras). A primary
     //    volume with a reachable archive is drained by tier.rs instead.
-    for st in &storages {
+    for st in storages.iter().filter(|s| !s.read_only) {
         let p = Path::new(&st.path);
         if let Some(a) = st.archive_to {
             let archive_ok = storages.iter().find(|x| x.id == a).map(|x| Path::new(&x.path).is_dir()).unwrap_or(false);
@@ -150,7 +150,9 @@ pub fn delete_camera_files(db: &Db, thumb_dir: &Path, camera_id: i64) -> Result<
         let mut progressed = false;
         for s in segs {
             if let Some(st) = storages.iter().find(|x| x.id == s.storage_id) {
-                if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
+                // a read-only storage keeps its files; only the index row goes
+                let ok = if st.read_only { db.delete_segment(s.id).is_ok() } else { remove_segment_file(db, &st.path, &s.path, s.id).is_ok() };
+                if ok {
                     n += 1;
                     progressed = true;
                 }
@@ -162,14 +164,6 @@ pub fn delete_camera_files(db: &Db, thumb_dir: &Path, camera_id: i64) -> Result<
     }
     let _ = std::fs::remove_dir_all(thumb_dir.join(camera_id.to_string()));
     Ok(n)
-}
-
-/// Online backup of the index next to the database file (see `health::backup`).
-pub fn backup_db(db: &Db, db_path: &Path) -> Result<()> {
-    let bak = db_path.with_extension("db.backup");
-    crate::health::backup(db, &bak)?;
-    info!(path = %bak.display(), "index backup written");
-    Ok(())
 }
 
 /// Adopt files on disk that are not in the index (crash recovery / manual

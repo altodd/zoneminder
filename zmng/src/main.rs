@@ -37,6 +37,9 @@ enum Cmd {
         /// Move segments older than this many days to the archive
         #[arg(long)]
         archive_after_days: Option<f64>,
+        /// Never delete or move anything here (imported ZoneMinder events)
+        #[arg(long)]
+        read_only: bool,
     },
     /// Add a camera
     AddCamera {
@@ -122,7 +125,7 @@ fn main() -> Result<()> {
             print!("{}", toml::to_string_pretty(&config::Config::default())?);
             Ok(())
         }
-        Cmd::AddStorage { path, max_gb, reserve_gb, archive_to, archive_after_days } => {
+        Cmd::AddStorage { path, max_gb, reserve_gb, archive_to, archive_after_days, read_only } => {
             let db = db::Db::open(&cfg.db_path)?;
             std::fs::create_dir_all(&path).with_context(|| format!("creating {path}"))?;
             let id = db.add_storage(
@@ -130,10 +133,11 @@ fn main() -> Result<()> {
                 max_gb.map(|g| (g * 1e9) as i64),
                 (reserve_gb * 1e9) as i64,
             )?;
-            if archive_to.is_some() || archive_after_days.is_some() {
+            if archive_to.is_some() || archive_after_days.is_some() || read_only {
                 let mut m = serde_json::Map::new();
                 if let Some(a) = archive_to { m.insert("archive_to".into(), a.into()); }
                 if let Some(d) = archive_after_days { m.insert("archive_after_days".into(), d.into()); }
+                if read_only { m.insert("read_only".into(), true.into()); }
                 db.update_storage(id, &m)?;
             }
             println!("storage {id} added");
@@ -188,9 +192,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Backup { to } => {
-            let db = db::Db::open(&cfg.db_path)?;
             let dest = to.unwrap_or_else(|| health::backup_path(&cfg));
-            health::backup(&db, &dest)?;
+            health::backup(&cfg.db_path, &dest)?;
             println!("index backed up to {}", dest.display());
             Ok(())
         }
@@ -198,6 +201,7 @@ fn main() -> Result<()> {
             if !stopped {
                 anyhow::bail!("stop the zmng service first, then re-run with --stopped");
             }
+            let _lock = health::ServiceLock::acquire(&cfg.db_path)?; // fails while the service runs
             health::restore(&file, &cfg.db_path)?;
             println!("index restored from {} (previous copy kept as *.before-restore)", file.display());
             Ok(())
@@ -244,6 +248,8 @@ fn main() -> Result<()> {
 fn run(cfg: config::Config) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
+        // held for the life of the process; `restore` refuses to run while it is taken
+        let _service_lock = health::ServiceLock::acquire(&cfg.db_path)?;
         let db = db::Db::open(&cfg.db_path)?;
         let closed = db.close_stale_events()?;
         if closed > 0 {
@@ -256,11 +262,12 @@ fn run(cfg: config::Config) -> Result<()> {
         std::fs::create_dir_all(&cfg.thumb_dir)?;
         let hub = Arc::new(recorder::LiveHub::new());
         let bus = Arc::new(notify::Bus::new());
+        // subscribe before anything is published so the sinks see ServiceStarted
         if let Some(url) = cfg.alert_webhook.clone() {
-            tokio::spawn(notify::webhook_sink(bus.clone(), url));
+            tokio::spawn(notify::webhook_sink(bus.subscribe(), url));
         }
         if let Some(m) = cfg.mqtt.clone() {
-            tokio::spawn(notify::mqtt_sink(bus.clone(), db.clone(), m, hub.clone()));
+            tokio::spawn(notify::mqtt_sink(bus.subscribe(), db.clone(), m, hub.clone()));
         }
         bus.publish(notify::Notification::ServiceStarted { version: env!("CARGO_PKG_VERSION").into() });
         let rctx = Arc::new(recorder::RecorderCtx {
@@ -295,6 +302,7 @@ fn run(cfg: config::Config) -> Result<()> {
             let bus = bus.clone();
             let alert_after = cfg.alert_after_minutes as i64 * 60 * 90_000;
             let backup_to = health::backup_path(&cfg);
+            let db_path = cfg.db_path.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 let mut down: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -329,8 +337,8 @@ fn run(cfg: config::Config) -> Result<()> {
                     }
                     if last_backup.elapsed() > std::time::Duration::from_secs(24 * 3600) {
                         last_backup = std::time::Instant::now();
-                        let (db2, p) = (db.clone(), backup_to.clone());
-                        match tokio::task::spawn_blocking(move || health::backup(&db2, &p)).await {
+                        let (src, p) = (db_path.clone(), backup_to.clone());
+                        match tokio::task::spawn_blocking(move || health::backup(&src, &p)).await {
                             Ok(Ok(())) => info!(path = %backup_to.display(), "index backup written"),
                             Ok(Err(e)) => tracing::error!("index backup: {e:#}"),
                             Err(e) => tracing::error!("index backup task: {e}"),

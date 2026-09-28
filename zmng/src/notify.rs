@@ -160,7 +160,9 @@ pub fn objects_from_meta(e: &Event) -> Vec<DetectedObject> {
 // ---------------------------------------------------------------------------
 
 /// POST every external notification as JSON to `url` until the bus closes.
-pub async fn webhook_sink(bus: Arc<Bus>, url: String) {
+/// The receiver is created by the caller so nothing published between spawn
+/// and first poll is lost.
+pub async fn webhook_sink(mut rx: broadcast::Receiver<Notification>, url: String) {
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
         Ok(c) => c,
         Err(e) => {
@@ -168,7 +170,6 @@ pub async fn webhook_sink(bus: Arc<Bus>, url: String) {
             return;
         }
     };
-    let mut rx = bus.subscribe();
     loop {
         let n = match rx.recv().await {
             Ok(n) => n,
@@ -307,24 +308,37 @@ pub fn mqtt_messages(cfg: &MqttConfig, n: &Notification) -> Vec<(String, bool, V
     }
 }
 
+/// Request-queue capacity between this task and rumqttc's event loop. Sized
+/// for a full discovery burst of a large fleet (6 messages per camera).
+const MQTT_QUEUE: usize = 4096;
+
 /// Run the MQTT client until the bus closes. Reconnects with backoff; on
 /// every (re)connect it republishes availability, discovery for every camera
 /// and the current recording state.
-pub async fn mqtt_sink(bus: Arc<Bus>, db: Db, cfg: MqttConfig, hub: Arc<crate::recorder::LiveHub>) {
+///
+/// The event loop is polled by this same task, so a publish must never
+/// block here: rumqttc drains its request queue only inside `poll()`, and an
+/// awaited `publish` on a full queue would deadlock the sink (and with the
+/// broker down, wedge it for good). Everything goes through `try_publish`
+/// and is dropped with a warning when the queue is full; while disconnected
+/// nothing is queued at all, because state topics are republished from the
+/// database and the recorders on the next ConnAck anyway.
+pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: MqttConfig, hub: Arc<crate::recorder::LiveHub>) {
     use rumqttc::{AsyncClient, Event as MEvent, Incoming, LastWill, MqttOptions, QoS};
     let t = MqttTopics { cfg: &cfg };
-    let mut opts = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
+    let client_id = if cfg.client_id.trim().is_empty() { "zmng".to_string() } else { cfg.client_id.trim().to_string() };
+    let mut opts = MqttOptions::new(client_id, cfg.host.clone(), cfg.port);
     opts.set_keep_alive(std::time::Duration::from_secs(30));
     if let Some(u) = &cfg.username {
         opts.set_credentials(u.clone(), cfg.password.clone().unwrap_or_default());
     }
     opts.set_last_will(LastWill::new(t.status(), "offline", QoS::AtLeastOnce, true));
-    let (client, mut eventloop) = AsyncClient::new(opts, 64);
-    let mut rx = bus.subscribe();
-    let publish = |client: AsyncClient, msgs: Vec<(String, bool, Vec<u8>)>| async move {
+    let (client, mut eventloop) = AsyncClient::new(opts, MQTT_QUEUE);
+    let mut connected = false;
+    let publish = |client: &AsyncClient, msgs: Vec<(String, bool, Vec<u8>)>| {
         for (topic, retain, payload) in msgs {
-            if let Err(e) = client.publish(topic, QoS::AtLeastOnce, retain, payload).await {
-                warn!("mqtt publish: {e}");
+            if let Err(e) = client.try_publish(&topic, QoS::AtLeastOnce, retain, payload) {
+                warn!(%topic, "mqtt publish dropped: {e}");
             }
         }
     };
@@ -332,6 +346,7 @@ pub async fn mqtt_sink(bus: Arc<Bus>, db: Db, cfg: MqttConfig, hub: Arc<crate::r
         tokio::select! {
             ev = eventloop.poll() => match ev {
                 Ok(MEvent::Incoming(Incoming::ConnAck(_))) => {
+                    connected = true;
                     info!(host = %cfg.host, port = cfg.port, "mqtt connected");
                     let mut msgs = vec![(t.status(), true, b"online".to_vec())];
                     for cam in db.cameras().unwrap_or_default().into_iter().filter(|c| c.enabled) {
@@ -342,16 +357,25 @@ pub async fn mqtt_sink(bus: Arc<Bus>, db: Db, cfg: MqttConfig, hub: Arc<crate::r
                         msgs.push((t.camera(cam.id, "recording"), true, if up { b"ON".to_vec() } else { b"OFF".to_vec() }));
                         msgs.push((t.camera(cam.id, "motion"), true, b"OFF".to_vec()));
                     }
-                    publish(client.clone(), msgs).await;
+                    publish(&client, msgs);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!("mqtt: {e}; reconnecting in 5 s");
+                    if connected {
+                        warn!("mqtt: {e}; reconnecting");
+                    } else {
+                        debug!("mqtt: {e}; retrying in 5 s");
+                    }
+                    connected = false;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             },
             n = rx.recv() => match n {
-                Ok(n) => publish(client.clone(), mqtt_messages(&cfg, &n)).await,
+                Ok(n) => {
+                    if connected {
+                        publish(&client, mqtt_messages(&cfg, &n));
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(k)) => warn!(skipped = k, "mqtt sink lagged"),
                 Err(_) => return,
             }

@@ -35,7 +35,10 @@ async fn read_packet(s: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
 
 impl FakeBroker {
     pub async fn start() -> FakeBroker {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(0).await
+    }
+    pub async fn start_on(port: u16) -> FakeBroker {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let published = Arc::new(Mutex::new(Vec::new()));
         let connects = Arc::new(Mutex::new(0));

@@ -581,7 +581,7 @@ async function viewAdmin(main) {
     h('input', { name: 'username', placeholder: 'username', required: true, style: 'width:160px' }), h('input', { name: 'password', type: 'password', placeholder: 'password (8+)', required: true, style: 'width:180px' }), h('select', { name: 'role', style: 'width:120px' }, h('option', { value: 'viewer' }, 'viewer'), h('option', { value: 'admin' }, 'admin')), h('button', {}, 'Add user'));
   const stor = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Path'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Reserve'), h('th', {}, 'Archive to'), h('th', {}, '')),
     ...storages.map((s) => h('tr', {}, h('td', {}, s.id), h('td', {}, h('code', {}, s.path), s.available ? '' : h('span', { class: 'pill bad' }, 'missing')), h('td', {}, gb(s.used_bytes)), h('td', {}, gb(s.free_bytes)), h('td', {}, s.max_bytes ? gb(s.max_bytes) : '—'), h('td', {}, gb(s.reserve_bytes)),
-      h('td', {}, s.archive_to ? `storage ${s.archive_to} after ${s.archive_after_days ?? '—'} d @ ${s.archive_rate_mbps} Mb/s` : '—'),
+      h('td', {}, s.read_only ? h('span', { class: 'pill' }, 'read-only') : s.archive_to ? `storage ${s.archive_to} after ${s.archive_after_days ?? '—'} d @ ${s.archive_rate_mbps} Mb/s` : '—'),
       h('td', {}, h('button', { class: 'ghost small', onclick: () => editStorage(s, storages) }, 'Edit')))));
   const tokenBtn = h('button', { class: 'ghost small', onclick: async () => { const t = await api.post('/api/tokens'); prompt('Long-lived API token (Home Assistant etc.). Shown once:', t.token); } }, 'Create API token');
   main.replaceChildren(h('div', { class: 'two' },
@@ -608,12 +608,13 @@ function editCamera(c) {
 }
 function editStorage(s, all) {
   const inputs = {};
-  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = { max_bytes: inputs.max_gb.value === '' ? null : Math.round(Number(inputs.max_gb.value) * 1e9), reserve_bytes: Math.round(Number(inputs.reserve_gb.value) * 1e9), archive_to: inputs.archive_to.value === '' ? null : Number(inputs.archive_to.value), archive_after_days: inputs.archive_after_days.value === '' ? null : Number(inputs.archive_after_days.value), archive_rate_mbps: Number(inputs.archive_rate_mbps.value) }; try { await api.patch(`/api/storages/${s.id}`, patch); modal.remove(); route(); } catch (err) { errEl.textContent = err.message; } } },
+  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = { max_bytes: inputs.max_gb.value === '' ? null : Math.round(Number(inputs.max_gb.value) * 1e9), reserve_bytes: Math.round(Number(inputs.reserve_gb.value) * 1e9), archive_to: inputs.archive_to.value === '' ? null : Number(inputs.archive_to.value), archive_after_days: inputs.archive_after_days.value === '' ? null : Number(inputs.archive_after_days.value), archive_rate_mbps: Number(inputs.archive_rate_mbps.value), read_only: inputs.read_only.checked }; try { await api.patch(`/api/storages/${s.id}`, patch); modal.remove(); route(); } catch (err) { errEl.textContent = err.message; } } },
     h('label', {}, 'Cap (GB, blank = use free-space reserve only)', inputs.max_gb = h('input', { value: s.max_bytes ? (s.max_bytes / 1e9).toFixed(0) : '' })),
     h('label', {}, 'Reserve free (GB)', inputs.reserve_gb = h('input', { value: (s.reserve_bytes / 1e9).toFixed(0) })),
     h('label', {}, 'Archive to (tiering)', inputs.archive_to = h('select', {}, h('option', { value: '' }, 'never (delete here by retention)'), ...all.filter((o) => o.id !== s.id).map((o) => h('option', { value: o.id, selected: o.id === s.archive_to }, `storage ${o.id}: ${o.path}`)))),
     h('label', {}, 'Move segments older than (days)', inputs.archive_after_days = h('input', { value: s.archive_after_days ?? '' })),
     h('label', {}, 'Copy rate limit (Mb/s)', inputs.archive_rate_mbps = h('input', { value: s.archive_rate_mbps })),
+    h('label', { class: 'row' }, inputs.read_only = h('input', { type: 'checkbox', style: 'width:auto', checked: s.read_only }), ' Read-only (imported ZoneMinder events: never delete, move or write here)'),
     h('p', { class: 'muted' }, 'Recent footage of every camera stays here; older segments are copied to the archive volume (checksummed), then removed here. If the archive volume is missing, nothing is moved and recording continues.'),
     h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
   const errEl = h('p', { class: 'err' });

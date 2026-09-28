@@ -15,7 +15,9 @@ LimitNOFILE=65536
 # the index holds RTSP credentials
 UMask=0077
 # recording volumes must be writable by the zmng user
-ReadWritePaths=/var/lib/zmng /var/cache/zmng /var/cache/zoneminder /media
+ReadWritePaths=/var/lib/zmng /var/cache/zmng /var/cache/zoneminder/zmng /media
+# imported ZoneMinder events are served, never modified (see CUTOVER.md)
+ReadOnlyPaths=/var/cache/zoneminder/events /media/zmoverflow/events
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
