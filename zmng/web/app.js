@@ -750,4 +750,6 @@ async function route() {
   } catch (e) { main.replaceChildren(h('p', { class: 'err' }, e.message)); }
 }
 window.addEventListener('hashchange', route);
+// PWA: cache the shell (never the API) so the app opens instantly on phones and works as a home-screen app
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('/sw.js').catch(() => {});
 boot();

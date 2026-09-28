@@ -138,3 +138,20 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 .ptz .pad { display: grid; grid-template-columns: repeat(3, 34px); gap: 3px; }
 .ptz button { width: 34px; height: 30px; padding: 0; touch-action: none; user-select: none; }
 .ptz select { width: auto; padding: 4px 6px; }
+
+/* phones: bigger touch targets, wrapping controls, no hover-only affordances */
+@media (max-width: 640px) {
+  button, select, input { min-height: 40px; }
+  button.small { min-height: 32px; }
+  .controls .muted.small { display: none; }
+  .controls .time { min-width: 0; }
+  .toolbar h2 { font-size: 16px; }
+  .player video { max-height: 45vh; }
+  .timeline { height: 64px; }
+  .grid.montage { grid-template-columns: 1fr; }
+  .events { grid-template-columns: 1fr 1fr; }
+  .ptz { right: 4px; bottom: 4px; }
+}
+@media (display-mode: standalone) {
+  #top { padding-top: calc(10px + env(safe-area-inset-top, 0px)); }
+}

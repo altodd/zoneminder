@@ -1,0 +1,14 @@
+{
+  "name": "ZoneMinder NG",
+  "short_name": "ZMNG",
+  "description": "Cameras: live, review, events",
+  "start_url": "/#/live",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f1216",
+  "theme_color": "#171b21",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
