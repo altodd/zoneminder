@@ -237,8 +237,13 @@ impl Store {
         let bytes = encode_jpeg(sheet.as_raw(), sheet.width(), sheet.height(), JPEG_QUALITY)?;
         let manifest = serde_json::json!({"cols": SPRITE_COLS, "tile_w": tw, "tile_h": th, "times": times});
         if closed {
-            let _ = std::fs::write(&jpg, &bytes);
-            let _ = std::fs::write(&json, manifest.to_string());
+            // atomic: a concurrent reader never sees a half-written cache file
+            for (target, data) in [(&jpg, bytes.clone()), (&json, manifest.to_string().into_bytes())] {
+                let tmp = target.with_extension("tmp");
+                if std::fs::write(&tmp, &data).is_ok() {
+                    let _ = std::fs::rename(&tmp, target);
+                }
+            }
         }
         Ok(Some((bytes, manifest)))
     }

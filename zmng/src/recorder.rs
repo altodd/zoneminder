@@ -209,6 +209,7 @@ pub async fn reconcile(ctx: Arc<RecorderCtx>) -> Result<()> {
                 let changed = {
                     let cur = h.camera.read();
                     stream_url(&cur, kind) != stream_url(cam, kind) || cur.storage_id != cam.storage_id
+                        || (kind == StreamKind::Main && cur.record_audio != cam.record_audio)
                 };
                 if changed {
                     let _ = h.stop.send(true);
@@ -341,8 +342,8 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     let url = url::Url::parse(&stream_url(cam, kind)).context("bad stream url")?;
     let creds = if !url.username().is_empty() {
         Some(retina::client::Credentials {
-            username: url.username().to_string(),
-            password: url.password().unwrap_or("").to_string(),
+            username: percent_encoding::percent_decode_str(url.username()).decode_utf8_lossy().to_string(),
+            password: percent_encoding::percent_decode_str(url.password().unwrap_or("")).decode_utf8_lossy().to_string(),
         })
     } else {
         None
@@ -404,6 +405,8 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     let mut gop: Vec<Sample> = Vec::new();
     let mut agop: Vec<Sample> = Vec::new(); // audio frames of the current GOP (audio timescale)
     let mut audio_rate: u32 = 0;
+    // the audio stream has its own RTP origin: anchor it on its own first packet's wall clock
+    let mut audio_anchor: Option<(i64, i64)> = None;
     let mut pending: Option<Pending> = None;
     // wallclock anchoring: (rtp elapsed at anchor, dts at anchor)
     let mut anchor: Option<(i64, i64)> = None;
@@ -432,10 +435,11 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
         let frame = match item {
             CodecItem::VideoFrame(f) if f.stream_id() == video_i => f,
             CodecItem::AudioFrame(a) if Some(a.stream_id()) == audio_i => {
-                // only once video is flowing and anchored; timestamps follow the video clock mapping
-                if let (Some((a_rtp, a_wall)), true) = (anchor, audio_rate > 0 && (seg.is_some() || !gop.is_empty() || pending.is_some())) {
+                // only once video is flowing; the audio clock is mapped from its own first packet
+                if audio_rate > 0 && anchor.is_some() && (seg.is_some() || !gop.is_empty() || pending.is_some()) {
                     let ts = a.timestamp();
                     let elapsed_90k = (ts.elapsed() as i128 * TIMESCALE as i128 / ts.clock_rate().get() as i128) as i64;
+                    let (a_rtp, a_wall) = *audio_anchor.get_or_insert_with(|| (elapsed_90k, dts_from_wall(a.ctx().received_wall().into())));
                     let dts90k = a_wall + (elapsed_90k - a_rtp);
                     let dts = (dts90k as i128 * audio_rate as i128 / TIMESCALE as i128) as i64;
                     agop.push(Sample { dts, duration: a.frame_length().get(), is_key: true, data: Bytes::copy_from_slice(a.data()) });

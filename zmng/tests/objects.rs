@@ -11,6 +11,11 @@ use zmng::objects::{ObjectDetector, ObjectsConfig};
 /// Mock detection server. `reply` is what every request gets; requests are
 /// counted and the last body checked for a multipart JPEG.
 async fn mock_detector(reply: Value) -> (u16, Arc<Mutex<usize>>) {
+    mock_detector_delayed(reply, std::time::Duration::ZERO).await
+}
+
+/// [`mock_detector`] that answers after `delay` (a slow GPU box).
+async fn mock_detector_delayed(reply: Value, delay: std::time::Duration) -> (u16, Arc<Mutex<usize>>) {
     let calls = Arc::new(Mutex::new(0usize));
     let c2 = calls.clone();
     let app = axum::Router::new().route(
@@ -19,6 +24,7 @@ async fn mock_detector(reply: Value) -> (u16, Arc<Mutex<usize>>) {
             let c = c2.clone();
             let reply = reply.clone();
             async move {
+                tokio::time::sleep(delay).await;
                 let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 assert!(ct.starts_with("multipart/form-data"), "{ct}");
                 let s = String::from_utf8_lossy(&body);
@@ -163,6 +169,79 @@ async fn require_object_discards_eventless_motion() {
         if matches!(n, Notification::EventStart(_) | Notification::EventEnd(_)) { announced = true; }
     }
     assert!(!announced);
+    fx.db.update_camera(cam, json!({"enabled": false}).as_object().unwrap()).unwrap();
+    zmng::detect::reconcile(ctx).await.unwrap();
+}
+
+/// A `require_object` event whose only detection answers after motion has
+/// stopped and the cooldown passed: the close waits for the answer, the
+/// person is attributed to the event, and it is kept and announced.
+#[tokio::test]
+async fn late_detection_keeps_a_require_object_event() {
+    let (port, calls) = mock_detector_delayed(person_reply(), std::time::Duration::from_millis(2500)).await;
+    let fx = Fixture::new();
+    // 1.5 s of motion, then 3 s of a frozen frame (no motion), then the source ends
+    let cam = fx.db.add_camera("synthetic", "rtsp://none/", Some("lavfi:testsrc=size=320x180:rate=10:duration=1.5,tpad=stop_mode=clone:stop_duration=3"), fx.storage_id).unwrap();
+    fx.db.update_camera(cam, json!({"record_sub": false, "detect_fps": 10, "require_object": true, "cooldown_secs": 0.5, "post_secs": 0.5, "object_labels": "person"}).as_object().unwrap()).unwrap();
+    let ctx = ctx(&fx, Some(Arc::new(ObjectDetector::new(ObjectsConfig { timeout_ms: 5000, ..cfg(port) }).unwrap())));
+    let mut rx = fx.bus.subscribe();
+    zmng::detect::reconcile(ctx.clone()).await.unwrap();
+    let mut id = None;
+    for _ in 0..400 {
+        if let Some(e) = zmng::detect::status(&fx.hub, cam).and_then(|s| s.in_event) { id = Some(e); break; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let id = id.expect("an event row was opened while motion ran");
+    // the cooldown has passed long before the detector answers: the event must survive it
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(fx.db.event(id).unwrap().is_some(), "closed before the in-flight detection answered");
+    let mut done = None;
+    for _ in 0..120 {
+        if let Some(e) = fx.db.event(id).unwrap() {
+            if e.end_dts.is_some() { done = Some(e); break; }
+        } else {
+            panic!("event discarded although the late detection found a person");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let e = done.expect("event closed after the answer arrived");
+    assert_eq!(e.kind, "person");
+    assert_eq!(*calls.lock().unwrap(), 1, "one detection during 1.5 s of motion");
+    let mut kinds = Vec::new();
+    while let Ok(n) = rx.try_recv() {
+        match n {
+            Notification::EventStart(e) => kinds.push(format!("start:{}", e.kind)),
+            Notification::EventEnd(e) => kinds.push(format!("end:{}", e.kind)),
+            _ => {}
+        }
+    }
+    assert_eq!(kinds, ["start:person", "end:person"], "{kinds:?}");
+    fx.db.update_camera(cam, json!({"enabled": false}).as_object().unwrap()).unwrap();
+    zmng::detect::reconcile(ctx).await.unwrap();
+}
+
+/// Changing object settings restarts the detector session; a rename does not.
+#[tokio::test]
+async fn object_setting_changes_restart_the_detector() {
+    let (port, _calls) = mock_detector(person_reply()).await;
+    let fx = Fixture::new();
+    let cam = fx.db.add_camera("synthetic", "rtsp://none/", Some("lavfi:testsrc=size=320x180:rate=5"), fx.storage_id).unwrap();
+    fx.db.update_camera(cam, json!({"record_sub": false, "detect_fps": 5}).as_object().unwrap()).unwrap();
+    let ctx = ctx(&fx, Some(Arc::new(ObjectDetector::new(cfg(port)).unwrap())));
+    zmng::detect::reconcile(ctx.clone()).await.unwrap();
+    let first = zmng::detect::status(&fx.hub, cam).expect("session").started_ms;
+    fx.db.update_camera(cam, json!({"name": "renamed"}).as_object().unwrap()).unwrap();
+    zmng::detect::reconcile(ctx.clone()).await.unwrap();
+    assert_eq!(zmng::detect::status(&fx.hub, cam).unwrap().started_ms, first, "a rename must not restart");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    fx.db.update_camera(cam, json!({"require_object": true}).as_object().unwrap()).unwrap();
+    zmng::detect::reconcile(ctx.clone()).await.unwrap();
+    let mut restarted = false;
+    for _ in 0..100 {
+        if zmng::detect::status(&fx.hub, cam).map(|s| s.started_ms != first).unwrap_or(false) { restarted = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(restarted, "require_object change must restart the detector session");
     fx.db.update_camera(cam, json!({"enabled": false}).as_object().unwrap()).unwrap();
     zmng::detect::reconcile(ctx).await.unwrap();
 }

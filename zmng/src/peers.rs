@@ -10,8 +10,9 @@
 //! local to each server; nothing is replicated.
 //!
 //! The proxy is an allow-list: only the camera/event/media/status routes a
-//! viewer needs, GET (plus PATCH on events and POST on PTZ, admin only),
-//! never the peer's users, tokens, storage or its own peers (no chaining).
+//! viewer needs, GET plus PATCH on events, never the peer's users, tokens,
+//! storage, PTZ or its own peers (no chaining). The list is checked on the
+//! raw capture and again on the parsed, normalized URL.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -49,14 +50,13 @@ pub fn allowed(method: &http::Method, path: &str) -> Option<bool> {
     let read_prefixes = ["api/cameras", "api/events", "api/segments", "api/stats", "api/status", "api/health"];
     match *method {
         http::Method::GET | http::Method::HEAD => {
-            if p == "api/me" || read_prefixes.iter().any(|x| p == *x || p.starts_with(&format!("{x}/")) || p.starts_with(&format!("{x}?"))) {
+            if p == "api/me" || read_prefixes.iter().any(|x| p == *x || p.starts_with(&format!("{x}/"))) {
                 Some(false)
             } else {
                 None
             }
         }
-        http::Method::PATCH => p.starts_with("api/events/").then_some(false),
-        http::Method::POST => (p.starts_with("api/cameras/") && p.ends_with("/ptz")).then_some(true),
+        http::Method::PATCH => (p.starts_with("api/events/") && !p.contains("/events/stream")).then_some(false),
         _ => None,
     }
 }
@@ -83,7 +83,10 @@ mod tests {
         let m = http::Method::GET;
         assert_eq!(allowed(&m, "api/cameras"), Some(false));
         assert_eq!(allowed(&m, "/api/cameras/3/video.mp4"), Some(false));
-        assert_eq!(allowed(&m, "api/events?limit=5"), Some(false));
+        assert_eq!(allowed(&m, "api/events"), Some(false));
+        assert_eq!(allowed(&m, "api/events/7/video.mp4"), Some(false));
+        // the query string is not part of the path handed to allowed()
+        assert_eq!(allowed(&m, "api/events?limit=5"), None);
         assert_eq!(allowed(&m, "api/segments/9/file.mp4"), Some(false));
         assert_eq!(allowed(&m, "api/me"), Some(false));
         assert_eq!(allowed(&m, "api/users"), None);
@@ -94,7 +97,7 @@ mod tests {
         assert_eq!(allowed(&m, "api/camerasx"), None);
         assert_eq!(allowed(&http::Method::PATCH, "api/events/4"), Some(false));
         assert_eq!(allowed(&http::Method::PATCH, "api/cameras/4"), None);
-        assert_eq!(allowed(&http::Method::POST, "api/cameras/4/ptz"), Some(true));
+        assert_eq!(allowed(&http::Method::POST, "api/cameras/4/ptz"), None);
         assert_eq!(allowed(&http::Method::POST, "api/cameras"), None);
         assert_eq!(allowed(&http::Method::DELETE, "api/events/4"), None);
     }

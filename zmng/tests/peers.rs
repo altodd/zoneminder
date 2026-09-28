@@ -75,8 +75,24 @@ async fn proxy_serves_peer_cameras_events_and_media_with_the_peer_acl() {
         let res = call(&r, m, p, Some(&at), Some(json!({}))).await;
         assert_eq!(res.status, 404, "{m} {p}");
     }
-    // PTZ through a peer is admin-only locally
-    assert_eq!(call(&r, "POST", &format!("/api/peers/barn/api/cameras/{cam}/ptz"), Some(&vt), Some(json!({"action": "stop"}))).await.status, 403);
+    // PTZ is never proxied (the peer's admin drives its own cameras)
+    assert_eq!(call(&r, "POST", &format!("/api/peers/barn/api/cameras/{cam}/ptz"), Some(&at), Some(json!({"action": "stop"}))).await.status, 404);
+    // path tricks never reach a route outside the allow-list
+    for p in [
+        "/api/peers/barn/api/cameras/../users",
+        "/api/peers/barn/api/cameras/%2e%2e/users",
+        "/api/peers/barn/api/cameras//users",
+        "/api/peers/barn/api/cameras/./users",
+        "/api/peers/barn/api/cameras/..%2fusers",
+        "/api/peers/barn/api/cameras/x%5c../users",
+        "/api/peers/barn/api/cameras/@evil.example/",
+        "/api/peers/barn/api/cameras/a@evil.example:80/",
+    ] {
+        let res = call(&r, "GET", p, Some(&at), None).await;
+        assert_eq!(res.status, 404, "{p} -> {}", res.text());
+    }
+    // the peer's user list was never served
+    assert_eq!(call(&r, "GET", "/api/peers/barn/api/cameras/..%2Fusers", Some(&at), None).await.status, 404);
     assert_eq!(get(&r, "/api/peers/nope/api/cameras", &vt).await.status, 404);
     assert_eq!(call(&r, "GET", "/api/peers/barn/api/cameras", None, None).await.status, 401);
 }

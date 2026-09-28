@@ -48,19 +48,23 @@ pub struct DetectStatus {
     pub score: u8,
     pub in_event: Option<i64>,
     pub last_error: Option<String>,
+    /// wall-clock ms when this detector session started decoding
+    pub started_ms: i64,
 }
 
 pub fn status(hub: &LiveHub, camera_id: i64) -> Option<DetectStatus> {
     hub.detectors.read().get(&camera_id).map(|d| d.status.read().clone())
 }
 
-/// Relevant subset of camera config; a change restarts the detector.
-fn detect_key(c: &Camera) -> String {
+/// Relevant subset of camera config; a change restarts the detector
+/// (object-detection settings included: the gate is built per session).
+pub fn detect_key(c: &Camera) -> String {
     format!(
-        "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         c.sub_url, c.detect_fps, c.detect_width, c.detect_height, c.pixel_threshold, c.min_area_pct,
-        c.min_blob_pct, c.pre_secs, c.post_secs, c.cooldown_secs, c.zones_json, c.masks_json
-    ) + &c.record_sub.to_string()
+        c.min_blob_pct, c.pre_secs, c.post_secs, c.cooldown_secs, c.zones_json, c.masks_json,
+        c.record_sub, c.objects, c.object_labels, c.require_object
+    )
 }
 
 pub async fn reconcile(ctx: Arc<DetectCtx>) -> Result<()> {
@@ -75,6 +79,7 @@ pub async fn reconcile(ctx: Arc<DetectCtx>) -> Result<()> {
     for cam in cams.into_iter().filter(|c| c.enabled) {
         if let Some(d) = map.get(&cam.id) {
             if detect_key(&d.camera.read()) == detect_key(&cam) {
+                *d.camera.write() = cam.clone(); // name etc. may have changed
                 continue;
             }
             let _ = d.stop.send(true);
@@ -359,7 +364,11 @@ async fn detect_session(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Cam
         }
     });
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started");
-    h.status.write().running = true;
+    {
+        let mut st = h.status.write();
+        st.running = true;
+        st.started_ms = crate::db::now_dts() / 90;
+    }
 
     let mut run = DetectRun::new(ctx.clone(), cam.clone(), h.clone());
     let mut frame = vec![0u8; w * hh * 3 / 2];
@@ -397,11 +406,11 @@ impl DetectRun {
         let masks = parse_polys(&cam.masks_json);
         DetectRun {
             det: MotionDetector::new(cam.detect_width as usize, cam.detect_height as usize, cam.pixel_threshold, cam.min_area_pct, cam.min_blob_pct, &zones, &masks),
-            ev: EventState::default(),
             fps_t: Instant::now(),
             fps_n: 0,
             preview: (ctx.preview_secs > 0).then(|| crate::preview::PreviewWriter::new(&ctx.thumb_dir, cam.id, ctx.preview_secs, cam.detect_width, cam.detect_height)),
             gate: ctx.objects.as_ref().filter(|_| cam.objects).map(|d| crate::objects::ObjectGate::new(d.clone(), &cam)),
+            ev: EventState { labels: ctx.objects.as_ref().filter(|_| cam.objects).map(|d| crate::objects::ObjectGate::new(d.clone(), &cam).labels().to_vec()).unwrap_or_default(), ..EventState::default() },
             w: cam.detect_width as usize,
             h: cam.detect_height as usize,
             last_dts: 0,
@@ -422,13 +431,21 @@ impl DetectRun {
                 warn!(camera = cam.id, "preview tile: {e:#}");
             }
         }
+        let mut in_flight = false;
         if let Some(g) = self.gate.as_mut() {
             if score > 0 {
-                g.maybe_send(dts, frame, self.w, self.h);
+                g.maybe_send(dts, frame, self.w, self.h, self.ev.event_id);
             }
-            let labels = g.labels().to_vec();
-            for (d, objs) in g.poll() {
-                self.ev.on_objects(&ctx, &cam, d, objs, &labels)?;
+            for (d, sent_for, objs) in g.poll() {
+                self.ev.on_objects(&ctx, &cam, d, sent_for, objs)?;
+            }
+            in_flight = g.in_flight();
+            // a close deferred until the last detection answered
+            if let Some(last) = self.ev.deferred_close {
+                if !in_flight {
+                    self.ev.deferred_close = None;
+                    self.ev.close(&ctx, &cam, last, &h, false)?;
+                }
             }
         }
         self.fps_n += 1;
@@ -443,7 +460,7 @@ impl DetectRun {
         if let Some(hh2) = ctx.hub.get(cam.id) {
             hh2.motion.push(dts, score);
         }
-        self.ev.step(&ctx, &cam, dts, score, &h)
+        self.ev.step(&ctx, &cam, dts, score, &h, in_flight)
     }
 }
 
@@ -453,7 +470,7 @@ impl Drop for DetectRun {
     fn drop(&mut self) {
         if self.ev.event_id.is_some() {
             let end_dts = if self.last_dts > 0 { self.last_dts } else { now_dts() };
-            if let Err(e) = self.ev.close(&self.ctx, &self.cam, end_dts, &self.handle) {
+            if let Err(e) = self.ev.close(&self.ctx, &self.cam, end_dts, &self.handle, false) {
                 error!(camera = self.cam.id, "closing event at session end: {e:#}");
             }
         }
@@ -548,7 +565,11 @@ async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam
         }
     });
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started (fed by substream recorder)");
-    h.status.write().running = true;
+    {
+        let mut st = h.status.write();
+        st.running = true;
+        st.started_ms = crate::db::now_dts() / 90;
+    }
 
     let mut run = DetectRun::new(ctx.clone(), cam.clone(), h.clone());
     let mut frame = vec![0u8; w * hh * 3 / 2];
@@ -588,6 +609,11 @@ struct EventState {
     announced: bool,
     /// detections that arrived before the event row existed
     pending: Vec<(i64, Vec<crate::notify::DetectedObject>)>,
+    /// label priority list for this camera (gate override or server default)
+    labels: Vec<String>,
+    /// `require_object` close postponed while a detection is in flight:
+    /// the last-motion dts to close at once the answer arrives
+    deferred_close: Option<i64>,
 }
 
 impl EventState {
@@ -601,21 +627,27 @@ impl EventState {
         })
     }
 
-    /// Merge a detection result into the open event (or keep it for the
-    /// event that is about to open). Publishes EventStart/EventUpdate.
-    fn on_objects(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, objs: Vec<crate::notify::DetectedObject>, labels: &[String]) -> Result<()> {
+    /// Merge a detection result into the event it was taken for. A result
+    /// for an event that has since closed is dropped; one taken before the
+    /// event row existed is kept for the event that is about to open.
+    fn on_objects(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, sent_for: Option<i64>, objs: Vec<crate::notify::DetectedObject>) -> Result<()> {
         let Some(id) = self.event_id else {
-            if !objs.is_empty() {
+            if sent_for.is_none() && !objs.is_empty() {
                 self.pending.retain(|(d, _)| dts - *d < 10 * TIMESCALE as i64);
                 self.pending.push((dts, objs));
             }
             return Ok(());
         };
+        if sent_for.is_some_and(|s| s != id) {
+            debug!(camera = cam.id, event = id, "dropping detection for a closed event");
+            return Ok(());
+        }
         let changed = self.objects.merge(&objs);
         if !changed {
             return Ok(());
         }
-        let kind = self.objects.kind(labels);
+        let labels = self.labels.clone();
+        let kind = self.objects.kind(&labels);
         ctx.db.update_event_objects(id, &kind, &self.meta().to_string())?;
         info!(camera = cam.id, event = id, %kind, objects = ?self.objects.list().iter().map(|o| format!("{}:{:.2}", o.label, o.confidence)).collect::<Vec<_>>(), "objects");
         if self.announced {
@@ -628,10 +660,15 @@ impl EventState {
     }
 
     /// Close the open event at `end_dts` (post-roll included), or discard it
-    /// when the camera requires an object and none was seen.
-    fn close(&mut self, ctx: &DetectCtx, cam: &Camera, last_motion_dts: i64, h: &DetectorHandle) -> Result<()> {
+    /// when the camera requires an object and none was seen. With a
+    /// detection still in flight the decision waits for its answer.
+    fn close(&mut self, ctx: &DetectCtx, cam: &Camera, last_motion_dts: i64, h: &DetectorHandle, in_flight: bool) -> Result<()> {
         let ts = TIMESCALE as i64;
         let Some(id) = self.event_id else { return Ok(()) };
+        if cam.require_object && self.objects.is_empty() && in_flight {
+            self.deferred_close = Some(last_motion_dts);
+            return Ok(());
+        }
         let peak_dts = self.peak_dts;
         h.status.write().in_event = None;
         if cam.require_object && self.objects.is_empty() {
@@ -653,12 +690,16 @@ impl EventState {
         Ok(())
     }
 
-    fn step(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, score: u8, h: &DetectorHandle) -> Result<()> {
+    fn step(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, score: u8, h: &DetectorHandle, in_flight: bool) -> Result<()> {
         let ts = TIMESCALE as i64;
         if score > 0 {
             self.consecutive = self.consecutive.saturating_add(1);
+            self.deferred_close = None; // motion resumed: the event simply continues
         } else {
             self.consecutive = 0;
+        }
+        if self.deferred_close.is_some() {
+            return Ok(()); // waiting for the last detection before deciding
         }
         match self.event_id {
             None => {
@@ -681,9 +722,8 @@ impl EventState {
                         ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);
                     }
                     let pending = std::mem::take(&mut self.pending);
-                    let labels: Vec<String> = ctx.objects.as_ref().map(|d| d.cfg.labels.clone()).unwrap_or_default();
                     for (d, objs) in pending.into_iter().filter(|(d, _)| dts - *d < 10 * TIMESCALE as i64) {
-                        self.on_objects(ctx, cam, d, objs, &labels)?;
+                        self.on_objects(ctx, cam, d, None, objs)?;
                     }
                 }
             }
@@ -705,7 +745,7 @@ impl EventState {
                 let max_len = ts * 600; // hard cap 10 min from event start; a new event starts if motion continues
                 if quiet > (cam.cooldown_secs * ts as f64) as i64 || dts - self.start_dts > max_len {
                     let last = self.last_motion_dts;
-                    self.close(ctx, cam, last, h)?;
+                    self.close(ctx, cam, last, h, in_flight)?;
                 }
             }
         }
@@ -790,6 +830,21 @@ mod tests {
         let mut det2 = MotionDetector::new(w, h, 25, 0.5, 0.2, &[], &[]);
         for _ in 0..12 { det2.feed(&base); }
         assert_eq!(det2.feed(&f), 0);
+    }
+
+    #[test]
+    fn detect_key_covers_object_settings() {
+        let a = Camera::example();
+        let mut b = a.clone();
+        assert_eq!(detect_key(&a), detect_key(&b));
+        b.object_labels = "person".into();
+        assert_ne!(detect_key(&a), detect_key(&b));
+        let mut c = a.clone();
+        c.require_object = true;
+        assert_ne!(detect_key(&a), detect_key(&c));
+        let mut d = a.clone();
+        d.name = "renamed".into();
+        assert_eq!(detect_key(&a), detect_key(&d), "a rename does not restart the detector");
     }
 
     #[test]

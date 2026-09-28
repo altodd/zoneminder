@@ -51,11 +51,12 @@ async fn av_segment_decodes_and_serves() {
     let frames_per_sec = rate as usize / 1024; // ~46 AAC frames per second
     for (g, chunk) in enc.samples.chunks(per_gop).enumerate() {
         let gop: Vec<mp4::Sample> = chunk.iter().map(|(dur, key, data)| { let s = mp4::Sample { dts: vdts, duration: *dur, is_key: *key, data: data.clone() }; vdts += *dur as i64; s }).collect();
-        let a0 = g * frames_per_sec;
-        let asamples: Vec<mp4::Sample> = frames.iter().skip(a0).take(frames_per_sec).enumerate().map(|(i, f)| mp4::Sample {
-            dts: (base as i128 * rate as i128 / TIMESCALE as i128) as i64 + ((a0 + i) * 1024) as i64,
-            duration: 1024, is_key: true, data: f.clone(),
-        }).collect();
+        // the audio frames whose time falls inside this GOP's second, like the recorder buckets them
+        let base_a = (base as i128 * rate as i128 / TIMESCALE as i128) as i64;
+        let asamples: Vec<mp4::Sample> = frames.iter().enumerate()
+            .filter(|(i, _)| (i * 1024) / rate as usize == g)
+            .map(|(i, f)| mp4::Sample { dts: base_a + (i * 1024) as i64, duration: 1024, is_key: true, data: f.clone() })
+            .collect();
         seq += 1;
         let frag = mp4::fragment_av(seq, &gop, &asamples);
         let dur: u32 = gop.iter().map(|s| s.duration).sum();
@@ -102,6 +103,46 @@ async fn av_segment_decodes_and_serves() {
     let res = get(&r, &format!("/api/cameras/{cam}/video.mp4?start={}&end={}", base / 90, base / 90 + 1000), &tok).await;
     assert!(res.header("content-type").unwrap().contains("mp4a.40.2"));
     assert!(count_audio_frames(&res.body) >= frames_per_sec - 2);
+    // an event download is re-stamped to start at t=0: the audio track's
+    // tfdt is shifted in ITS timescale, so the tracks stay in sync
+    // (ffprobe normalizes each stream's start, so the tfdt values are read directly)
+    let ev = fx.db.insert_event(cam, base + TIMESCALE as i64, "motion").unwrap();
+    fx.db.close_event(ev, base + 3 * TIMESCALE as i64, None, "{}").unwrap();
+    let dl = call(&r, "GET", &format!("/zm/index.php?view=view_video&eid={ev}&token={tok}"), None, None).await;
+    assert_eq!(dl.status, 200, "{}", dl.text());
+    let tfdts = tfdt_pairs(&dl.body);
+    assert_eq!(tfdts.len(), 2, "{tfdts:?}");
+    assert_eq!(tfdts[0].0, 0, "video starts at t=0");
+    for (v, a) in &tfdts {
+        let (vs, as_) = (*v as f64 / TIMESCALE as f64, *a as f64 / rate as f64);
+        assert!((vs - as_).abs() < 0.05, "audio tfdt {as_:.3}s drifted from video {vs:.3}s");
+    }
+    let out = fx.storage_path().join("event.mp4");
+    std::fs::write(&out, &dl.body).unwrap();
+    assert_eq!(ffprobe_json(&out)["streams"].as_array().unwrap().len(), 2);
+    assert!(count_audio_frames(&dl.body) >= 2 * frames_per_sec - 2);
+}
+
+/// (video tfdt, audio tfdt) of every moof in a fragmented MP4, in order.
+fn tfdt_pairs(mp4: &[u8]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cur: Vec<u64> = Vec::new();
+    let mut i = 0;
+    while i + 8 <= mp4.len() {
+        let size = u32::from_be_bytes(mp4[i..i + 4].try_into().unwrap()) as usize;
+        let kind = &mp4[i + 4..i + 8];
+        if kind == b"moof" || kind == b"traf" {
+            if kind == b"moof" && cur.len() == 2 { out.push((cur[0], cur[1])); cur.clear(); }
+            i += 8; // descend
+            continue;
+        }
+        if kind == b"tfdt" && mp4[i + 8] == 1 {
+            cur.push(u64::from_be_bytes(mp4[i + 12..i + 20].try_into().unwrap()));
+        }
+        i += size.max(8);
+    }
+    if cur.len() == 2 { out.push((cur[0], cur[1])); }
+    out
 }
 
 fn count_audio_frames(mp4: &[u8]) -> usize {

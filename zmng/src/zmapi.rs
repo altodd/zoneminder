@@ -658,9 +658,9 @@ fn read_plan_bytes(plan: &video::RangePlan, offset: u64, len: u64) -> Result<Vec
             video::RangeItem::Init(b) => (b.len() as u64, None),
             video::RangeItem::Frag { path, offset: o, len: l, .. } => (*l as u64, Some((path, *o))),
         };
-        let frag_shift = match item {
-            video::RangeItem::Frag { dts_offset, .. } => dts_offset + plan.tfdt_shift,
-            _ => 0,
+        let (frag_shift, audio_rate) = match item {
+            video::RangeItem::Frag { dts_offset, audio_rate, .. } => (dts_offset + plan.tfdt_shift, *audio_rate),
+            _ => (0, None),
         };
         let a = pos.max(offset);
         let b = (pos + ilen).min(end);
@@ -679,7 +679,7 @@ fn read_plan_bytes(plan: &video::RangePlan, offset: u64, len: u64) -> Result<Vec
                     let mut buf = vec![0u8; ilen as usize];
                     f.read_exact(&mut buf)?;
                     if frag_shift != 0 {
-                        crate::mp4::shift_tfdt(&mut buf, frag_shift);
+                        crate::mp4::shift_tfdt_av(&mut buf, frag_shift, audio_rate);
                     }
                     out.extend_from_slice(&buf[from as usize..to as usize]);
                 }

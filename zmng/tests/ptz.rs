@@ -119,8 +119,9 @@ async fn probe_move_stop_presets_through_the_api() {
     assert_eq!(call(&r, "POST", &format!("/api/cameras/{cam}/ptz"), Some(&admin), Some(json!({"action": "move", "pan": -1, "tilt": 0, "zoom": 0, "seconds": 5}))).await.status, 200);
     assert_eq!(call(&r, "POST", &format!("/api/cameras/{cam}/ptz"), Some(&admin), Some(json!({"action": "stop"}))).await.status, 200);
     assert_eq!(call(&r, "POST", &format!("/api/cameras/{cam}/ptz"), Some(&admin), Some(json!({"action": "move", "pan": 2, "tilt": 0, "zoom": 0}))).await.status, 400);
-    // presets (viewers may list), goto, set, home
-    let ps = get(&r, &format!("/api/cameras/{cam}/ptz/presets"), &viewer).await.json();
+    // presets (admin only, like the pad), goto, set, home
+    assert_eq!(get(&r, &format!("/api/cameras/{cam}/ptz/presets"), &viewer).await.status, 403);
+    let ps = get(&r, &format!("/api/cameras/{cam}/ptz/presets"), &admin).await.json();
     assert_eq!(ps, json!([{"token": "1", "name": "Door"}, {"token": "2", "name": "Lot"}]));
     assert_eq!(call(&r, "POST", &format!("/api/cameras/{cam}/ptz"), Some(&admin), Some(json!({"action": "preset", "preset": "2"}))).await.status, 200);
     assert_eq!(call(&r, "POST", &format!("/api/cameras/{cam}/ptz"), Some(&admin), Some(json!({"action": "set_preset", "name": "Gate"}))).await.json()["preset"], "9");

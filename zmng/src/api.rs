@@ -395,6 +395,9 @@ async fn camera_update(
 
 async fn camera_delete(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     require_admin(user.as_ref().map(|e| &e.0))?;
+    if app.db.camera(id).map_err(err500)?.is_none() {
+        return Err((StatusCode::NOT_FOUND, "no such camera").into_response());
+    }
     // stop recording first so no new files appear while we delete
     app.db.update_camera(id, &serde_json::json!({"enabled": false}).as_object().unwrap().clone()).map_err(bad)?;
     app.hub.remove_camera(id);
@@ -608,9 +611,10 @@ fn wants_h264(codec: &Option<String>) -> Result<bool, Response> {
 
 /// Wrap an fMP4 stream in a transcode session when the client wants H.264
 /// and the source is not H.264 already. Returns (mime, body).
-async fn maybe_transcode(app: &App, want_h264: bool, source_mime: &str, first_dts: i64, fps: f64, body: impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static) -> Result<(String, Body), Response> {
+/// Returns (mime, body, transcoded).
+async fn maybe_transcode(app: &App, want_h264: bool, source_mime: &str, first_dts: i64, fps: f64, body: impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static) -> Result<(String, Body, bool), Response> {
     if !want_h264 || source_mime.contains("avc1") {
-        return Ok((source_mime.to_string(), Body::from_stream(body)));
+        return Ok((source_mime.to_string(), Body::from_stream(body), false));
     }
     let Some(t) = app.transcoder.as_ref() else {
         return Err((StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "no [transcode] configured; use the substream"}))).into_response());
@@ -622,7 +626,7 @@ async fn maybe_transcode(app: &App, want_h264: bool, source_mime: &str, first_dt
     };
     use futures::StreamExt;
     let init = futures::stream::once(async move { Ok::<_, std::io::Error>(tc.init) });
-    Ok((tc.mime, Body::from_stream(init.chain(tc.frags))))
+    Ok((tc.mime, Body::from_stream(init.chain(tc.frags)), true))
 }
 
 fn stream_of(q: &Option<String>) -> Result<crate::recorder::StreamKind, Response> {
@@ -651,8 +655,7 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
     let len = plan.bytes;
     let exact = plan.exact_len;
     let fps = app.hub.get(id).map(|h| h.status.read().fps as f64).filter(|f| *f > 0.5).unwrap_or(18.0);
-    let (mime, body) = maybe_transcode(&app, want_h264, &source_mime, first_dts, fps, video::stream_plan(plan)).await?;
-    let transcoded = mime != source_mime;
+    let (mime, body, transcoded) = maybe_transcode(&app, want_h264, &source_mime, first_dts, fps, video::stream_plan(plan)).await?;
     let mut b = Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, "private, max-age=3600")
@@ -738,9 +741,10 @@ async fn segment_frag(State(app): State<App>, Path((id, fi)): Path<(i64, usize)>
     let storage = app.db.storage(seg.storage_id).map_err(err500)?.ok_or_else(|| err500("storage missing"))?;
     let path = std::path::PathBuf::from(&storage.path).join(&seg.path);
     let off = seg.dts_offset;
+    let audio_rate = app.db.sample_entry(seg.sample_entry_id).map_err(err500)?.and_then(|se| se.audio.map(|a| a.sample_rate));
     let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let d = crate::thumbs::read_range(&path, frag.offset, frag.len)?;
-        Ok(crate::mp4::rebase_fragment(&d, off))
+        Ok(crate::mp4::rebase_fragment_av(&d, off, audio_rate))
     })
     .await
     .map_err(err500)?
@@ -776,7 +780,7 @@ async fn live(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<Strea
         )
     };
     let fps = h.status.read().fps as f64;
-    let (mime, body) = maybe_transcode(&app, want_h264, &source_mime, first_dts, if fps > 0.5 { fps } else { 18.0 }, video::live_mp4(h)).await?;
+    let (mime, body, _) = maybe_transcode(&app, want_h264, &source_mime, first_dts, if fps > 0.5 { fps } else { 18.0 }, video::live_mp4(h)).await?;
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, "no-store")
@@ -911,6 +915,10 @@ async fn ptz_command(State(app): State<App>, Path(id): Path<i64>, user: Option<a
                 return Err(bad("pan/tilt/zoom must be within -1..1"));
             }
             c.continuous_move(&url, &profile, req.pan, req.tilt, req.zoom).await.map_err(ptz_err)?;
+            // (re)arm after the move so two quick moves never leave a stale timer
+            if let Some(t) = app.ptz_timers.lock().remove(&id) {
+                t.abort();
+            }
             if req.seconds > 0.0 {
                 let (c2, url2, profile2) = (c, url.clone(), profile.clone());
                 let secs = req.seconds.min(30.0);
@@ -935,9 +943,9 @@ async fn ptz_command(State(app): State<App>, Path(id): Path<i64>, user: Option<a
     Ok(Json(serde_json::json!({"ok": true})).into_response())
 }
 
+/// Admin only, like the pad: the reply may carry the camera's ONVIF URL.
 async fn ptz_presets(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
-    let u = require(user.as_ref().map(|e| &e.0))?;
-    can_see(&app, u, id)?;
+    require_admin(user.as_ref().map(|e| &e.0))?;
     let cam = app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?;
     let (c, url, profile) = ptz_client(&cam)?;
     let presets = c.presets(&url, &profile).await.map_err(ptz_err)?;
@@ -1206,10 +1214,23 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
     if need_admin && u.role != "admin" {
         return Err((StatusCode::FORBIDDEN, "admin only").into_response());
     }
+    // axum percent-decodes the capture and reqwest normalizes dot segments,
+    // so the allow-list is enforced on the final, parsed URL as well
+    if path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == ".." || seg.contains('%') || seg.contains('\\')) {
+        return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
+    }
     let mut url = format!("{}/{}", peer.url.trim_end_matches('/'), path.trim_start_matches('/'));
     if let Some(q) = req.uri().query() {
         url.push('?');
         url.push_str(q);
+    }
+    let parsed = url::Url::parse(&url).map_err(|_| (StatusCode::NOT_FOUND, "not proxied").into_response())?;
+    let base = url::Url::parse(&peer.url).map_err(err500)?;
+    if parsed.host_str() != base.host_str() || parsed.port_or_known_default() != base.port_or_known_default() || parsed.scheme() != base.scheme() {
+        return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
+    }
+    if crate::peers::allowed(req.method(), parsed.path()) != Some(need_admin) {
+        return Err((StatusCode::NOT_FOUND, "not proxied").into_response());
     }
     let method = req.method().clone();
     let mut out = app.http.request(method, &url).bearer_auth(&peer.token).timeout(std::time::Duration::from_secs(3600));
@@ -1223,6 +1244,10 @@ async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, St
         out = out.body(body);
     }
     let res = out.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("peer {name}: {e}")}))).into_response())?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED || res.status() == reqwest::StatusCode::FORBIDDEN {
+        // the peer rejected OUR token; never let that log the local user out
+        return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("peer {name}: token rejected ({})", res.status())}))).into_response());
+    }
     let mut b = Response::builder().status(res.status().as_u16());
     for h in crate::peers::PASS_HEADERS {
         if let Some(v) = res.headers().get(*h) {

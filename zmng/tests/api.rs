@@ -346,3 +346,74 @@ async fn zm_compatible_api_lists_monitors_and_events() {
     assert_eq!(mp4.header("accept-ranges").unwrap(), "bytes");
     assert!(count_frames(&mp4.body) >= 10);
 }
+
+/// The admin surface: users, tokens, storages, camera create/delete, and
+/// the login throttle. Viewers are refused everywhere here.
+#[tokio::test]
+async fn admin_surface_users_tokens_storages_and_cameras() {
+    let w = world();
+    let r = w.fx.router();
+    let (a, v) = (&w.admin_tok, &w.viewer_tok);
+    // viewers: every admin route is 403
+    for (m, p, body) in [
+        ("GET", "/api/users", json!({})),
+        ("POST", "/api/users", json!({"username": "x", "password": "password123"})),
+        ("POST", "/api/tokens", json!({})),
+        ("GET", "/api/storages", json!({})),
+        ("POST", "/api/storages", json!({"path": "/tmp"})),
+        ("POST", "/api/cameras", json!({"name": "x", "main_url": "rtsp://x/"})),
+        ("DELETE", &format!("/api/cameras/{}", w.cam)[..], json!({})),
+    ] {
+        assert_eq!(call(&r, m, p, Some(v), Some(body)).await.status, 403, "{m} {p}");
+    }
+    // users: create with validation, list, patch cameras, delete (not yourself)
+    assert_eq!(call(&r, "POST", "/api/users", Some(a), Some(json!({"username": "short", "password": "1234"}))).await.status, 400);
+    assert_eq!(call(&r, "POST", "/api/users", Some(a), Some(json!({"username": "x", "password": "password123", "role": "root"}))).await.status, 400);
+    let uid = call(&r, "POST", "/api/users", Some(a), Some(json!({"username": "ops", "password": "password123", "cameras": [w.cam]}))).await.json()["id"].as_i64().unwrap();
+    assert_eq!(call(&r, "POST", "/api/users", Some(a), Some(json!({"username": "ops", "password": "password123"}))).await.status, 400, "duplicate name");
+    let users = get(&r, "/api/users", a).await.json();
+    let ops = users.as_array().unwrap().iter().find(|u| u["id"] == uid).unwrap();
+    assert_eq!(ops["role"], "viewer");
+    assert_eq!(ops["cameras"], json!([w.cam]));
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{uid}"), Some(a), Some(json!({"cameras": []}))).await.status, 200);
+    assert_eq!(get(&r, "/api/users", a).await.json().as_array().unwrap().iter().find(|u| u["id"] == uid).unwrap()["cameras"], json!([]));
+    let me = get(&r, "/api/me", a).await.json()["user"]["id"].as_i64().unwrap();
+    assert_eq!(call(&r, "DELETE", &format!("/api/users/{me}"), Some(a), None).await.status, 400);
+    assert_eq!(call(&r, "DELETE", &format!("/api/users/{uid}"), Some(a), None).await.status, 200);
+    assert!(get(&r, "/api/users", a).await.json().as_array().unwrap().iter().all(|u| u["id"] != uid));
+    // tokens: a long-lived token works like a login
+    let t = call(&r, "POST", "/api/tokens", Some(a), None).await.json()["token"].as_str().unwrap().to_string();
+    assert_eq!(get(&r, "/api/me", &t).await.json()["user"]["role"], "admin");
+    // storages: path must exist; create, list, patch
+    assert_eq!(call(&r, "POST", "/api/storages", Some(a), Some(json!({"path": "/nonexistent/zmng"}))).await.status, 400);
+    let dir = w.fx.storage_path().join("tier2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = call(&r, "POST", "/api/storages", Some(a), Some(json!({"path": dir.to_str().unwrap(), "max_gb": 1.0, "reserve_gb": 0.1}))).await.json()["id"].as_i64().unwrap();
+    let st = get(&r, "/api/storages", a).await.json();
+    let s2 = st.as_array().unwrap().iter().find(|s| s["id"] == sid).unwrap();
+    assert_eq!(s2["max_bytes"], 1_000_000_000i64);
+    assert_eq!(s2["available"], true);
+    assert_eq!(call(&r, "PATCH", &format!("/api/storages/{sid}"), Some(a), Some(json!({"archive_after_days": 7}))).await.status, 200);
+    assert_eq!(call(&r, "PATCH", &format!("/api/storages/{sid}"), Some(a), Some(json!({"bogus": 1}))).await.status, 400);
+    // cameras: create, then delete; deleting an unknown id is 404, not 200
+    let cid = call(&r, "POST", "/api/cameras", Some(a), Some(json!({"name": "new", "main_url": "rtsp://10.0.0.9/main"}))).await.json()["id"].as_i64().unwrap();
+    assert_eq!(get(&r, &format!("/api/cameras/{cid}"), a).await.json()["name"], "new");
+    assert_eq!(call(&r, "DELETE", &format!("/api/cameras/{cid}"), Some(a), None).await.status, 200);
+    assert_eq!(get(&r, &format!("/api/cameras/{cid}"), a).await.status, 404);
+    assert_eq!(call(&r, "DELETE", &format!("/api/cameras/{cid}"), Some(a), None).await.status, 404);
+    assert_eq!(call(&r, "DELETE", "/api/cameras/999999", Some(a), None).await.status, 404);
+}
+
+/// Ten failed logins in a minute lock the login route with 429 (a token
+/// still works, so an operator is never locked out by a scanner).
+#[tokio::test]
+async fn login_locks_after_ten_failures() {
+    let w = world();
+    let r = w.fx.router();
+    let bad = json!({"username": "admin", "password": "wrong"});
+    for _ in 0..10 {
+        assert_eq!(call(&r, "POST", "/api/login", None, Some(bad.clone())).await.status, 401);
+    }
+    assert_eq!(call(&r, "POST", "/api/login", None, Some(json!({"username": "admin", "password": "password123"}))).await.status, 429);
+    assert_eq!(get(&r, "/api/me", &w.admin_tok).await.status, 200);
+}

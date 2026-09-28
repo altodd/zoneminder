@@ -44,7 +44,7 @@ pub struct RangePlan {
 
 pub enum RangeItem {
     Init(Bytes),
-    Frag { path: PathBuf, offset: u64, len: u32, dts: i64, duration: u32, dts_offset: i64 },
+    Frag { path: PathBuf, offset: u64, len: u32, dts: i64, duration: u32, dts_offset: i64, audio_rate: Option<u32> },
 }
 
 /// Build the plan for a time range: which init segments and fragments to send.
@@ -57,6 +57,7 @@ pub fn plan_range_stream(db: &Db, camera_id: i64, stream: &str, start: i64, end:
     let mut items = Vec::new();
     let mut bytes = 0u64;
     let mut cur_se: Option<i64> = None;
+    let mut cur_audio_rate: Option<u32> = None;
     let mut first = None;
     let mut last = None;
     let mut mime = None;
@@ -73,6 +74,7 @@ pub fn plan_range_stream(db: &Db, camera_id: i64, stream: &str, start: i64, end:
         if cur_se != Some(seg.sample_entry_id) {
             if let Some(se) = db.sample_entry(seg.sample_entry_id)? {
                 let vp = se.video_params();
+                cur_audio_rate = vp.audio.as_ref().map(|a| a.sample_rate);
                 let init = crate::mp4::init_segment(&vp);
                 bytes += init.len() as u64;
                 if mime.is_none() {
@@ -88,7 +90,7 @@ pub fn plan_range_stream(db: &Db, camera_id: i64, stream: &str, start: i64, end:
             }
             last = Some(f.dts + f.duration as i64);
             bytes += f.len as u64;
-            items.push(RangeItem::Frag { path: path.clone(), offset: f.offset, len: f.len, dts: f.dts, duration: f.duration, dts_offset: seg.dts_offset });
+            items.push(RangeItem::Frag { path: path.clone(), offset: f.offset, len: f.len, dts: f.dts, duration: f.duration, dts_offset: seg.dts_offset, audio_rate: cur_audio_rate });
         }
     }
     Ok(RangePlan { items, bytes, exact_len, tfdt_shift: 0, first_dts: first, last_end_dts: last, mime })
@@ -103,7 +105,7 @@ pub fn stream_plan(plan: RangePlan) -> impl Stream<Item = std::result::Result<By
         for item in plan.items {
             let res = match item {
                 RangeItem::Init(b) => Ok(b),
-                RangeItem::Frag { path, offset, len, dts_offset, .. } => {
+                RangeItem::Frag { path, offset, len, dts_offset, audio_rate, .. } => {
                     let need_open = open.as_ref().map(|(p, _)| *p != path).unwrap_or(true);
                     if need_open {
                         match std::fs::File::open(&path) {
@@ -118,7 +120,7 @@ pub fn stream_plan(plan: RangePlan) -> impl Stream<Item = std::result::Result<By
                     let mut buf = vec![0u8; len as usize];
                     f.seek(SeekFrom::Start(offset))
                         .and_then(|_| f.read_exact(&mut buf))
-                        .map(|_| Bytes::from(crate::mp4::rebase_fragment(&buf, dts_offset + shift)))
+                        .map(|_| Bytes::from(crate::mp4::rebase_fragment_av(&buf, dts_offset + shift, audio_rate)))
                 }
             };
             let stop = res.is_err();

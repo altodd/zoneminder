@@ -639,6 +639,22 @@ pub fn scan_segment_file(path: &std::path::Path) -> anyhow::Result<ScannedSegmen
 /// ZoneMinder files, whose timestamps start near zero, on our absolute
 /// timeline.  Returns false if no tfdt was found.
 pub fn shift_tfdt(frag: &mut [u8], offset: i64) -> bool {
+    shift_tfdt_av(frag, offset, None)
+}
+
+/// The tfdt offset for a track: video (track 1) in 90 kHz ticks; the audio
+/// track (2) in its own timescale.
+fn track_offset(track: u32, offset: i64, audio_rate: Option<u32>) -> i64 {
+    match (track, audio_rate) {
+        (1, _) => offset,
+        (_, Some(r)) => (offset as i128 * r as i128 / TIMESCALE as i128) as i64,
+        (_, None) => offset,
+    }
+}
+
+/// Like [`shift_tfdt`] but scales the offset for the audio `traf` (track 2)
+/// to `audio_rate`, so an AV fragment keeps its tracks in sync.
+pub fn shift_tfdt_av(frag: &mut [u8], offset: i64, audio_rate: Option<u32>) -> bool {
     if offset == 0 {
         return true;
     }
@@ -659,22 +675,28 @@ pub fn shift_tfdt(frag: &mut [u8], offset: i64) -> bool {
         if &frag[pos + 4..pos + 8] == b"traf" {
             let mut p = pos + 8;
             let end = pos + size;
+            let mut track = 1u32;
             while p + 8 <= end {
                 let s = u32::from_be_bytes(frag[p..p + 4].try_into().unwrap()) as usize;
                 if s < 8 || p + s > end {
                     break;
                 }
+                if &frag[p + 4..p + 8] == b"tfhd" && s >= 16 {
+                    track = u32::from_be_bytes(frag[p + 12..p + 16].try_into().unwrap());
+                }
                 if &frag[p + 4..p + 8] == b"tfdt" {
+                    let offset = track_offset(track, offset, audio_rate);
                     let version = frag[p + 8];
+                    // an audio frame a few ms before the first keyframe must not wrap negative
                     if version == 1 && s >= 20 {
                         let old = u64::from_be_bytes(frag[p + 12..p + 20].try_into().unwrap()) as i64;
-                        frag[p + 12..p + 20].copy_from_slice(&((old + offset) as u64).to_be_bytes());
+                        frag[p + 12..p + 20].copy_from_slice(&((old + offset).max(0) as u64).to_be_bytes());
                         found = true;
                     } else if version == 0 && s >= 16 {
                         // upgrade in place is impossible (box would grow); ZoneMinder/ffmpeg
                         // write version 1 for fragmented output, so this is rare
                         let old = u32::from_be_bytes(frag[p + 12..p + 16].try_into().unwrap()) as i64;
-                        let new = old + offset;
+                        let new = (old + offset).max(0);
                         if new < 0 || new > u32::MAX as i64 {
                             return false;
                         }
@@ -700,6 +722,12 @@ pub fn shift_tfdt(frag: &mut [u8], offset: i64) -> bool {
 /// Our own files already satisfy both, so this is a cheap pass-through for
 /// them.  Returns the rewritten fragment.
 pub fn rebase_fragment(frag: &[u8], dts_offset: i64) -> Vec<u8> {
+    rebase_fragment_av(frag, dts_offset, None)
+}
+
+/// [`rebase_fragment`] with the audio track's timescale so its tfdt is
+/// shifted by the equivalent amount.
+pub fn rebase_fragment_av(frag: &[u8], dts_offset: i64, audio_rate: Option<u32>) -> Vec<u8> {
     let mut out = frag.to_vec();
     if out.len() < 8 || &out[4..8] != b"moof" {
         return out;
@@ -721,6 +749,7 @@ pub fn rebase_fragment(frag: &[u8], dts_offset: i64) -> Vec<u8> {
             let mut p = pos + 8;
             let mut end = pos + size;
             let mut trun_positions: Vec<usize> = Vec::new();
+            let mut track = 1u32;
             while p + 8 <= end {
                 let s = u32::from_be_bytes(out[p..p + 4].try_into().unwrap()) as usize;
                 if s < 8 || p + s > end {
@@ -729,6 +758,9 @@ pub fn rebase_fragment(frag: &[u8], dts_offset: i64) -> Vec<u8> {
                 match &out[p + 4..p + 8] {
                     b"tfhd" => {
                         let flags = u32::from_be_bytes(out[p + 8..p + 12].try_into().unwrap()) & 0xff_ffff;
+                        if s >= 16 {
+                            track = u32::from_be_bytes(out[p + 12..p + 16].try_into().unwrap());
+                        }
                         if flags & 0x1 != 0 && s >= 24 {
                             // drop the 8-byte base_data_offset (right after track_ID at p+12..16)
                             out.drain(p + 16..p + 24);
@@ -746,10 +778,11 @@ pub fn rebase_fragment(frag: &[u8], dts_offset: i64) -> Vec<u8> {
                     }
                     b"tfdt" => {
                         if dts_offset != 0 {
+                            let dts_offset = track_offset(track, dts_offset, audio_rate);
                             let version = out[p + 8];
                             if version == 1 && s >= 20 {
                                 let old = u64::from_be_bytes(out[p + 12..p + 20].try_into().unwrap()) as i64;
-                                out[p + 12..p + 20].copy_from_slice(&((old + dts_offset) as u64).to_be_bytes());
+                                out[p + 12..p + 20].copy_from_slice(&((old + dts_offset).max(0) as u64).to_be_bytes());
                             } else if version == 0 && s >= 16 {
                                 let old = u32::from_be_bytes(out[p + 12..p + 16].try_into().unwrap()) as i64;
                                 let new = (old + dts_offset).clamp(0, u32::MAX as i64);
@@ -1093,6 +1126,21 @@ mod tests {
         assert_eq!(decode_index(&blob), scanned.frags);
     }
 
+    /// Every tfdt baseMediaDecodeTime in a fragment, in traf order.
+    fn xml_free_tfdts(frag: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 20 <= frag.len() {
+            if &frag[i + 4..i + 8] == b"tfdt" && frag[i + 8] == 1 {
+                out.push(u64::from_be_bytes(frag[i + 12..i + 20].try_into().unwrap()));
+                i += 20;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
     #[test]
     fn av_fragment_indexes_only_the_video_track() {
         let v = |dts: i64| Sample { dts, duration: 9000, is_key: true, data: Bytes::from(vec![1u8; 20]) };
@@ -1111,6 +1159,20 @@ mod tests {
         assert_eq!(fourcc, "avc1", "video stays the first track");
         assert_eq!(VideoParams { audio: Some(audio.clone()), ..params() }.mime(), "video/mp4; codecs=\"avc1.64001e,mp4a.40.2\"");
         assert_eq!(extract_audio_entry(&init).map(|(e, r, c)| (e[4..8].to_vec(), r, c)), Some((b"mp4a".to_vec(), 48_000, 1)));
+        // shifting an AV fragment moves the audio tfdt in its own timescale
+        let mut shifted = f.to_vec();
+        assert!(shift_tfdt_av(&mut shifted, 90_000 * 10, Some(48_000)));
+        let tfdts: Vec<u64> = xml_free_tfdts(&shifted);
+        assert_eq!(tfdts, vec![90_000 + 900_000, 48_000 + 480_000]);
+        let rebased = rebase_fragment_av(&f, 90_000 * 10, Some(48_000));
+        assert_eq!(xml_free_tfdts(&rebased), vec![90_000 + 900_000, 48_000 + 480_000]);
+        // a truncated stsd never panics the adopter
+        let mut short = init.to_vec();
+        if let Some(i) = short.windows(4).position(|w| w == b"stsd") {
+            short.truncate(i + 6);
+        }
+        assert!(extract_sample_entry(&short).is_none());
+        assert!(extract_audio_entry(&short).is_none());
         assert!(extract_audio_entry(&init_segment(&params())).is_none());
         let scanned = scan_segment(&[init.as_ref(), &f].concat()).unwrap();
         assert_eq!(scanned.frags.len(), 1);
@@ -1157,7 +1219,7 @@ fn find_box<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
         let b = found?;
         // full boxes (stsd) have a 4-byte version/flags + entry count before children
         cur = if i + 1 < path.len() {
-            if *want == b"stsd" { &b[16..] } else { &b[8..] }
+            if *want == b"stsd" { b.get(16..)? } else { b.get(8..)? }
         } else {
             b
         };

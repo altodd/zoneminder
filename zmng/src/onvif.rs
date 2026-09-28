@@ -131,9 +131,9 @@ pub fn xml_attrs<'a>(xml: &'a str, name: &str, attr: &str) -> Vec<(&'a str, &'a 
             if let Some(a) = open.find(&needle) {
                 let v = &open[a + needle.len()..];
                 if let Some(q) = v.find('"') {
-                    // element xml: from '<' to its closing tag (or self-closing)
+                    // element xml: from '<' to its closing tag; a self-closing tag ends at '>'
                     let close = format!("</{tag}>");
-                    let end = rest.find(&close).map(|c| c + close.len()).unwrap_or(gt + 1);
+                    let end = if open.ends_with('/') { gt + 1 } else { rest.find(&close).map(|c| c + close.len()).unwrap_or(gt + 1) };
                     out.push((&v[..q], &xml[start..start + 1 + end]));
                 }
             }
@@ -164,7 +164,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(user: &str, pass: &str) -> Result<Client> {
-        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(6)).build()?;
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(6)).redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(Client { http, user: user.to_string(), pass: pass.to_string() })
     }
 
@@ -172,7 +172,7 @@ impl Client {
         let env = envelope(&self.user, &self.pass, body);
         let res = self.http.post(url).header("Content-Type", "application/soap+xml; charset=utf-8").body(env).send().await.with_context(|| format!("POST {url}"))?;
         let status = res.status();
-        let text = res.text().await?;
+        let text = String::from_utf8_lossy(&read_capped(res, 1 << 20).await?).to_string();
         if let Some(fault) = xml_section(&text, "Fault") {
             let reason = xml_first(fault, "Text").or_else(|| xml_first(fault, "faultstring")).unwrap_or("SOAP fault");
             anyhow::bail!("{reason} (HTTP {status})");
@@ -241,13 +241,34 @@ impl Client {
     }
 }
 
-/// ONVIF credentials for a camera: its own, else the RTSP URL's.
+/// Read a response body with a hard size cap (cameras and detectors must
+/// never make the server buffer an arbitrary amount).
+pub async fn read_capped(res: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    use futures::StreamExt;
+    if res.content_length().is_some_and(|n| n as usize > max) {
+        anyhow::bail!("response too large");
+    }
+    let mut out = Vec::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > max {
+            anyhow::bail!("response too large");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// ONVIF credentials for a camera: its own, else the RTSP URL's (percent
+/// decoded, as the recorder does for RTSP).
 pub fn credentials(cam: &crate::db::Camera) -> (String, String) {
     if !cam.onvif_user.is_empty() {
         return (cam.onvif_user.clone(), cam.onvif_pass.clone());
     }
+    let dec = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string();
     match url::Url::parse(&cam.main_url) {
-        Ok(u) if !u.username().is_empty() => (u.username().to_string(), u.password().unwrap_or("").to_string()),
+        Ok(u) if !u.username().is_empty() => (dec(u.username()), dec(u.password().unwrap_or(""))),
         _ => (String::new(), String::new()),
     }
 }
@@ -293,6 +314,9 @@ mod tests {
         assert_eq!(p[0].0, "P1");
         assert!(!p[0].1.contains("PTZConfiguration"));
         assert!(p[1].1.contains("PTZConfiguration"));
+        // a self-closing profile does not swallow its PTZ sibling
+        let sc = xml_attrs("<r><trt:Profiles token=\"A\"/><trt:Profiles token=\"B\"><tt:PTZConfiguration/></trt:Profiles></r>", "Profiles", "token");
+        assert!(!sc[0].1.contains("PTZConfiguration") && sc[1].1.contains("PTZConfiguration"));
         assert!(xml_section(xml, "PTZConfiguration").unwrap().starts_with("<tt:PTZConfiguration"));
         assert_eq!(xml_first(xml, "Missing"), None);
         let caps = "<tt:Media><tt:XAddr>http://c/onvif/Media</tt:XAddr></tt:Media><tt:PTZ><tt:XAddr>http://c/onvif/PTZ</tt:XAddr></tt:PTZ>";
@@ -306,7 +330,7 @@ mod tests {
     fn credentials_fall_back_to_the_rtsp_url() {
         let mut cam = crate::db::Camera::example();
         cam.main_url = "rtsp://joe:pw%40x@10.0.0.9:554/s".into();
-        assert_eq!(credentials(&cam), ("joe".into(), "pw%40x".into()));
+        assert_eq!(credentials(&cam), ("joe".into(), "pw@x".into()));
         assert_eq!(default_device_url(&cam).as_deref(), Some("http://10.0.0.9/onvif/device_service"));
         cam.onvif_user = "onvif".into();
         cam.onvif_pass = "p".into();

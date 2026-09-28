@@ -163,7 +163,7 @@ pub struct ObjectDetector {
 
 impl ObjectDetector {
     pub fn new(cfg: ObjectsConfig) -> Result<ObjectDetector> {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100))).build()?;
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100))).redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(ObjectDetector { sem: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent.max(1))), cfg, client })
     }
 
@@ -185,7 +185,8 @@ impl ObjectDetector {
         if !res.status().is_success() {
             anyhow::bail!("detector returned {}", res.status());
         }
-        let v: serde_json::Value = res.json().await.context("detection response")?;
+        let body = crate::onvif::read_capped(res, 1 << 20).await.context("detection response")?;
+        let v: serde_json::Value = serde_json::from_slice(&body).context("detection response")?;
         if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
             anyhow::bail!("detector error: {}", v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
         }
@@ -205,8 +206,8 @@ pub struct ObjectGate {
     interval: i64,
     last_sent: i64,
     in_flight: bool,
-    tx: tokio::sync::mpsc::UnboundedSender<(i64, Result<Vec<DetectedObject>>)>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<(i64, Result<Vec<DetectedObject>>)>,
+    tx: tokio::sync::mpsc::UnboundedSender<(i64, Option<i64>, Result<Vec<DetectedObject>>)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(i64, Option<i64>, Result<Vec<DetectedObject>>)>,
 }
 
 impl ObjectGate {
@@ -233,9 +234,15 @@ impl ObjectGate {
         &self.labels
     }
 
+    /// A detection request is outstanding.
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
     /// Called with every motion-positive frame (yuv420p at `w`x`h`); sends a
-    /// detection when the interval allows and none is in flight.
-    pub fn maybe_send(&mut self, dts: i64, yuv: &[u8], w: usize, h: usize) -> bool {
+    /// detection when the interval allows and none is in flight. `event_id`
+    /// is the event open at send time so the result can be attributed.
+    pub fn maybe_send(&mut self, dts: i64, yuv: &[u8], w: usize, h: usize, event_id: Option<i64>) -> bool {
         if self.in_flight || dts - self.last_sent < self.interval {
             return false;
         }
@@ -247,18 +254,19 @@ impl ObjectGate {
         let (w, h) = (w as u32, h as u32);
         tokio::spawn(async move {
             let r = det.detect(jpeg, w, h).await;
-            let _ = tx.send((dts, r));
+            let _ = tx.send((dts, event_id, r));
         });
         true
     }
 
-    /// Filtered results that arrived since the last call (non-blocking).
-    pub fn poll(&mut self) -> Vec<(i64, Vec<DetectedObject>)> {
+    /// Filtered results that arrived since the last call (non-blocking):
+    /// (frame dts, event the frame was sent for, objects).
+    pub fn poll(&mut self) -> Vec<(i64, Option<i64>, Vec<DetectedObject>)> {
         let mut out = Vec::new();
-        while let Ok((dts, r)) = self.rx.try_recv() {
+        while let Ok((dts, sent_for, r)) = self.rx.try_recv() {
             self.in_flight = false;
             match r {
-                Ok(objs) => out.push((dts, filter(objs, &self.labels, self.det.cfg.min_confidence, &self.zones, &self.masks))),
+                Ok(objs) => out.push((dts, sent_for, filter(objs, &self.labels, self.det.cfg.min_confidence, &self.zones, &self.masks))),
                 Err(e) => warn!("object detection: {e:#}"),
             }
         }
