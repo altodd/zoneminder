@@ -1,4 +1,4 @@
-use zmng::{api, config, db, detect, import, notify, recorder, retention, tier};
+use zmng::{api, config, db, detect, health, import, notify, recorder, retention, tier};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -62,6 +62,26 @@ enum Cmd {
     },
     /// Re-adopt segment files that exist on disk but not in the index
     Reindex,
+    /// Pre-flight checks: ffmpeg, clock, database, storage volumes, cameras
+    Doctor {
+        /// Also open an RTSP session to every enabled camera
+        #[arg(long)]
+        cameras: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a consistent copy of the index (default: backup_dir or next to the db)
+    Backup {
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// Replace the index with a backup (stop the service first)
+    Restore {
+        file: PathBuf,
+        /// Required: confirms the service is stopped
+        #[arg(long)]
+        stopped: bool,
+    },
     /// Print storage usage
     Stats,
     /// Import ZoneMinder events (TSV export + files in place). See src/import.rs for the SQL.
@@ -152,6 +172,36 @@ fn main() -> Result<()> {
             println!("adopted {n} segment files");
             Ok(())
         }
+        Cmd::Doctor { cameras, json } => {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let checks = rt.block_on(health::doctor(&cfg, cameras));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&checks)?);
+            } else {
+                for c in &checks {
+                    println!("{:<5} {:<24} {}", format!("{:?}", c.verdict).to_uppercase(), c.name, c.detail);
+                }
+            }
+            if checks.iter().any(|c| c.verdict == health::Verdict::Fail) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Backup { to } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            let dest = to.unwrap_or_else(|| health::backup_path(&cfg));
+            health::backup(&db, &dest)?;
+            println!("index backed up to {}", dest.display());
+            Ok(())
+        }
+        Cmd::Restore { file, stopped } => {
+            if !stopped {
+                anyhow::bail!("stop the zmng service first, then re-run with --stopped");
+            }
+            health::restore(&file, &cfg.db_path)?;
+            println!("index restored from {} (previous copy kept as *.before-restore)", file.display());
+            Ok(())
+        }
         Cmd::Stats => {
             let db = db::Db::open(&cfg.db_path)?;
             for s in db.storages()? {
@@ -239,11 +289,12 @@ fn run(cfg: config::Config) -> Result<()> {
             let hub = hub.clone();
             let bus = bus.clone();
             let alert_after = cfg.alert_after_minutes as i64 * 60 * 90_000;
-            let db_path = cfg.db_path.clone();
+            let backup_to = health::backup_path(&cfg);
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 let mut down: std::collections::HashSet<i64> = std::collections::HashSet::new();
                 let mut last_backup = std::time::Instant::now();
+                let mut storage_low: std::collections::HashSet<i64> = std::collections::HashSet::new();
                 loop {
                     tick.tick().await;
                     // camera-down alerts (state transitions only)
@@ -273,8 +324,23 @@ fn run(cfg: config::Config) -> Result<()> {
                     }
                     if last_backup.elapsed() > std::time::Duration::from_secs(24 * 3600) {
                         last_backup = std::time::Instant::now();
-                        let (db2, p) = (db.clone(), db_path.clone());
-                        let _ = tokio::task::spawn_blocking(move || retention::backup_db(&db2, &p)).await;
+                        let (db2, p) = (db.clone(), backup_to.clone());
+                        match tokio::task::spawn_blocking(move || health::backup(&db2, &p)).await {
+                            Ok(Ok(())) => info!(path = %backup_to.display(), "index backup written"),
+                            Ok(Err(e)) => tracing::error!("index backup: {e:#}"),
+                            Err(e) => tracing::error!("index backup task: {e}"),
+                        }
+                    }
+                    // storage headroom alerts (state transitions only)
+                    for s in db.storages().unwrap_or_default() {
+                        let free = retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(u64::MAX);
+                        let low = free < s.reserve_bytes as u64;
+                        if low && storage_low.insert(s.id) {
+                            tracing::warn!(storage = s.id, path = %s.path, "free space under reserve");
+                            bus.publish(notify::Notification::StorageLow { storage_id: s.id, path: s.path.clone(), free_bytes: free, reserve_bytes: s.reserve_bytes as u64 });
+                        } else if !low {
+                            storage_low.remove(&s.id);
+                        }
                     }
                     if let Err(e) = recorder::reconcile(rctx.clone()).await {
                         tracing::error!("reconcile recorders: {e:#}");

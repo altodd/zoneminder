@@ -5,6 +5,7 @@
 //   #/camera/<id>[/t] one camera: full-res live, its timeline, scrub previews, Live button
 //   #/review          multi-camera synchronized playback with date/group/camera filters
 //   #/events          motion events, instant paging, thumbnails
+//   #/status          health: recording/detector state per camera, storage headroom, issues
 //   #/admin           cameras, users, storage/tiering
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -521,6 +522,36 @@ function openEvent(ev) {
 }
 
 // ---------------------------------------------------------------------------
+// Status: what a volunteer reads when something seems wrong
+// ---------------------------------------------------------------------------
+async function viewStatus(main) {
+  const render = async () => {
+    const s = await api.get('/api/status');
+    const ago = (ms) => ms ? fmtDur(Date.now() - ms) + ' ago' : '—';
+    const issues = s.issues.length ? h('div', { class: 'card issues' }, ...s.issues.map((i) => h('div', { class: 'issue ' + i.level }, h('b', {}, i.subject), ' ', i.text))) : h('div', { class: 'card ok' }, '✓ Everything is recording and detecting.');
+    const cams = h('table', {}, h('tr', {}, h('th', {}, 'Camera'), h('th', {}, 'Recording'), h('th', {}, 'Stream'), h('th', {}, 'Detector'), h('th', {}, 'Last event'), h('th', {}, 'Events 24 h'), h('th', {}, 'Ingest 24 h'), h('th', {}, 'Oldest footage'), h('th', {}, 'Reconnects')),
+      ...s.cameras.map((c) => h('tr', { onclick: () => { location.hash = `#/camera/${c.id}`; }, style: 'cursor:pointer' },
+        h('td', {}, c.name, c.enabled ? '' : h('span', { class: 'muted' }, ' (disabled)')),
+        h('td', {}, h('span', { class: 'pill ' + (c.recording ? 'ok' : 'bad') }, c.recording ? 'recording' : 'down'), c.last_error ? h('div', { class: 'muted small' }, c.last_error) : null),
+        h('td', {}, c.recording ? `${c.codec || ''} ${c.width}×${c.height} ${c.fps.toFixed(0)} fps ${(c.kbps / 1000).toFixed(1)} Mb/s` : ago(c.last_frame_ms), c.sub_recording === false ? h('div', { class: 'muted small' }, 'substream down') : null),
+        h('td', {}, h('span', { class: 'pill ' + (c.detect_running ? 'ok' : 'bad') }, c.detect_running ? `${c.detect_fps.toFixed(1)} fps` : 'stopped'), c.in_event ? ' MOTION' : ''),
+        h('td', {}, ago(c.last_event_ms)), h('td', {}, c.events_24h), h('td', {}, gb(c.ingest_24h)), h('td', {}, c.oldest_ms ? fmtDur(Date.now() - c.oldest_ms) : '—'), h('td', {}, c.reconnects))));
+    const stor = s.storages.length ? h('table', {}, h('tr', {}, h('th', {}, 'Volume'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Headroom'), h('th', {}, 'Ingest / day'), h('th', {}, 'Holds'), h('th', {}, 'Oldest')),
+      ...s.storages.map((v) => h('tr', {}, h('td', {}, h('code', {}, v.path), v.available ? '' : h('span', { class: 'pill bad' }, ' missing'), v.archive_to ? h('span', { class: 'muted small' }, ` → archive ${v.archive_to}`) : null),
+        h('td', {}, gb(v.used_bytes)), h('td', {}, gb(v.free_bytes)), h('td', {}, gb(v.headroom_bytes)), h('td', {}, gb(v.ingest_24h)),
+        h('td', {}, v.effective_days === null ? '—' : `${v.effective_days.toFixed(1)} days`), h('td', {}, v.oldest_ms ? fmtDur(Date.now() - v.oldest_ms) : '—')))) : null;
+    main.replaceChildren(
+      h('div', { class: 'toolbar' }, h('h2', {}, 'Status'), h('span', { class: 'muted' }, `zmng ${s.version} · up ${fmtDur(s.uptime_secs * 1000)} · load ${s.load.map((l) => l.toFixed(1)).join(' ')}`), h('span', { class: 'grow' }), h('button', { class: 'ghost small', onclick: render }, 'Refresh')),
+      issues,
+      h('div', { class: 'card' }, h('h2', {}, 'Cameras'), cams),
+      stor ? h('div', { class: 'card' }, h('h2', {}, 'Storage'), stor, h('p', { class: 'muted' }, '"Holds" is how many days of footage fit at the last 24 hours\' ingest rate before retention starts deleting. Prometheus: GET /api/metrics with an admin token.')) : null);
+  };
+  await render();
+  const t = setInterval(() => render().catch(() => {}), 30000);
+  state.cleanup = () => clearInterval(t);
+}
+
+// ---------------------------------------------------------------------------
 // Admin
 // ---------------------------------------------------------------------------
 async function viewAdmin(main) {
@@ -655,6 +686,7 @@ async function route() {
     else if (view === 'camera') await viewCamera(main, parts[1], parts[2] ? Number(parts[2]) : null);
     else if (view === 'review') await viewReview(main, parts[1] ? Number(parts[1]) : null);
     else if (view === 'events') await viewEvents(main);
+    else if (view === 'status') await viewStatus(main);
     else if (view === 'admin') await viewAdmin(main);
     else main.replaceChildren(h('p', { class: 'muted' }, 'Unknown view.'));
   } catch (e) { main.replaceChildren(h('p', { class: 'err' }, e.message)); }

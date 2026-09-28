@@ -6,6 +6,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod detect;
+pub mod health;
 pub mod import;
 pub mod mp4;
 pub mod notify;

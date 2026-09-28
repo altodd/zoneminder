@@ -34,6 +34,8 @@ pub struct App {
     /// Bounds concurrent on-demand ffmpeg decodes (snapshot/frame endpoints).
     pub decode_sem: Arc<tokio::sync::Semaphore>,
     pub bus: Arc<crate::notify::Bus>,
+    /// epoch milliseconds when this process started
+    pub started_ms: i64,
 }
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
@@ -946,6 +948,23 @@ async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthU
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping")).into_response())
 }
 
+/// Full status report (cameras, detectors, storage headroom, issues).
+async fn status(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let vis = visible_cameras(&app, u);
+    let admin = u.role == "admin";
+    let r = crate::health::report(&app.db, &app.hub, app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000, &vis, admin).map_err(err500)?;
+    Ok(Json(r).into_response())
+}
+
+/// Prometheus text format of the same report (admin token).
+async fn metrics(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+    let vis = visible_cameras(&app, u);
+    let r = crate::health::report(&app.db, &app.hub, app.started_ms, app.cfg.alert_after_minutes as i64 * 60_000, &vis, true).map_err(err500)?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::health::prometheus(&r)).into_response())
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true, "ts": TIMESCALE}))
 }
@@ -964,6 +983,7 @@ impl App {
             setup_token: Arc::new(new_token()[..12].to_string()),
             login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            started_ms: crate::db::now_dts() / 90,
         }
     }
 }
@@ -1002,6 +1022,8 @@ pub fn router(app: App) -> Router {
         .route("/api/storages", get(storages).post(storage_create))
         .route("/api/storages/{id}", axum::routing::patch(storage_update))
         .route("/api/stats", get(stats))
+        .route("/api/status", get(status))
+        .route("/api/metrics", get(metrics))
         .merge(crate::zmapi::router())
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw))
         .with_state(app);

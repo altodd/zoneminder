@@ -38,6 +38,15 @@ Detector test without a camera: `--sub-url "lavfi:testsrc=size=640x360:rate=5"`.
 
 `sudo deploy/install-ubuntu.sh` installs the binary, web files, a `zmng` user, `/etc/zmng/zmng.toml` and a systemd unit. See the script's output for the next steps.
 
+## Operating it
+
+```
+zmng doctor [--cameras]      # ffmpeg, clock, database integrity, volumes writable + free space, camera URLs (and an RTSP DESCRIBE per camera with --cameras); exit 1 on any FAIL
+zmng backup [--to FILE]      # consistent copy of the index (VACUUM INTO); the service also does this daily into backup_dir (put it on the other volume)
+zmng restore FILE --stopped  # replace the index with a backup after checking it; the old file is kept as *.before-restore
+```
+The **Status** page in the UI shows the same report as `GET /api/status`: recording/detector state and last event per camera, ingest per day, and for every volume how many days of footage fit at the current rate before retention deletes. Issues (camera down, detector stopped, volume missing or under its reserve, archive unreachable) are listed at the top; `camera_down`/`camera_up`/`storage_low` notifications go to the webhook/MQTT/SSE sinks on state changes.
+
 ## Import ZoneMinder events
 
 On the ZoneMinder host:
@@ -69,6 +78,8 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
 | `GET /api/events/stream` | server-sent events: `event_start`, `event_end`, `camera_down`, `camera_up`, `storage_low` |
+| `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
+| `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
 
 ## Notifications (Home Assistant, ntfy, the UI, zmNinjaNg)

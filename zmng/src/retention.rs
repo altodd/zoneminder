@@ -160,17 +160,10 @@ pub fn delete_camera_files(db: &Db, thumb_dir: &Path, camera_id: i64) -> Result<
     Ok(n)
 }
 
-/// Online backup of the index (`VACUUM INTO`), keeping one previous copy.
+/// Online backup of the index next to the database file (see `health::backup`).
 pub fn backup_db(db: &Db, db_path: &Path) -> Result<()> {
     let bak = db_path.with_extension("db.backup");
-    let prev = db_path.with_extension("db.backup.1");
-    if bak.exists() {
-        let _ = std::fs::rename(&bak, &prev);
-    }
-    db.with(|c| {
-        c.execute("VACUUM INTO ?1", [bak.to_string_lossy().as_ref()])?;
-        Ok(())
-    })?;
+    crate::health::backup(db, &bak)?;
     info!(path = %bak.display(), "index backup written");
     Ok(())
 }

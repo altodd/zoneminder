@@ -122,3 +122,10 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 .toast.motion { border-left-color: var(--accent2); }
 .toast.bad { border-left-color: var(--motion); }
 .toast.ok { border-left-color: var(--ok); }
+
+/* status page */
+.card.ok { color: var(--ok); margin-bottom: 12px; }
+.card.issues { margin-bottom: 12px; display: grid; gap: 4px; }
+.issue { padding: 4px 8px; border-left: 3px solid var(--accent2); }
+.issue.error { border-left-color: var(--motion); }
+.card + .card { margin-top: 12px; }

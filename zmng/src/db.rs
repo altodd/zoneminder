@@ -777,6 +777,54 @@ impl Db {
         })
     }
 
+    // ----- health queries (all index range scans / small group-bys) ------------
+
+    /// Bytes recorded since `dts` per (camera, storage), main + sub.
+    pub fn ingest_since(&self, dts: i64) -> Result<Vec<(i64, i64, i64)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT camera_id, storage_id, SUM(bytes) FROM segment WHERE start_dts>=?1 GROUP BY camera_id, storage_id")?;
+            let rows = st.query_map(params![dts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn last_event_per_camera(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT camera_id, MAX(start_dts) FROM event GROUP BY camera_id")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    pub fn event_counts_since(&self, dts: i64) -> Result<std::collections::HashMap<i64, i64>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT camera_id, COUNT(*) FROM event WHERE start_dts>=?1 GROUP BY camera_id")?;
+            let rows = st.query_map(params![dts], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    pub fn oldest_segment_per_camera(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT camera_id, MIN(start_dts) FROM segment WHERE stream='main' GROUP BY camera_id")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    pub fn oldest_segment_per_storage(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT storage_id, MIN(start_dts) FROM segment GROUP BY storage_id")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// `PRAGMA integrity_check` result ("ok" when healthy).
+    pub fn integrity_check(&self) -> Result<String> {
+        self.with(|c| Ok(c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?))
+    }
+
     // ----- events --------------------------------------------------------------
 
     pub fn insert_event(&self, camera_id: i64, start_dts: i64, kind: &str) -> Result<i64> {

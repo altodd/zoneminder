@@ -39,6 +39,9 @@ pub struct Config {
     pub alert_after_minutes: u32,
     /// MQTT broker for Home Assistant (motion/recording topics + discovery).
     pub mqtt: Option<crate::notify::MqttConfig>,
+    /// Where the daily index backup (VACUUM INTO) goes; ideally on the other
+    /// volume. Default: next to the database.
+    pub backup_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -58,6 +61,7 @@ impl Default for Config {
             alert_webhook: None,
             alert_after_minutes: 3,
             mqtt: None,
+            backup_dir: None,
         }
     }
 }
