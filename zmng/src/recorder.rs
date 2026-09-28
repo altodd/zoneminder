@@ -77,15 +77,41 @@ impl MotionLog {
     }
 }
 
-/// Shared handles for one camera.
+/// Which of a camera's two RTSP streams a recorder handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamKind {
+    Main,
+    Sub,
+}
+
+impl StreamKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamKind::Main => "main",
+            StreamKind::Sub => "sub",
+        }
+    }
+    pub fn parse(s: &str) -> Option<StreamKind> {
+        match s {
+            "main" => Some(StreamKind::Main),
+            "sub" => Some(StreamKind::Sub),
+            _ => None,
+        }
+    }
+}
+
+/// Shared handles for one recorder (one per camera stream).
 pub struct CamHandle {
+    pub kind: StreamKind,
     pub camera: RwLock<Camera>,
     pub status: RwLock<CamStatus>,
     pub live: broadcast::Sender<LiveFrag>,
     /// Most recent init segment + last few fragments so a new live viewer can
     /// start immediately from a keyframe.
     pub recent: RwLock<Option<Recent>>,
-    pub motion: MotionLog,
+    /// Shared between the main and sub recorder of a camera.
+    pub motion: Arc<MotionLog>,
     pub stop: tokio::sync::watch::Sender<bool>,
 }
 
@@ -96,15 +122,38 @@ pub struct Recent {
 }
 
 pub struct LiveHub {
+    /// main-stream recorders by camera id
     pub cams: RwLock<HashMap<i64, Arc<CamHandle>>>,
+    /// substream recorders by camera id (only when `record_sub` is on)
+    pub subs: RwLock<HashMap<i64, Arc<CamHandle>>>,
 }
 
 impl LiveHub {
     pub fn new() -> Self {
-        LiveHub { cams: RwLock::new(HashMap::new()) }
+        LiveHub { cams: RwLock::new(HashMap::new()), subs: RwLock::new(HashMap::new()) }
     }
     pub fn get(&self, id: i64) -> Option<Arc<CamHandle>> {
         self.cams.read().get(&id).cloned()
+    }
+    pub fn get_stream(&self, id: i64, kind: StreamKind) -> Option<Arc<CamHandle>> {
+        match kind {
+            StreamKind::Main => self.get(id),
+            StreamKind::Sub => self.subs.read().get(&id).cloned(),
+        }
+    }
+    pub fn all_handles(&self) -> Vec<Arc<CamHandle>> {
+        let mut v: Vec<_> = self.cams.read().values().cloned().collect();
+        v.extend(self.subs.read().values().cloned());
+        v
+    }
+    /// Stop and forget every recorder of a camera.
+    pub fn remove_camera(&self, id: i64) {
+        if let Some(h) = self.cams.write().remove(&id) {
+            let _ = h.stop.send(true);
+        }
+        if let Some(h) = self.subs.write().remove(&id) {
+            let _ = h.stop.send(true);
+        }
     }
 }
 
@@ -121,67 +170,92 @@ pub struct RecorderCtx {
     pub fsync: bool,
 }
 
-/// Spawn (or respawn) recorder tasks for every enabled camera.  Safe to call
-/// repeatedly: cameras already running are left alone, removed/disabled ones
-/// are stopped, changed URLs cause a restart.
+/// Spawn (or respawn) recorder tasks for every enabled camera and stream.
+/// Safe to call repeatedly: running recorders are left alone, removed or
+/// disabled ones are stopped, changed URLs cause a restart.
 pub async fn reconcile(ctx: Arc<RecorderCtx>) -> Result<()> {
     let cams = ctx.db.cameras()?;
-    let mut hub = ctx.hub.cams.write();
-    // stop removed or disabled
-    let keep: Vec<i64> = cams.iter().filter(|c| c.enabled).map(|c| c.id).collect();
-    let to_stop: Vec<i64> = hub.keys().filter(|id| !keep.contains(id)).copied().collect();
-    for id in to_stop {
-        if let Some(h) = hub.remove(&id) {
-            let _ = h.stop.send(true);
-            info!(camera = id, "stopping recorder");
-        }
+    let enabled: Vec<&Camera> = cams.iter().filter(|c| c.enabled).collect();
+    // motion logs are shared per camera; collect them before taking write locks
+    let mut motions: HashMap<i64, Arc<MotionLog>> = HashMap::new();
+    for h in ctx.hub.all_handles() {
+        motions.entry(h.camera.read().id).or_insert_with(|| h.motion.clone());
     }
-    for cam in cams.into_iter().filter(|c| c.enabled) {
-        if let Some(h) = hub.get(&cam.id) {
-            let changed = {
-                let cur = h.camera.read();
-                cur.main_url != cam.main_url || cur.storage_id != cam.storage_id
-            };
-            if changed {
+    for kind in [StreamKind::Main, StreamKind::Sub] {
+        let wanted: Vec<&Camera> = enabled
+            .iter()
+            .copied()
+            .filter(|c| kind == StreamKind::Main || (c.record_sub && c.sub_url.as_deref().map(|u| u.starts_with("rtsp")).unwrap_or(false)))
+            .collect();
+        let map = match kind {
+            StreamKind::Main => &ctx.hub.cams,
+            StreamKind::Sub => &ctx.hub.subs,
+        };
+        let mut hub = map.write();
+        let keep: Vec<i64> = wanted.iter().map(|c| c.id).collect();
+        for id in hub.keys().filter(|id| !keep.contains(id)).copied().collect::<Vec<_>>() {
+            if let Some(h) = hub.remove(&id) {
                 let _ = h.stop.send(true);
-                hub.remove(&cam.id);
-                info!(camera = cam.id, "restarting recorder (config changed)");
-            } else {
-                *h.camera.write() = cam.clone();
-                continue;
+                info!(camera = id, stream = kind.as_str(), "stopping recorder");
             }
         }
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let (live_tx, _) = broadcast::channel(64);
-        let handle = Arc::new(CamHandle {
-            camera: RwLock::new(cam.clone()),
-            status: RwLock::new(CamStatus::default()),
-            live: live_tx,
-            recent: RwLock::new(None),
-            motion: MotionLog::default(),
-            stop: stop_tx,
-        });
-        hub.insert(cam.id, handle.clone());
-        let ctx2 = ctx.clone();
-        tokio::spawn(async move {
-            // supervisor: a panic inside the recorder must not silently stop recording
-            loop {
-                let (c, h, s) = (ctx2.clone(), handle.clone(), stop_rx.clone());
-                let res = tokio::spawn(async move { run_camera(c, h, s).await }).await;
-                if *stop_rx.borrow() {
-                    return;
-                }
-                if let Err(e) = res {
-                    error!(camera = handle.camera.read().id, "recorder task panicked: {e}; restarting in 5 s");
-                    handle.status.write().last_error = Some(format!("panic: {e}"));
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+        for cam in wanted {
+            if let Some(h) = hub.get(&cam.id) {
+                let changed = {
+                    let cur = h.camera.read();
+                    stream_url(&cur, kind) != stream_url(cam, kind) || cur.storage_id != cam.storage_id
+                };
+                if changed {
+                    let _ = h.stop.send(true);
+                    hub.remove(&cam.id);
+                    info!(camera = cam.id, stream = kind.as_str(), "restarting recorder (config changed)");
                 } else {
-                    return;
+                    *h.camera.write() = cam.clone();
+                    continue;
                 }
             }
-        });
+            // the motion log is per camera and shared by both streams
+            let motion = motions.entry(cam.id).or_default().clone();
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let (live_tx, _) = broadcast::channel(64);
+            let handle = Arc::new(CamHandle {
+                kind,
+                camera: RwLock::new(cam.clone()),
+                status: RwLock::new(CamStatus::default()),
+                live: live_tx,
+                recent: RwLock::new(None),
+                motion,
+                stop: stop_tx,
+            });
+            hub.insert(cam.id, handle.clone());
+            let ctx2 = ctx.clone();
+            tokio::spawn(async move {
+                // supervisor: a panic inside the recorder must not silently stop recording
+                loop {
+                    let (c, h, s) = (ctx2.clone(), handle.clone(), stop_rx.clone());
+                    let res = tokio::spawn(async move { run_camera(c, h, s).await }).await;
+                    if *stop_rx.borrow() {
+                        return;
+                    }
+                    if let Err(e) = res {
+                        error!(camera = handle.camera.read().id, "recorder task panicked: {e}; restarting in 5 s");
+                        handle.status.write().last_error = Some(format!("panic: {e}"));
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        return;
+                    }
+                }
+            });
+        }
     }
     Ok(())
+}
+
+fn stream_url(cam: &Camera, kind: StreamKind) -> String {
+    match kind {
+        StreamKind::Main => cam.main_url.clone(),
+        StreamKind::Sub => cam.sub_url.clone().unwrap_or_default(),
+    }
 }
 
 async fn run_camera(ctx: Arc<RecorderCtx>, h: Arc<CamHandle>, mut stop: tokio::sync::watch::Receiver<bool>) {
@@ -258,7 +332,8 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     use retina::client::{PlayOptions, SessionOptions, SetupOptions, Transport};
     use retina::codec::CodecItem;
 
-    let url = url::Url::parse(&cam.main_url).context("bad main_url")?;
+    let kind = h.kind;
+    let url = url::Url::parse(&stream_url(cam, kind)).context("bad stream url")?;
     let creds = if !url.username().is_empty() {
         Some(retina::client::Credentials {
             username: url.username().to_string(),
@@ -290,14 +365,17 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
         .await
         .context("PLAY")?;
     let mut demuxed = playing.demuxed().context("demux")?;
-    info!(camera = cam.id, name = %cam.name, "connected");
+    info!(camera = cam.id, name = %cam.name, stream = kind.as_str(), "connected");
     {
         let mut st = h.status.write();
         st.connected = true;
         st.last_error = None;
     }
 
-    let cam_root = Path::new(&storage.path).join(cam.id.to_string());
+    let cam_root = match kind {
+        StreamKind::Main => Path::new(&storage.path).join(cam.id.to_string()),
+        StreamKind::Sub => Path::new(&storage.path).join(cam.id.to_string()).join("sub"),
+    };
     std::fs::create_dir_all(&cam_root)?;
 
     let mut params: Option<Arc<VideoParams>> = None;
@@ -357,7 +435,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
                 rfc6381: p.rfc6381_codec().to_string(),
             });
             if params.as_ref().map(|old| **old != *vp).unwrap_or(true) {
-                info!(camera = cam.id, codec = %codec, width = w, height = hgt, rfc6381 = %vp.rfc6381, "video parameters");
+                info!(camera = cam.id, stream = kind.as_str(), codec = %codec, width = w, height = hgt, rfc6381 = %vp.rfc6381, "video parameters");
                 // a codec change forces a new segment: flush what we have under the OLD sample entry
                 if seg.is_some() {
                     if let Some(prev) = pending.take() {
@@ -429,7 +507,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
             // The GOP that just ended becomes a fragment.
             if !gop.is_empty() {
                 if seg.is_none() {
-                    seg = Some(open_segment(&cam_root, storage, cam, &init, gop[0].dts)?);
+                    seg = Some(open_segment(&cam_root, storage, cam, kind, &init, gop[0].dts)?);
                 }
                 flush_gop(&mut gop, &mut seg, h)?;
                 let must_close = seg.as_ref().map(|s| dts - s.start_dts >= seg_len_dts).unwrap_or(false) || force_new_segment;
@@ -473,7 +551,7 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
             gop.push(Sample { dts: prev.dts, duration: dur, is_key: prev.is_key, data: prev.data });
         }
         if seg.is_none() && !gop.is_empty() {
-            if let Ok(s) = open_segment(&cam_root, storage, cam, &init, gop[0].dts) {
+            if let Ok(s) = open_segment(&cam_root, storage, cam, kind, &init, gop[0].dts) {
                 seg = Some(s);
             }
         }
@@ -487,7 +565,11 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     result
 }
 
-fn open_segment(cam_root: &Path, storage: &Storage, cam: &Camera, init: &Bytes, start_dts: i64) -> Result<OpenSegment> {
+fn open_segment(cam_root: &Path, storage: &Storage, cam: &Camera, kind: StreamKind, init: &Bytes, start_dts: i64) -> Result<OpenSegment> {
+    let prefix = match kind {
+        StreamKind::Main => cam.id.to_string(),
+        StreamKind::Sub => format!("{}/sub", cam.id),
+    };
     let secs = start_dts / TIMESCALE as i64;
     let t = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_default();
     let day = t.format("%Y%m%d").to_string();
@@ -495,7 +577,7 @@ fn open_segment(cam_root: &Path, storage: &Storage, cam: &Camera, init: &Bytes, 
     let dir = cam_root.join(&day);
     std::fs::create_dir_all(&dir)?;
     let mut abs = dir.join(&name);
-    let mut rel = format!("{}/{}/{}", cam.id, day, name);
+    let mut rel = format!("{}/{}/{}", prefix, day, name);
     let mut n = 0;
     let mut file = loop {
         match std::fs::OpenOptions::new().create_new(true).write(true).open(&abs) {
@@ -504,7 +586,7 @@ fn open_segment(cam_root: &Path, storage: &Storage, cam: &Camera, init: &Bytes, 
                 n += 1;
                 let alt = format!("{}-{}.mp4", t.format("%H%M%S"), n);
                 abs = dir.join(&alt);
-                rel = format!("{}/{}/{}", cam.id, day, alt);
+                rel = format!("{}/{}/{}", prefix, day, alt);
             }
             Err(e) => return Err(e.into()),
         }
@@ -583,7 +665,7 @@ async fn close_segment(
     for f in s.frags.iter_mut() {
         f.motion = f.motion.max(h.motion.max_in(f.dts, f.dts + f.duration as i64));
     }
-    let (ctx, cam, storage) = (ctx.clone(), cam.clone(), storage.clone());
+    let (ctx, cam, storage, kind) = (ctx.clone(), cam.clone(), storage.clone(), h.kind);
     tokio::task::spawn_blocking(move || -> Result<()> {
         if ctx.fsync {
             if let Err(e) = s.file.sync_data() {
@@ -595,7 +677,7 @@ async fn close_segment(
             let _ = std::fs::remove_file(&s.abs_path);
             return Ok(());
         }
-        let id = ctx.db.insert_segment(cam.id, storage.id, sample_entry_id, &s.rel_path, s.pos as i64, s.init_len, &s.frags)?;
+        let id = ctx.db.insert_segment_ext(cam.id, storage.id, sample_entry_id, &s.rel_path, s.pos as i64, s.init_len, &s.frags, 0, None, kind.as_str())?;
         let dur = s.frags.last().map(|f| f.dts + f.duration as i64).unwrap_or(s.start_dts) - s.start_dts;
         debug!(camera = cam.id, segment = id, path = %s.rel_path, secs = dur / TIMESCALE as i64, bytes = s.pos, frags = s.frags.len(), "closed segment");
         Ok(())

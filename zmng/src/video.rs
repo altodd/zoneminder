@@ -34,6 +34,9 @@ pub struct RangePlan {
     pub bytes: u64,
     /// false when legacy fragments are rewritten while streaming
     pub exact_len: bool,
+    /// added to every fragment's tfdt when served (0 = absolute time; set to
+    /// -first_dts to produce a self-contained file whose timeline starts at 0)
+    pub tfdt_shift: i64,
     pub first_dts: Option<i64>,
     pub last_end_dts: Option<i64>,
     pub mime: Option<String>,
@@ -46,7 +49,11 @@ pub enum RangeItem {
 
 /// Build the plan for a time range: which init segments and fragments to send.
 pub fn plan_range(db: &Db, camera_id: i64, start: i64, end: i64) -> Result<RangePlan> {
-    let segs = db.segments_in_range(camera_id, start, end)?;
+    plan_range_stream(db, camera_id, "main", start, end)
+}
+
+pub fn plan_range_stream(db: &Db, camera_id: i64, stream: &str, start: i64, end: i64) -> Result<RangePlan> {
+    let segs = db.segments_in_range_stream(camera_id, stream, start, end)?;
     let mut items = Vec::new();
     let mut bytes = 0u64;
     let mut cur_se: Option<i64> = None;
@@ -90,13 +97,14 @@ pub fn plan_range(db: &Db, camera_id: i64, start: i64, end: i64) -> Result<Range
             items.push(RangeItem::Frag { path: path.clone(), offset: f.offset, len: f.len, dts: f.dts, duration: f.duration, dts_offset: seg.dts_offset });
         }
     }
-    Ok(RangePlan { items, bytes, exact_len, first_dts: first, last_end_dts: last, mime })
+    Ok(RangePlan { items, bytes, exact_len, tfdt_shift: 0, first_dts: first, last_end_dts: last, mime })
 }
 
 /// Turn a plan into a byte stream, reading files on a blocking thread.
 pub fn stream_plan(plan: RangePlan) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> {
     let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(8);
     tokio::task::spawn_blocking(move || {
+        let shift = plan.tfdt_shift;
         let mut open: Option<(PathBuf, std::fs::File)> = None;
         for item in plan.items {
             let res = match item {
@@ -116,7 +124,7 @@ pub fn stream_plan(plan: RangePlan) -> impl Stream<Item = std::result::Result<By
                     let mut buf = vec![0u8; len as usize];
                     f.seek(SeekFrom::Start(offset))
                         .and_then(|_| f.read_exact(&mut buf))
-                        .map(|_| Bytes::from(crate::mp4::rebase_fragment(&buf, dts_offset)))
+                        .map(|_| Bytes::from(crate::mp4::rebase_fragment(&buf, dts_offset + shift)))
                 }
             };
             let stop = res.is_err();
@@ -137,13 +145,14 @@ fn tokio_stream_from_rx<T>(mut rx: mpsc::Receiver<T>) -> impl Stream<Item = T> {
 pub fn hls_playlist(
     db: &Db,
     camera_id: i64,
+    stream: &str,
     start: i64,
     end: i64,
     seg_url: impl Fn(i64) -> String,
     frag_url: impl Fn(i64, usize) -> String,
     init_url: impl Fn(i64) -> String,
 ) -> Result<String> {
-    let segs = db.segments_in_range(camera_id, start, end)?;
+    let segs = db.segments_in_range_stream(camera_id, stream, start, end)?;
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     let mut target = 1.0f64;
     let mut body = String::new();

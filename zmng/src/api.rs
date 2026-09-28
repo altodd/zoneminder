@@ -43,12 +43,12 @@ pub struct LoginGuard {
 }
 const MAX_FAILS: usize = 10;
 impl LoginGuard {
-    fn allowed(&mut self) -> bool {
+    pub fn allowed(&mut self) -> bool {
         let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(60);
         self.fails.retain(|t| *t > cutoff);
         self.fails.len() < MAX_FAILS
     }
-    fn record_failure(&mut self) {
+    pub fn record_failure(&mut self) {
         self.fails.push(std::time::Instant::now());
     }
 }
@@ -67,11 +67,57 @@ pub fn hash_password(pw: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
+pub fn verify_password_pub(pw: &str, hash: &str) -> bool {
+    verify_password(pw, hash)
+}
+pub fn hash_password_dummy() {
+    let _ = hash_password("x");
+}
+pub fn visible_cameras_pub(app: &App, u: &User) -> Vec<i64> {
+    visible_cameras(app, u)
+}
+pub fn parse_range_pub(v: &str) -> Option<(u64, Option<u64>)> {
+    parse_range(v)
+}
+/// JPEG of the keyframe nearest `dts` (recorded) or the latest live keyframe.
+pub async fn frame_jpeg_pub(app: &App, cam: i64, dts: i64, width: u32) -> Result<Response, Response> {
+    let now = crate::db::now_dts();
+    let (init, data) = if dts >= now - 5 * crate::mp4::TIMESCALE as i64 {
+        let h = app.hub.get(cam).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
+        let r = h.recent.read();
+        let r = r.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
+        let f = r.frags.back().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
+        (r.init.to_vec(), f.2.to_vec())
+    } else {
+        let segs = app.db.segments_in_range(cam, dts, dts + 1).map_err(err500)?;
+        let seg = segs.first().ok_or_else(|| (StatusCode::NOT_FOUND, "no recording at that time").into_response())?;
+        let frag = seg.index.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64).or_else(|| seg.index.first()).copied().ok_or_else(|| err500("empty segment"))?;
+        let storage = app.db.storage(seg.storage_id).map_err(err500)?.ok_or_else(|| err500("storage missing"))?;
+        let path = std::path::PathBuf::from(&storage.path).join(&seg.path);
+        let (init_len, off) = (seg.init_len, seg.dts_offset);
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>)> {
+            let d = crate::thumbs::read_range(&path, frag.offset, frag.len)?;
+            Ok((crate::thumbs::read_range(&path, 0, init_len)?, crate::mp4::rebase_fragment(&d, off)))
+        })
+        .await
+        .map_err(err500)?
+        .map_err(err500)?
+    };
+    let _permit = app.decode_sem.acquire().await.map_err(err500)?;
+    let jpeg = crate::thumbs::frag_to_jpeg(&app.cfg.ffmpeg, &init, &data, width.min(3840), 5).await.map_err(err500)?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=5")], jpeg).into_response())
+}
+
 fn verify_password(pw: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     PasswordHash::new(hash)
         .map(|h| argon2::Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
         .unwrap_or(false)
+}
+
+fn token_from_query(uri: &axum::http::Uri) -> Option<String> {
+    let q = uri.query()?;
+    url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()).filter(|v| !v.is_empty())
 }
 
 fn token_from(headers: &HeaderMap) -> Option<String> {
@@ -97,8 +143,10 @@ fn token_from(headers: &HeaderMap) -> Option<String> {
 /// create the first account.
 async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    let public = path == "/api/login" || path == "/api/setup" || path == "/api/health" || !path.starts_with("/api/");
-    let user = match token_from(req.headers()) {
+    let public = path == "/api/login" || path == "/api/setup" || path == "/api/health"
+        || path == "/zm/api/host/getVersion.json" || path == "/zm/api/host/login.json"
+        || !(path.starts_with("/api/") || path.starts_with("/zm/"));
+    let user = match token_from(req.headers()).or_else(|| token_from_query(req.uri())) {
         Some(t) => app.db.session_user(&t).ok().flatten(),
         None => None,
     };
@@ -243,7 +291,7 @@ async fn me(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> 
     .into_response())
 }
 
-fn new_token() -> String {
+pub fn new_token() -> String {
     let bytes: [u8; 32] = rand::random();
     hex::encode(bytes)
 }
@@ -257,11 +305,13 @@ struct CameraOut {
     #[serde(flatten)]
     camera: crate::db::Camera,
     status: crate::recorder::CamStatus,
+    sub_status: Option<crate::recorder::CamStatus>,
     detect: Option<crate::detect::DetectStatus>,
 }
 
 fn camera_out(app: &App, c: crate::db::Camera, admin: bool) -> CameraOut {
     let status = app.hub.get(c.id).map(|h| h.status.read().clone()).unwrap_or_default();
+    let sub_status = app.hub.get_stream(c.id, crate::recorder::StreamKind::Sub).map(|h| h.status.read().clone());
     let detect = crate::detect::status(c.id);
     let mut c = c;
     if !admin || app.db.user_count().unwrap_or(1) == 0 {
@@ -269,7 +319,7 @@ fn camera_out(app: &App, c: crate::db::Camera, admin: bool) -> CameraOut {
         c.main_url = String::new();
         c.sub_url = None;
     }
-    CameraOut { camera: c, status, detect }
+    CameraOut { camera: c, status, sub_status, detect }
 }
 
 async fn cameras(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -327,9 +377,7 @@ async fn camera_delete(State(app): State<App>, Path(id): Path<i64>, user: Option
     require_admin(user.as_ref().map(|e| &e.0))?;
     // stop recording first so no new files appear while we delete
     app.db.update_camera(id, &serde_json::json!({"enabled": false}).as_object().unwrap().clone()).map_err(bad)?;
-    if let Some(h) = app.hub.cams.write().remove(&id) {
-        let _ = h.stop.send(true);
-    }
+    app.hub.remove_camera(id);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let (db, td) = (app.db.clone(), app.cfg.thumb_dir.clone());
     tokio::task::spawn_blocking(move || crate::retention::delete_camera_files(&db, &td, id)).await.map_err(err500)?.map_err(err500)?;
@@ -516,6 +564,16 @@ async fn event_thumb(State(app): State<App>, Path(id): Path<i64>, user: Option<a
 struct VideoQ {
     start: i64,
     end: i64,
+    /// "main" (default) or "sub"
+    stream: Option<String>,
+}
+
+fn stream_of(q: &Option<String>) -> Result<crate::recorder::StreamKind, Response> {
+    match q.as_deref() {
+        None | Some("main") => Ok(crate::recorder::StreamKind::Main),
+        Some("sub") => Ok(crate::recorder::StreamKind::Sub),
+        _ => Err(bad("stream must be main or sub")),
+    }
 }
 
 async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<VideoQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -524,7 +582,8 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
     if q.end <= q.start || q.end - q.start > 6 * 3600 * 1000 {
         return Err(bad("range must be 0 < end-start <= 6h"));
     }
-    let plan = video::plan_range(&app.db, id, video::ms_to_dts(q.start), video::ms_to_dts(q.end)).map_err(err500)?;
+    let kind = stream_of(&q.stream)?;
+    let plan = video::plan_range_stream(&app.db, id, kind.as_str(), video::ms_to_dts(q.start), video::ms_to_dts(q.end)).map_err(err500)?;
     if plan.items.is_empty() {
         return Err((StatusCode::NOT_FOUND, "no recording in range").into_response());
     }
@@ -550,9 +609,11 @@ async fn video_hls(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<
     if q.end <= q.start || q.end - q.start > 24 * 3600 * 1000 {
         return Err(bad("range must be 0 < end-start <= 24h"));
     }
+    let kind = stream_of(&q.stream)?;
     let m3u8 = video::hls_playlist(
         &app.db,
         id,
+        kind.as_str(),
         video::ms_to_dts(q.start),
         video::ms_to_dts(q.end),
         |sid| format!("/api/segments/{sid}/file.mp4"),
@@ -641,10 +702,16 @@ fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-async fn live(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+#[derive(Deserialize)]
+struct StreamQ {
+    stream: Option<String>,
+}
+
+async fn live(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<StreamQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
-    let h = app.hub.get(id).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
+    let kind = stream_of(&q.stream)?;
+    let h = app.hub.get_stream(id, kind).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "stream not running").into_response())?;
     let (mime, first_ms) = {
         let r = h.recent.read();
         (
@@ -791,9 +858,35 @@ async fn storages(State(app): State<App>, user: Option<axum::Extension<AuthUser>
     for s in app.db.storages().map_err(err500)? {
         let used = app.db.storage_used_bytes(s.id).unwrap_or(0);
         let free = crate::retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(0);
-        out.push(serde_json::json!({"id": s.id, "path": s.path, "max_bytes": s.max_bytes, "reserve_bytes": s.reserve_bytes, "used_bytes": used, "free_bytes": free}));
+        out.push(serde_json::json!({"id": s.id, "path": s.path, "max_bytes": s.max_bytes, "reserve_bytes": s.reserve_bytes, "used_bytes": used, "free_bytes": free,
+            "archive_to": s.archive_to, "archive_after_days": s.archive_after_days, "archive_rate_mbps": s.archive_rate_mbps, "available": std::path::Path::new(&s.path).is_dir()}));
     }
     Ok(Json(out).into_response())
+}
+
+async fn storage_update(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(patch): Json<serde_json::Map<String, serde_json::Value>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    app.db.update_storage(id, &patch).map_err(bad)?;
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+#[derive(Deserialize)]
+struct StorageCreate {
+    path: String,
+    max_gb: Option<f64>,
+    reserve_gb: Option<f64>,
+}
+
+async fn storage_create(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<StorageCreate>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    if !std::path::Path::new(&req.path).is_dir() {
+        return Err(bad("path must be an existing directory"));
+    }
+    let id = app
+        .db
+        .add_storage(&req.path, req.max_gb.map(|g| (g * 1e9) as i64), (req.reserve_gb.unwrap_or(50.0) * 1e9) as i64)
+        .map_err(bad)?;
+    Ok(Json(serde_json::json!({"id": id})).into_response())
 }
 
 async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -803,7 +896,8 @@ async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
     let mut cams = Vec::new();
     for id in vis {
         if let Some(h) = app.hub.get(id) {
-            cams.push(serde_json::json!({"id": id, "status": h.status.read().clone(), "detect": crate::detect::status(id)}));
+            let sub = app.hub.get_stream(id, crate::recorder::StreamKind::Sub).map(|s| s.status.read().clone());
+            cams.push(serde_json::json!({"id": id, "status": h.status.read().clone(), "sub_status": sub, "detect": crate::detect::status(id)}));
         }
     }
     Ok(Json(serde_json::json!({"earliest_ms": earliest, "now_ms": crate::db::now_dts() / 90, "cameras": cams})).into_response())
@@ -856,8 +950,10 @@ pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>) -> Result<()> {
         .route("/api/tokens", post(create_token))
         .route("/api/users", get(users).post(user_create))
         .route("/api/users/{id}", axum::routing::patch(user_update).delete(user_delete))
-        .route("/api/storages", get(storages))
+        .route("/api/storages", get(storages).post(storage_create))
+        .route("/api/storages/{id}", axum::routing::patch(storage_update))
         .route("/api/stats", get(stats))
+        .merge(crate::zmapi::router())
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw))
         .with_state(app);
 

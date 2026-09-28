@@ -145,7 +145,7 @@ fn import_one(
     if opts.dry_run {
         return Ok(bytes);
     }
-    db.insert_segment_ext(cam_id, opts.storage_id, se, rel, bytes as i64, scanned.init_len, &frags, offset, Some(eid))?;
+    db.insert_segment_ext(cam_id, opts.storage_id, se, rel, bytes as i64, scanned.init_len, &frags, offset, Some(eid), "main")?;
 
     // the ZoneMinder event becomes an event row (motion if it had alarm frames, else a marker)
     let end_dts = if end_s > start_s { end_s * TIMESCALE as i64 } else { frags.last().map(|f| f.dts + f.duration as i64).unwrap_or(start_dts) };

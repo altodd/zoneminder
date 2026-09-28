@@ -21,7 +21,12 @@ CREATE TABLE IF NOT EXISTS storage (
   -- hard cap on bytes of segments kept on this storage (NULL = use free-space reserve only)
   max_bytes     INTEGER,
   -- always keep at least this many bytes free on the filesystem
-  reserve_bytes INTEGER NOT NULL DEFAULT 21474836480
+  reserve_bytes INTEGER NOT NULL DEFAULT 21474836480,
+  -- tiering: move segments older than archive_after_days (or under space
+  -- pressure) to this storage, oldest first, rate limited; NULL = never
+  archive_to          INTEGER REFERENCES storage(id),
+  archive_after_days  REAL,
+  archive_rate_mbps   INTEGER NOT NULL DEFAULT 40
 );
 
 CREATE TABLE IF NOT EXISTS camera (
@@ -47,6 +52,10 @@ CREATE TABLE IF NOT EXISTS camera (
   -- JSON: [[[x,y],...], ...] polygons in 0..1 to ignore (privacy / swaying trees)
   masks_json       TEXT NOT NULL DEFAULT '[]',
   sort_order       INTEGER NOT NULL DEFAULT 0,
+  -- also record the substream (multi-camera review, non-HEVC clients)
+  record_sub       INTEGER NOT NULL DEFAULT 1,
+  -- segments overlapping an event are kept this long (0 = same as retention_days)
+  event_retention_days REAL NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL
 );
 
@@ -78,9 +87,12 @@ CREATE TABLE IF NOT EXISTS segment (
   dts_offset       INTEGER NOT NULL DEFAULT 0,
   -- provenance for imported ZoneMinder events
   zm_event_id      INTEGER,
+  -- 'main' (full resolution) or 'sub' (substream recording)
+  stream           TEXT NOT NULL DEFAULT 'main',
   created_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS segment_cam_start ON segment(camera_id, start_dts);
+CREATE INDEX IF NOT EXISTS segment_cam_stream_start ON segment(camera_id, stream, start_dts);
 CREATE INDEX IF NOT EXISTS segment_cam_end   ON segment(camera_id, end_dts);
 CREATE INDEX IF NOT EXISTS segment_storage   ON segment(storage_id, start_dts);
 
@@ -114,6 +126,19 @@ CREATE TABLE IF NOT EXISTS user_camera (
   camera_id INTEGER NOT NULL REFERENCES camera(id) ON DELETE CASCADE,
   PRIMARY KEY (user_id, camera_id)
 );
+CREATE TABLE IF NOT EXISTS push_token (
+  id           INTEGER PRIMARY KEY,
+  user_id      INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+  token        TEXT NOT NULL UNIQUE,
+  platform     TEXT NOT NULL DEFAULT '',
+  monitor_list TEXT NOT NULL DEFAULT '',
+  interval     INTEGER NOT NULL DEFAULT 0,
+  push_state   TEXT NOT NULL DEFAULT 'enabled',
+  app_version  TEXT NOT NULL DEFAULT '',
+  profile      TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session (
   token      TEXT PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -141,7 +166,8 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
                 anyhow::bail!("sub_url must be a string or null");
             }
         }
-        "enabled" => {
+        "event_retention_days" => num(0.0, 3650.0)?,
+        "enabled" | "record_sub" => {
             if !(v.is_boolean() || v.as_i64().map(|i| i == 0 || i == 1).unwrap_or(false)) {
                 anyhow::bail!("enabled must be true/false");
             }
@@ -176,6 +202,15 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has_col("segment", "zm_event_id")? {
         c.execute_batch("ALTER TABLE segment ADD COLUMN zm_event_id INTEGER;")?;
     }
+    if !has_col("segment", "stream")? {
+        c.execute_batch("ALTER TABLE segment ADD COLUMN stream TEXT NOT NULL DEFAULT 'main'; CREATE INDEX IF NOT EXISTS segment_cam_stream_start ON segment(camera_id, stream, start_dts);")?;
+    }
+    if !has_col("storage", "archive_to")? {
+        c.execute_batch("ALTER TABLE storage ADD COLUMN archive_to INTEGER REFERENCES storage(id); ALTER TABLE storage ADD COLUMN archive_after_days REAL; ALTER TABLE storage ADD COLUMN archive_rate_mbps INTEGER NOT NULL DEFAULT 40;")?;
+    }
+    if !has_col("camera", "record_sub")? {
+        c.execute_batch("ALTER TABLE camera ADD COLUMN record_sub INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN event_retention_days REAL NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 
@@ -190,6 +225,9 @@ pub struct Storage {
     pub path: String,
     pub max_bytes: Option<i64>,
     pub reserve_bytes: i64,
+    pub archive_to: Option<i64>,
+    pub archive_after_days: Option<f64>,
+    pub archive_rate_mbps: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +251,8 @@ pub struct Camera {
     pub zones_json: String,
     pub masks_json: String,
     pub sort_order: i64,
+    pub record_sub: bool,
+    pub event_retention_days: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,6 +281,7 @@ pub struct Segment {
     pub motion_max: u8,
     pub dts_offset: i64,
     pub zm_event_id: Option<i64>,
+    pub stream: String,
     #[serde(skip)]
     pub index: Vec<FragEntry>,
 }
@@ -308,9 +349,17 @@ impl Db {
 
     pub fn storages(&self) -> Result<Vec<Storage>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id,path,max_bytes,reserve_bytes FROM storage ORDER BY id")?;
+            let mut st = c.prepare("SELECT id,path,max_bytes,reserve_bytes,archive_to,archive_after_days,archive_rate_mbps FROM storage ORDER BY id")?;
             let rows = st.query_map([], |r| {
-                Ok(Storage { id: r.get(0)?, path: r.get(1)?, max_bytes: r.get(2)?, reserve_bytes: r.get(3)? })
+                Ok(Storage {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    max_bytes: r.get(2)?,
+                    reserve_bytes: r.get(3)?,
+                    archive_to: r.get(4)?,
+                    archive_after_days: r.get(5)?,
+                    archive_rate_mbps: r.get(6)?,
+                })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
@@ -327,6 +376,62 @@ impl Db {
                 params![path, max_bytes, reserve_bytes],
             )?;
             Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn update_storage(&self, id: i64, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        self.with(|c| {
+            for (k, v) in patch {
+                let sql = match k.as_str() {
+                    "max_bytes" | "reserve_bytes" | "archive_to" | "archive_after_days" | "archive_rate_mbps" => format!("UPDATE storage SET {k}=?1 WHERE id=?2"),
+                    _ => anyhow::bail!("field {k} is not updatable"),
+                };
+                let val: rusqlite::types::Value = match v {
+                    serde_json::Value::Null => rusqlite::types::Value::Null,
+                    serde_json::Value::Number(n) => n.as_i64().map(rusqlite::types::Value::Integer).unwrap_or_else(|| rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.0))),
+                    _ => anyhow::bail!("{k} must be a number or null"),
+                };
+                if k == "archive_to" {
+                    if let rusqlite::types::Value::Integer(t) = val {
+                        if t == id {
+                            anyhow::bail!("a storage cannot archive to itself");
+                        }
+                    }
+                }
+                c.execute(&sql, params![val, id])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Move a segment's index row to another storage (file already copied to
+    /// the same relative path there).
+    pub fn move_segment(&self, id: i64, storage_id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE segment SET storage_id=?1 WHERE id=?2", params![storage_id, id])?;
+            Ok(())
+        })
+    }
+
+    /// Oldest segments on a storage older than `before_dts` (for archiving).
+    pub fn archive_candidates(&self, storage_id: i64, before_dts: i64, limit: usize) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 AND end_dts<?2 ORDER BY start_dts LIMIT ?3")?;
+            let rows = st.query_map(params![storage_id, before_dts, limit as i64], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// True if any event overlaps the segment and is archived or ended after `event_cutoff`.
+    pub fn segment_pinned(&self, seg: &Segment, event_cutoff: i64) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 AND (archived=1 OR end_dts>?4) LIMIT 1",
+                params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
         })
     }
 
@@ -363,6 +468,8 @@ impl Db {
             zones_json: r.get("zones_json")?,
             masks_json: r.get("masks_json")?,
             sort_order: r.get("sort_order")?,
+            record_sub: r.get::<_, i64>("record_sub")? != 0,
+            event_retention_days: r.get("event_retention_days")?,
         })
     }
 
@@ -396,6 +503,7 @@ impl Db {
             "name", "main_url", "sub_url", "enabled", "storage_id", "retention_days", "detect_fps",
             "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
             "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
+            "record_sub", "event_retention_days",
         ];
         self.with(|c| {
             for (k, v) in patch {
@@ -507,7 +615,7 @@ impl Db {
         init_len: u32,
         index: &[FragEntry],
     ) -> Result<i64> {
-        self.insert_segment_ext(camera_id, storage_id, sample_entry_id, path, bytes, init_len, index, 0, None)
+        self.insert_segment_ext(camera_id, storage_id, sample_entry_id, path, bytes, init_len, index, 0, None, "main")
     }
 
     /// `index` must already carry absolute dts values; `dts_offset` is what
@@ -524,6 +632,7 @@ impl Db {
         index: &[FragEntry],
         dts_offset: i64,
         zm_event_id: Option<i64>,
+        stream: &str,
     ) -> Result<i64> {
         let start = index.first().map(|f| f.dts).unwrap_or(0);
         let end = index.last().map(|f| f.dts + f.duration as i64).unwrap_or(start);
@@ -531,9 +640,9 @@ impl Db {
         let motion_max = index.iter().map(|f| f.motion).max().unwrap_or(0);
         self.with(|c| {
             c.execute(
-                "INSERT INTO segment(camera_id,storage_id,sample_entry_id,start_dts,end_dts,path,bytes,init_len,frames,motion_max,index_blob,dts_offset,zm_event_id,created_at) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![camera_id, storage_id, sample_entry_id, start, end, path, bytes, init_len, frames, motion_max, mp4::encode_index(index), dts_offset, zm_event_id, now_secs()],
+                "INSERT INTO segment(camera_id,storage_id,sample_entry_id,start_dts,end_dts,path,bytes,init_len,frames,motion_max,index_blob,dts_offset,zm_event_id,stream,created_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![camera_id, storage_id, sample_entry_id, start, end, path, bytes, init_len, frames, motion_max, mp4::encode_index(index), dts_offset, zm_event_id, stream, now_secs()],
             )?;
             Ok(c.last_insert_rowid())
         })
@@ -573,17 +682,22 @@ impl Db {
             motion_max: r.get::<_, i64>("motion_max")? as u8,
             dts_offset: r.get("dts_offset")?,
             zm_event_id: r.get("zm_event_id")?,
+            stream: r.get("stream")?,
             index: mp4::decode_index(&blob),
         })
     }
 
-    /// Segments of a camera overlapping [start, end).
+    /// Main-stream segments of a camera overlapping [start, end).
     pub fn segments_in_range(&self, camera_id: i64, start: i64, end: i64) -> Result<Vec<Segment>> {
+        self.segments_in_range_stream(camera_id, "main", start, end)
+    }
+
+    pub fn segments_in_range_stream(&self, camera_id: i64, stream: &str, start: i64, end: i64) -> Result<Vec<Segment>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT * FROM segment WHERE camera_id=?1 AND end_dts>?2 AND start_dts<?3 ORDER BY start_dts",
+                "SELECT * FROM segment WHERE camera_id=?1 AND stream=?2 AND end_dts>?3 AND start_dts<?4 ORDER BY start_dts",
             )?;
-            let rows = st.query_map(params![camera_id, start, end], Self::row_segment)?;
+            let rows = st.query_map(params![camera_id, stream, start, end], Self::row_segment)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -642,8 +756,8 @@ impl Db {
     pub fn earliest_segment_dts(&self, camera_id: Option<i64>) -> Result<Option<i64>> {
         self.with(|c| {
             let v: Option<i64> = match camera_id {
-                Some(id) => c.query_row("SELECT MIN(start_dts) FROM segment WHERE camera_id=?1", params![id], |r| r.get(0))?,
-                None => c.query_row("SELECT MIN(start_dts) FROM segment", [], |r| r.get(0))?,
+                Some(id) => c.query_row("SELECT MIN(start_dts) FROM segment WHERE camera_id=?1 AND stream='main'", params![id], |r| r.get(0))?,
+                None => c.query_row("SELECT MIN(start_dts) FROM segment WHERE stream='main'", [], |r| r.get(0))?,
             };
             Ok(v)
         })
@@ -810,6 +924,82 @@ impl Db {
                 "UPDATE event SET end_dts=COALESCE(peak_dts,start_dts)+90000*5 WHERE end_dts IS NULL",
                 [],
             )?)
+        })
+    }
+
+    /// Offset-paged event query for the ZoneMinder-compatible API.
+    pub fn events_page(&self, cameras: &[i64], f: &crate::zmapi::EventFilter, page: usize, limit: usize, asc: bool) -> Result<(Vec<Event>, usize)> {
+        if cameras.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let mut wh = format!("end_dts IS NOT NULL AND camera_id IN ({})", cameras.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","));
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(v) = f.start_ge { args.push(v.into()); wh.push_str(&format!(" AND start_dts>=?{}", args.len())); }
+        if let Some(v) = f.start_le { args.push(v.into()); wh.push_str(&format!(" AND start_dts<=?{}", args.len())); }
+        if let Some(v) = f.end_le { args.push(v.into()); wh.push_str(&format!(" AND end_dts<=?{}", args.len())); }
+        if f.min_score > 0 { args.push((f.min_score as i64).into()); wh.push_str(&format!(" AND score>=?{}", args.len())); }
+        if let Some(a) = f.archived { args.push((a as i64).into()); wh.push_str(&format!(" AND archived=?{}", args.len())); }
+        if !f.ids.is_empty() { wh.push_str(&format!(" AND id IN ({})", f.ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","))); }
+        if let Some(re) = &f.notes_re { args.push(format!("%{}%", re.replace("detected:", "")).into()); wh.push_str(&format!(" AND (COALESCE(notes,'') LIKE ?{n} OR kind LIKE ?{n})", n = args.len())); }
+        self.with(|c| {
+            let total: i64 = c.query_row(&format!("SELECT COUNT(*) FROM event WHERE {wh}"), rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+            let sql = format!(
+                "SELECT * FROM event WHERE {wh} ORDER BY start_dts {}, id {} LIMIT {} OFFSET {}",
+                if asc { "ASC" } else { "DESC" }, if asc { "ASC" } else { "DESC" }, limit, (page - 1) * limit
+            );
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(args.iter()), Self::row_event)?;
+            Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, total as usize))
+        })
+    }
+
+    // ----- push tokens (zmNinjaNg direct notifications) -------------------------
+
+    pub fn push_tokens(&self, user_id: i64) -> Result<Vec<serde_json::Value>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id,token,platform,monitor_list,interval,push_state,app_version,profile,created_at,updated_at FROM push_token WHERE user_id=?1 ORDER BY id")?;
+            let rows = st.query_map(params![user_id], |r| {
+                Ok(serde_json::json!({
+                    "Id": r.get::<_, i64>(0)?.to_string(), "UserId": user_id.to_string(), "Token": r.get::<_, String>(1)?,
+                    "Platform": r.get::<_, String>(2)?, "MonitorList": r.get::<_, String>(3)?, "Interval": r.get::<_, i64>(4)?.to_string(),
+                    "PushState": r.get::<_, String>(5)?, "AppVersion": r.get::<_, String>(6)?, "Profile": r.get::<_, String>(7)?,
+                    "BadgeCount": "0", "LastNotifiedAt": null, "CreatedOn": r.get::<_, i64>(8)?.to_string(), "UpdatedOn": r.get::<_, i64>(9)?.to_string()
+                }))
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_push_token(&self, user_id: i64, token: &str, platform: &str, monitor_list: &str, interval: i64, push_state: &str, app_version: &str, profile: &str) -> Result<i64> {
+        if token.is_empty() {
+            anyhow::bail!("token required");
+        }
+        self.with(|c| {
+            let now = now_secs();
+            c.execute(
+                "INSERT INTO push_token(user_id,token,platform,monitor_list,interval,push_state,app_version,profile,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9) \
+                 ON CONFLICT(token) DO UPDATE SET user_id=excluded.user_id, platform=excluded.platform, monitor_list=excluded.monitor_list, interval=excluded.interval, push_state=excluded.push_state, app_version=excluded.app_version, profile=excluded.profile, updated_at=excluded.updated_at",
+                params![user_id, token, platform, monitor_list, interval, push_state, app_version, profile, now],
+            )?;
+            Ok(c.query_row("SELECT id FROM push_token WHERE token=?1", params![token], |r| r.get(0))?)
+        })
+    }
+
+    pub fn update_push_token(&self, user_id: i64, id: i64, monitor_list: Option<String>, interval: Option<i64>, push_state: Option<String>, profile: Option<String>) -> Result<()> {
+        self.with(|c| {
+            if let Some(v) = monitor_list { c.execute("UPDATE push_token SET monitor_list=?1, updated_at=?2 WHERE id=?3 AND user_id=?4", params![v, now_secs(), id, user_id])?; }
+            if let Some(v) = interval { c.execute("UPDATE push_token SET interval=?1, updated_at=?2 WHERE id=?3 AND user_id=?4", params![v, now_secs(), id, user_id])?; }
+            if let Some(v) = push_state { c.execute("UPDATE push_token SET push_state=?1, updated_at=?2 WHERE id=?3 AND user_id=?4", params![v, now_secs(), id, user_id])?; }
+            if let Some(v) = profile { c.execute("UPDATE push_token SET profile=?1, updated_at=?2 WHERE id=?3 AND user_id=?4", params![v, now_secs(), id, user_id])?; }
+            Ok(())
+        })
+    }
+
+    pub fn delete_push_token(&self, user_id: i64, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM push_token WHERE id=?1 AND user_id=?2", params![id, user_id])?;
+            Ok(())
         })
     }
 

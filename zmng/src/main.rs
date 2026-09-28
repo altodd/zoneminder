@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 mod api;
 mod config;
 mod db;
@@ -7,7 +8,9 @@ mod mp4;
 mod recorder;
 mod retention;
 mod thumbs;
+mod tier;
 mod video;
+mod zmapi;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -38,8 +41,14 @@ enum Cmd {
         #[arg(long)]
         max_gb: Option<f64>,
         /// Always keep this many GB free on the filesystem
-        #[arg(long, default_value_t = 20.0)]
+        #[arg(long, default_value_t = 50.0)]
         reserve_gb: f64,
+        /// Archive segments to this storage id (tiering)
+        #[arg(long)]
+        archive_to: Option<i64>,
+        /// Move segments older than this many days to the archive
+        #[arg(long)]
+        archive_after_days: Option<f64>,
     },
     /// Add a camera
     AddCamera {
@@ -105,7 +114,7 @@ fn main() -> Result<()> {
             print!("{}", toml::to_string_pretty(&config::Config::default())?);
             Ok(())
         }
-        Cmd::AddStorage { path, max_gb, reserve_gb } => {
+        Cmd::AddStorage { path, max_gb, reserve_gb, archive_to, archive_after_days } => {
             let db = db::Db::open(&cfg.db_path)?;
             std::fs::create_dir_all(&path).with_context(|| format!("creating {path}"))?;
             let id = db.add_storage(
@@ -113,6 +122,12 @@ fn main() -> Result<()> {
                 max_gb.map(|g| (g * 1e9) as i64),
                 (reserve_gb * 1e9) as i64,
             )?;
+            if archive_to.is_some() || archive_after_days.is_some() {
+                let mut m = serde_json::Map::new();
+                if let Some(a) = archive_to { m.insert("archive_to".into(), a.into()); }
+                if let Some(d) = archive_after_days { m.insert("archive_after_days".into(), d.into()); }
+                db.update_storage(id, &m)?;
+            }
             println!("storage {id} added");
             Ok(())
         }
@@ -286,9 +301,13 @@ fn run(cfg: config::Config) -> Result<()> {
                     }
                     let db2 = db.clone();
                     let td = thumb_dir.clone();
-                    let r = tokio::task::spawn_blocking(move || retention::run_once(&db2, &td)).await;
+                    let r = tokio::task::spawn_blocking(move || {
+                        tier::run_once(&db2, 20).map_err(|e| anyhow::anyhow!("tiering: {e:#}"))?;
+                        retention::run_once(&db2, &td)
+                    })
+                    .await;
                     match r {
-                        Ok(Err(e)) => tracing::error!("retention: {e:#}"),
+                        Ok(Err(e)) => tracing::error!("retention/tiering: {e:#}"),
                         Err(e) => tracing::error!("retention task: {e}"),
                         _ => {}
                     }
@@ -306,7 +325,7 @@ fn run(cfg: config::Config) -> Result<()> {
                     _ = tokio::signal::ctrl_c() => {},
                 }
                 info!("shutdown requested: closing segments");
-                let handles: Vec<_> = hub.cams.read().values().cloned().collect();
+                let handles: Vec<_> = hub.all_handles();
                 for h in &handles {
                     let _ = h.stop.send(true);
                 }

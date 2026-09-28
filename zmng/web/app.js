@@ -347,6 +347,98 @@ async function viewReview(main, camId, atMs) {
 }
 
 // ---------------------------------------------------------------------------
+// Montage review: every camera's substream recording, synchronized on one
+// timeline. Substreams are 640x360 H.264, so a browser decodes 20+ of them
+// easily and the server only copies bytes.
+// ---------------------------------------------------------------------------
+async function viewMontage(main, atMs) {
+  const cams = state.cameras.filter((c) => c.sub_status);
+  if (!cams.length) { main.replaceChildren(h('p', { class: 'muted' }, 'No cameras with substream recording enabled.')); return; }
+  const now = Date.now();
+  let windowMs = Number(localStorage.getItem('montageWindow')) || 3600 * 1000;
+  let end = atMs ? Math.min(now, atMs + windowMs / 2) : now;
+  let start = end - windowMs;
+  let playhead = atMs || (now - 120 * 1000);
+  const CHUNK = 2 * 60 * 1000;
+  const grid = h('div', { class: 'grid montage' });
+  const players = [];
+  for (const c of cams) {
+    const v = h('video', { muted: '', playsinline: '' });
+    const tile = h('div', { class: 'tile' }, v, h('div', { class: 'label' }, c.name), h('div', { class: 'stat' }, ''));
+    tile.addEventListener('dblclick', () => { location.hash = `#/review/${c.id}/${Math.round(playhead)}`; });
+    grid.append(tile);
+    players.push({ cam: c, video: v, mse: new MsePlayer(v), tile, stat: tile.querySelector('.stat') });
+  }
+  const canvas = h('canvas'); const cursor = h('div', { class: 'cursor' }); const tip = h('div', { class: 'tip' }); const hover = h('div', { class: 'hover' });
+  const timeline = h('div', { class: 'timeline tall' }, canvas, hover, tip, cursor);
+  const timeLabel = h('span', { class: 'time' });
+  const playBtn = h('button', { class: 'ghost', onclick: () => togglePlay() }, '⏸');
+  const speedSel = h('select', { style: 'width:90px', onchange: (e) => { players.forEach((p) => { p.video.playbackRate = Number(e.target.value); }); } }, ...[1, 2, 4, 8].map((r) => h('option', { value: r }, `${r}×`)));
+  const winSel = h('select', { onchange: (e) => { windowMs = Number(e.target.value); localStorage.setItem('montageWindow', windowMs); start = end - windowMs; refresh(); } },
+    ...[[900000, '15 min'], [3600000, '1 h'], [3 * 3600000, '3 h'], [12 * 3600000, '12 h'], [86400000, '24 h']].map(([v, l]) => h('option', { value: v, selected: v === windowMs ? '' : null }, l)));
+  const controls = h('div', { class: 'controls' }, playBtn, speedSel, winSel,
+    h('button', { class: 'ghost', onclick: () => seekAll(playhead - 60000) }, '−1 min'),
+    h('button', { class: 'ghost', onclick: () => seekAll(playhead + 60000) }, '+1 min'),
+    h('button', { class: 'ghost', onclick: () => { end = Date.now(); start = end - windowMs; refresh(); seekAll(end - 120000); } }, 'Now'),
+    timeLabel, h('span', { class: 'grow' }), h('span', { class: 'muted' }, 'double-click a tile for full resolution'));
+  main.replaceChildren(grid, timeline, controls);
+  let tls = new Map(); // camera id -> timeline
+  let paused = false;
+  function togglePlay() { paused = !paused; playBtn.textContent = paused ? '▶' : '⏸'; players.forEach((p) => paused ? p.video.pause() : p.video.play().catch(() => {})); }
+  async function seekAll(ms) {
+    playhead = ms;
+    const s = Math.max(start, ms - 1000), e = Math.min(Date.now(), s + CHUNK);
+    await Promise.all(players.map(async (p) => {
+      p.stat.textContent = '…';
+      try { await p.mse.play(`/api/cameras/${p.cam.id}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`, { startMs: s }); p.stat.textContent = ''; p.video.playbackRate = Number(speedSel.value); if (paused) p.video.pause(); }
+      catch (err) { p.stat.textContent = 'no recording'; }
+    }));
+  }
+  // keep players within 300 ms of the first one that is playing
+  const sync = setInterval(() => {
+    const lead = players.find((p) => p.mse.wallMs() !== null && !p.video.paused && p.video.readyState >= 2);
+    if (!lead) return;
+    const t = lead.mse.wallMs(); playhead = t; timeLabel.textContent = fmtDT(t); draw();
+    for (const p of players) {
+      if (p === lead) continue; const w = p.mse.wallMs(); if (w === null) continue;
+      const d = (t - w) / 1000; if (Math.abs(d) > 0.3) p.video.currentTime += d;
+    }
+    if (t > end - 5000 && end < Date.now()) { end = Math.min(Date.now(), t + windowMs / 4); start = end - windowMs; refresh(); }
+  }, 1000);
+  players.forEach((p) => p.video.addEventListener('ended', () => { if (p === players[0]) seekAll(playhead + 500); }));
+  async function refresh() {
+    const res = await Promise.all(cams.map((c) => api.get(`/api/cameras/${c.id}/timeline?start=${Math.round(start)}&end=${Math.round(end)}`).catch(() => null)));
+    tls = new Map(cams.map((c, i) => [c.id, res[i]]));
+    draw();
+  }
+  function xOf(ms) { return (ms - start) / (end - start) * canvas.clientWidth; }
+  function draw() {
+    const dpr = window.devicePixelRatio || 1; const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    const rowH = Math.max(6, (H - 14) / cams.length);
+    cams.forEach((c, i) => {
+      const tl = tls.get(c.id); const y = 14 + i * rowH;
+      ctx.fillStyle = '#2b3442'; if (tl) for (const [a, b] of tl.coverage) ctx.fillRect(xOf(a), y, Math.max(1, xOf(b) - xOf(a)), rowH - 1);
+      if (tl) { const bw = Math.max(1, W / ((end - start) / tl.bucket_ms)); for (let k = 0; k < tl.motion.length; k++) { const m = tl.motion[k]; if (!m) continue; ctx.fillStyle = m > 120 ? '#ff5a5f' : '#f9b84f'; ctx.fillRect(xOf(start + k * tl.bucket_ms), y, bw, rowH - 1); } }
+      ctx.fillStyle = '#8b93a1'; ctx.font = '10px system-ui'; ctx.fillText(c.name, 3, y + rowH - 2);
+    });
+    ctx.fillStyle = '#8b93a1'; ctx.font = '11px system-ui';
+    const span = end - start; const step = span > 20 * 3600000 ? 3600000 * 4 : span > 6 * 3600000 ? 3600000 : span > 2 * 3600000 ? 1800000 : span > 3600000 ? 900000 : 300000;
+    for (let t = Math.ceil(start / step) * step; t < end; t += step) { const x = xOf(t); ctx.fillRect(x, 0, 1, 10); ctx.fillText(fmtTime(t).slice(0, 5), x + 3, 10); }
+    cursor.style.left = `${xOf(playhead)}px`;
+  }
+  const msAt = (ev) => { const r = timeline.getBoundingClientRect(); return start + (ev.clientX - r.left) / r.width * (end - start); };
+  timeline.addEventListener('pointermove', (ev) => { const t = msAt(ev); hover.style.left = `${xOf(t)}px`; tip.style.left = `${xOf(t)}px`; tip.textContent = fmtDT(t); });
+  timeline.addEventListener('click', (ev) => seekAll(msAt(ev)));
+  timeline.addEventListener('wheel', (ev) => { ev.preventDefault(); const t = msAt(ev); const f = ev.deltaY > 0 ? 1.25 : 0.8; windowMs = Math.min(86400000, Math.max(300000, windowMs * f)); const frac = (t - start) / (end - start); start = t - frac * windowMs; end = start + windowMs; if (end > Date.now()) { end = Date.now(); start = end - windowMs; } refresh(); }, { passive: false });
+  window.addEventListener('resize', draw);
+  await refresh();
+  seekAll(playhead);
+  state.cleanup = () => { clearInterval(sync); players.forEach((p) => p.mse.stop()); window.removeEventListener('resize', draw); };
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 async function viewEvents(main) {
@@ -425,7 +517,8 @@ async function viewAdmin(main) {
   const camTable = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Name'), h('th', {}, 'Status'), h('th', {}, 'Storage'), h('th', {}, 'Retention'), h('th', {}, 'Detect'), h('th', {}, '')),
     ...cams.map((c) => h('tr', {},
       h('td', {}, c.id), h('td', {}, c.name),
-      h('td', {}, h('span', { class: 'pill ' + (c.status.connected ? 'ok' : 'bad') }, c.status.connected ? `${c.status.codec} ${c.status.width}×${c.status.height} ${c.status.fps.toFixed(0)}fps` : (c.status.last_error || 'offline'))),
+      h('td', {}, h('span', { class: 'pill ' + (c.status.connected ? 'ok' : 'bad') }, c.status.connected ? `${c.status.codec} ${c.status.width}×${c.status.height} ${c.status.fps.toFixed(0)}fps` : (c.status.last_error || 'offline')), ' ',
+        c.sub_status ? h('span', { class: 'pill ' + (c.sub_status.connected ? 'ok' : 'bad') }, c.sub_status.connected ? `sub ${c.sub_status.width}×${c.sub_status.height}` : 'sub offline') : null),
       h('td', {}, c.storage_id), h('td', {}, `${c.retention_days} d`),
       h('td', {}, c.detect ? `${c.detect.fps.toFixed(1)} fps, score ${c.detect.score}` : '—'),
       h('td', {}, h('button', { class: 'ghost small', onclick: () => editCamera(c) }, 'Edit'), ' ', h('button', { class: 'ghost small', onclick: async () => { if (confirmDelete(`Delete camera ${c.name}? Recordings are removed by retention.`)) { await api.del(`/api/cameras/${c.id}`); route(); } } }, 'Delete')))));
@@ -436,8 +529,10 @@ async function viewAdmin(main) {
       h('td', {}, h('button', { class: 'ghost small', onclick: () => editUserCams(u, cams) }, 'Cameras'), ' ', h('button', { class: 'ghost small', onclick: async () => { if (confirmDelete(`Delete user ${u.username}?`)) { await api.del(`/api/users/${u.id}`); route(); } } }, 'Delete')))));
   const addUser = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); await api.post('/api/users', { username: f.get('username'), password: f.get('password'), role: f.get('role') }); route(); } },
     h('input', { name: 'username', placeholder: 'username', required: '', style: 'width:160px' }), h('input', { name: 'password', type: 'password', placeholder: 'password (8+)', required: '', style: 'width:180px' }), h('select', { name: 'role', style: 'width:120px' }, h('option', { value: 'viewer' }, 'viewer'), h('option', { value: 'admin' }, 'admin')), h('button', {}, 'Add user'));
-  const stor = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Path'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Reserve')),
-    ...storages.map((s) => h('tr', {}, h('td', {}, s.id), h('td', {}, h('code', {}, s.path)), h('td', {}, gb(s.used_bytes)), h('td', {}, gb(s.free_bytes)), h('td', {}, s.max_bytes ? gb(s.max_bytes) : '—'), h('td', {}, gb(s.reserve_bytes)))));
+  const stor = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Path'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Reserve'), h('th', {}, 'Archive to'), h('th', {}, '')),
+    ...storages.map((s) => h('tr', {}, h('td', {}, s.id), h('td', {}, h('code', {}, s.path), s.available ? '' : h('span', { class: 'pill bad' }, 'missing')), h('td', {}, gb(s.used_bytes)), h('td', {}, gb(s.free_bytes)), h('td', {}, s.max_bytes ? gb(s.max_bytes) : '—'), h('td', {}, gb(s.reserve_bytes)),
+      h('td', {}, s.archive_to ? `storage ${s.archive_to} after ${s.archive_after_days ?? '—'} d @ ${s.archive_rate_mbps} Mb/s` : '—'),
+      h('td', {}, h('button', { class: 'ghost small', onclick: () => editStorage(s, storages) }, 'Edit')))));
   main.replaceChildren(h('div', { class: 'two' },
     h('div', { class: 'card', style: 'grid-column:1/-1' }, h('h2', {}, 'Cameras'), camTable, h('div', { style: 'margin-top:10px' }, addCam)),
     h('div', { class: 'card' }, h('h2', {}, 'Users'), userTable, h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted' }, 'Viewers see only the cameras assigned to them (fails closed).')),
@@ -448,14 +543,35 @@ async function viewAdmin(main) {
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
 function confirmDelete(msg) { return window.confirm ? window.confirm(msg) : true; }
 function editCamera(c) {
-  const fields = [['name', 'Name'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
+  const fields = [['name', 'Name'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
   const inputs = {};
-  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!['name', 'main_url', 'sub_url', 'zones_json', 'masks_json'].includes(k)) v = Number(v); if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); route(); } catch (err) { errEl.textContent = err.message; } } },
+  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!['name', 'main_url', 'sub_url', 'zones_json', 'masks_json'].includes(k)) v = Number(v); if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); route(); } catch (err) { errEl.textContent = err.message; } } },
     ...fields.map(([k, l]) => h('label', {}, l, inputs[k] = h('input', { value: c[k] ?? '' }))),
     h('label', { class: 'row' }, inputs.enabled = h('input', { type: 'checkbox', style: 'width:auto', checked: c.enabled ? '' : null }), ' Enabled'),
+    h('label', { class: 'row' }, inputs.record_sub = h('input', { type: 'checkbox', style: 'width:auto', checked: c.record_sub ? '' : null }), ' Record substream too (multi-camera review, phones)'),
     h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
   const errEl = h('p', { class: 'err' });
   const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Camera ${c.id}`), form, errEl));
+  document.body.append(modal);
+}
+function editStorage(s, all) {
+  const inputs = {};
+  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {
+      max_bytes: inputs.max_gb.value === '' ? null : Math.round(Number(inputs.max_gb.value) * 1e9),
+      reserve_bytes: Math.round(Number(inputs.reserve_gb.value) * 1e9),
+      archive_to: inputs.archive_to.value === '' ? null : Number(inputs.archive_to.value),
+      archive_after_days: inputs.archive_after_days.value === '' ? null : Number(inputs.archive_after_days.value),
+      archive_rate_mbps: Number(inputs.archive_rate_mbps.value) };
+    try { await api.patch(`/api/storages/${s.id}`, patch); modal.remove(); route(); } catch (err) { errEl.textContent = err.message; } } },
+    h('label', {}, 'Cap (GB, blank = use free-space reserve only)', inputs.max_gb = h('input', { value: s.max_bytes ? (s.max_bytes / 1e9).toFixed(0) : '' })),
+    h('label', {}, 'Reserve free (GB)', inputs.reserve_gb = h('input', { value: (s.reserve_bytes / 1e9).toFixed(0) })),
+    h('label', {}, 'Archive to (tiering)', inputs.archive_to = h('select', {}, h('option', { value: '' }, 'never (delete here by retention)'), ...all.filter((o) => o.id !== s.id).map((o) => h('option', { value: o.id, selected: o.id === s.archive_to ? '' : null }, `storage ${o.id}: ${o.path}`)))),
+    h('label', {}, 'Move segments older than (days)', inputs.archive_after_days = h('input', { value: s.archive_after_days ?? '' })),
+    h('label', {}, 'Copy rate limit (Mb/s)', inputs.archive_rate_mbps = h('input', { value: s.archive_rate_mbps })),
+    h('p', { class: 'muted' }, 'Recent footage of every camera stays here; older segments are copied to the archive volume (checksummed), then removed here. If the archive volume is missing, nothing is moved and recording continues.'),
+    h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
+  const errEl = h('p', { class: 'err' });
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Storage ${s.id}`), form, errEl));
   document.body.append(modal);
 }
 function editUserCams(u, cams) {
@@ -506,6 +622,7 @@ async function route() {
   try {
     if (view === 'live') await viewLive(main, parts[1]);
     else if (view === 'review') await viewReview(main, parts[1], parts[2] ? Number(parts[2]) : null);
+    else if (view === 'montage') await viewMontage(main, parts[1] ? Number(parts[1]) : null);
     else if (view === 'events') await viewEvents(main);
     else if (view === 'admin') await viewAdmin(main);
   } catch (e) { main.replaceChildren(h('p', { class: 'err' }, e.message)); }

@@ -132,7 +132,7 @@ Measured on the Mac: a 60 s 4 MP HEVC range = 22.7 MB served in 0.03 s; frame-at
 ### Phase 0 — relief on the current server (hours; needs Aaron's approval, see QUICK-WINS-PRODUCTION.md)
 Buffer pool 16 GB; `ZM_RECORD_EVENT_STATS=0`; slow/disable `zmaudit` orphan scans; `Decoding=KeyFrames` or the two-monitor pattern; `DefaultCodec=MP4HLS` for `<video>` playback; fix the 4K monitor dimensions; redraw zones in percent units; fix the events list LIMIT bug (fork patch). Expected: load 20 → ~5, NVDEC 100 % → ~10 %, events list from 1.5 s/500 to ~0.1 s.
 
-### Phase 1 — zmng on the test VM (this week)
+### Phase 1 — zmng on the test VM (this week) — *implementation started 2026-09-27 evening; see §9*
 1. VM: Ubuntu 24.04, `ffmpeg`, the `zmng` binary, systemd unit (`deploy/`), one volume. Point at 2–3 cameras (extra RTSP clients are harmless; Hikvision allows several).
 2. Validate in real browsers: Safari and Chrome HEVC MSE playback, iOS HLS, Firefox fallback to snapshots/WebRTC. Tune motion thresholds per camera; draw zones.
 3. Import: `zmng import-zm` reads the ZoneMinder `Events` table (read-only MySQL) and adopts each existing event mp4 as a legacy segment with a `tfdt` base offset (ZoneMinder's files are already fMP4 with one fragment per keyframe), alarm intervals become events, `snapshot.jpg` becomes the thumbnail. No re-encode, no file moves. (Design ready; not yet implemented.)
@@ -201,3 +201,15 @@ Two independent reviews were run against this plan and the code: `reviews/05-arc
 | Code review: live viewers were dropped when a recorder reconnected | Fixed: client resubscribes |
 | Code review: verified correct — ISO BMFF box layouts and flags, index codec, HEVC codec strings, per-camera ACL on every media route, no path traversal, CSRF posture, XSS-free DOM. The ffmpeg "non monotonically increasing dts" message seen in tests is an artifact of `-f null` rescaling, not a file defect (`-c copy` is silent; sample durations are 2970/3060/5940/6030 ticks = the camera's 30 fps clock at 18 fps). | — |
 | **Build zmng vs deploy Frigate** | The design reviewer's honest verdict: zmng is justified if (a) someone will maintain a Rust service, (b) the two-volume policy and/or the 14 TB legacy import are hard requirements, and (c) full-resolution HEVC in the browser without go2rtc matters more than Frigate's object-detection UX and community. Recommendation adopted for the VM week: **run both** (zmng and Frigate's `-tensorrt` image, 3 cameras each) and decide with evidence. Phase 0 quick wins proceed regardless. |
+
+
+## 9. Phase 1 build log (2026-09-27/28)
+
+Decisions taken with Aaron after the first review:
+* **Storage tiering instead of splitting cameras across volumes.** Recent footage of every camera stays on the RAID; a migrator moves whole segments older than N days (or under space pressure) to the archive volume: sequential copy, rate-limited, SHA-256 verified on re-read, index switched in one row update, then the source is unlinked. If the archive volume is missing nothing moves and recording continues; if the primary has no archive, retention deletes there as before. No JBOD, no new disks.
+* **Substream recording is phase 1**: every camera records main + sub (640x360 H.264, ~0.5 Mbit/s). It powers the Montage review view (all cameras synchronized on one timeline with per-camera motion rows, decoded by the browser), non-HEVC clients and phones.
+* **Detector fed from the substream recorder**: the recorder's live fragments are piped into ffmpeg's stdin; frame timestamps are read back from `showinfo`, so scores align exactly with the recording and no second RTSP session or credential ever leaves the process.
+* **Event-aware retention**: `retention_days` for continuous footage, `event_retention_days` for segments overlapping an event (archived events pin their footage), so "keep everything 7 days, keep motion 30 days" is a per-camera setting.
+* **zmNinjaNg compatibility layer** (`src/zmapi.rs`, research in `research/03-zmninjang-api.md`): ZoneMinder's JSON API under `/zm/api` (JWT `?token=` login/refresh, monitors, events with the path-segment filter grammar and pagination, archive/delete, notifications registration), `index.php?view=image|view_video|view_event_hls|request` and `cgi-bin/nph-zms` (single JPEG and MJPEG from the substream). Events are our motion intervals; `view_video` is a complete MP4 with `Accept-Ranges` cut from the continuous recording. Push delivery still needs the zmNinjaNg FCM relay key (or a rebuilt app); the ES websocket for desktop toasts is next.
+
+Verified locally against two real cameras (Front Door, Playground): main + sub recording, recorder-fed detection at 5 fps, tiering moves with checksum, substream range playback, ZM-API login → monitors → filtered events → thumbnail → MP4 with byte ranges → MJPEG live.

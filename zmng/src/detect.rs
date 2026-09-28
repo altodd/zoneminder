@@ -62,7 +62,7 @@ fn detect_key(c: &Camera) -> String {
         "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         c.sub_url, c.detect_fps, c.detect_width, c.detect_height, c.pixel_threshold, c.min_area_pct,
         c.min_blob_pct, c.pre_secs, c.post_secs, c.cooldown_secs, c.zones_json, c.masks_json
-    )
+    ) + &c.record_sub.to_string()
 }
 
 pub async fn reconcile(ctx: Arc<DetectCtx>) -> Result<()> {
@@ -305,6 +305,11 @@ impl Drop for TempFile {
 }
 
 async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Result<()> {
+    if cam.record_sub {
+        if let Some(sh) = ctx.hub.get_stream(cam.id, crate::recorder::StreamKind::Sub) {
+            return detect_from_recorder(ctx, h, cam, sh).await;
+        }
+    }
     let url = cam.sub_url.clone().unwrap_or_else(|| cam.main_url.clone());
     let (w, hh) = (cam.detect_width as usize, cam.detect_height as usize);
     let fps = cam.detect_fps.max(0.5);
@@ -358,13 +363,8 @@ async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Re
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started");
     h.status.write().running = true;
 
-    let zones = parse_polys(&cam.zones_json);
-    let masks = parse_polys(&cam.masks_json);
-    let mut det = MotionDetector::new(w, hh, cam.pixel_threshold, cam.min_area_pct, cam.min_blob_pct, &zones, &masks);
+    let mut run = DetectRun::new(cam);
     let mut frame = vec![0u8; w * hh];
-    let mut ev = EventState::default();
-    let mut fps_t = Instant::now();
-    let mut fps_n = 0u32;
     // pipeline latency of the substream decode is small (< 300 ms); we stamp frames with wallclock at read time
     loop {
         tokio::time::timeout(Duration::from_secs(30), stdout.read_exact(&mut frame))
@@ -372,20 +372,155 @@ async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Re
             .map_err(|_| anyhow::anyhow!("no frames for 30 s"))?
             .context("ffmpeg pipe closed")?;
         let dts = now_dts() - TIMESCALE as i64 / 4; // ~250 ms decode/pipe latency
-        let score = det.feed(&frame);
-        fps_n += 1;
-        if fps_t.elapsed() >= Duration::from_secs(5) {
+        run.on_frame(ctx, cam, h, dts, &frame).await?;
+    }
+}
+
+/// Per-session detector state shared by both feeding modes.
+struct DetectRun {
+    det: MotionDetector,
+    ev: EventState,
+    fps_t: Instant,
+    fps_n: u32,
+}
+
+impl DetectRun {
+    fn new(cam: &Camera) -> Self {
+        let zones = parse_polys(&cam.zones_json);
+        let masks = parse_polys(&cam.masks_json);
+        DetectRun {
+            det: MotionDetector::new(cam.detect_width as usize, cam.detect_height as usize, cam.pixel_threshold, cam.min_area_pct, cam.min_blob_pct, &zones, &masks),
+            ev: EventState::default(),
+            fps_t: Instant::now(),
+            fps_n: 0,
+        }
+    }
+
+    async fn on_frame(&mut self, ctx: &DetectCtx, cam: &Camera, h: &DetectorHandle, dts: i64, frame: &[u8]) -> Result<()> {
+        let score = self.det.feed(frame);
+        self.fps_n += 1;
+        if self.fps_t.elapsed() >= Duration::from_secs(5) {
             let mut st = h.status.write();
-            st.fps = fps_n as f32 / fps_t.elapsed().as_secs_f32();
-            fps_t = Instant::now();
-            fps_n = 0;
+            st.fps = self.fps_n as f32 / self.fps_t.elapsed().as_secs_f32();
+            self.fps_t = Instant::now();
+            self.fps_n = 0;
         }
         h.status.write().score = score;
         // look the recorder handle up each time: it is replaced on recorder restart
         if let Some(hh2) = ctx.hub.get(cam.id) {
             hh2.motion.push(dts, score);
         }
-        ev.step(ctx, cam, dts, score, h).await?;
+        self.ev.step(ctx, cam, dts, score, h).await
+    }
+}
+
+/// Feed ffmpeg from the substream RECORDER's live fMP4 fragments instead of
+/// opening a second RTSP session: no extra camera connection, credentials
+/// never leave the process, and every decoded frame carries the recording's
+/// own absolute timestamp (read back from ffmpeg's `showinfo` filter).
+async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera, sh: Arc<crate::recorder::CamHandle>) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (w, hh) = (cam.detect_width as usize, cam.detect_height as usize);
+    let fps = cam.detect_fps.max(0.5);
+    // wait for the recorder to have an init segment
+    let mut waited = 0;
+    let (init, first_frag) = loop {
+        if let Some(r) = sh.recent.read().as_ref() {
+            if let Some((_, _, f)) = r.frags.back() {
+                break (r.init.clone(), f.clone());
+            }
+        }
+        waited += 1;
+        if waited > 60 {
+            anyhow::bail!("substream recorder has no fragments yet");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let mut child = tokio::process::Command::new(&ctx.ffmpeg)
+        .args([
+            "-nostdin", "-loglevel", "info", "-nostats", "-threads", "1",
+            "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "65536", "-analyzeduration", "0",
+            "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
+            "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=gray,showinfo"),
+            "-f", "rawvideo", "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning ffmpeg (recorder-fed)")?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // writer: init + latest fragment now, then every fragment as it closes
+    let mut rx = sh.live.subscribe();
+    let writer_init = init.clone();
+    let cam_id = cam.id;
+    let mut writer = tokio::spawn(async move {
+        if stdin.write_all(&writer_init).await.is_err() || stdin.write_all(&first_frag).await.is_err() {
+            return "pipe closed";
+        }
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    if f.init != writer_init {
+                        return "codec parameters changed";
+                    }
+                    if stdin.write_all(&f.data).await.is_err() {
+                        return "pipe closed";
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(camera = cam_id, lagged = n, "detector feed lagged");
+                    continue;
+                }
+                Err(_) => return "recorder stopped",
+            }
+        }
+    });
+    // stderr: showinfo lines give the pts of each output frame, in order
+    let (pts_tx, mut pts_rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+    tokio::spawn(async move {
+        let mut r = tokio::io::BufReader::new(stderr);
+        let mut line = String::new();
+        while let Ok(n) = r.read_line(&mut line).await {
+            if n == 0 {
+                break;
+            }
+            if let Some(i) = line.find("pts_time:") {
+                let rest = &line[i + 9..];
+                let tok: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                if let Ok(v) = tok.parse::<f64>() {
+                    let _ = pts_tx.send(v);
+                }
+            } else if !line.contains("showinfo") {
+                debug!(ffmpeg = %line.trim());
+            }
+            line.clear();
+        }
+    });
+    info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started (fed by substream recorder)");
+    h.status.write().running = true;
+
+    let mut run = DetectRun::new(cam);
+    let mut frame = vec![0u8; w * hh];
+    loop {
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(30), stdout.read_exact(&mut frame)) => {
+                r.map_err(|_| anyhow::anyhow!("no frames for 30 s"))?.context("ffmpeg pipe closed")?;
+            }
+            why = &mut writer => {
+                anyhow::bail!("feed ended: {}", why.unwrap_or("writer task failed"));
+            }
+        }
+        // pts of this output frame (absolute seconds, because tfdt is absolute)
+        let dts = match tokio::time::timeout(Duration::from_millis(300), pts_rx.recv()).await {
+            Ok(Some(pts)) if pts > 1.0e9 => (pts * TIMESCALE as f64) as i64,
+            _ => now_dts() - TIMESCALE as i64 / 4,
+        };
+        run.on_frame(ctx, cam, h, dts, &frame).await?;
     }
 }
 

@@ -98,3 +98,7 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
   main { padding: 10px; }
   .grid { grid-template-columns: 1fr; }
 }
+
+.grid.montage { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.grid.montage .tile { cursor: default; }
+.timeline.tall { height: 160px; }

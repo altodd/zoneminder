@@ -70,6 +70,16 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
 
+## ZoneMinder-compatible API (zmNinjaNg)
+
+Point zmNinjaNg at `http(s)://<host>:8080/zm` (portal URL). Supported: login/refresh (`?token=`), monitors, events list/detail/archive/delete with ZoneMinder's filter grammar, thumbnails (`index.php?view=image`), MP4 playback (`view_video`, byte ranges), HLS (`view_event_hls`), MJPEG/snapshot live (`cgi-bin/nph-zms`), notification token registration. Not yet: push delivery (needs the zmNinjaNg FCM relay), PTZ, ES websocket.
+
+## Storage tiering and retention
+
+* `zmng add-storage /raid --archive-to <archive id> --archive-after-days 3` (or edit in Admin → Storage): segments older than 3 days are copied to the archive volume (checksummed, rate limited), then removed from the RAID. Space pressure on the RAID also triggers moves. A missing archive volume never stops recording.
+* Per camera: `retention_days` (continuous footage) and `event_retention_days` (segments that overlap a motion event); archived events keep their footage.
+* Substream recording (`record_sub`, default on) stores `<camera>/sub/<day>/*.mp4`; use `?stream=sub` on the video/playlist/live endpoints.
+
 ## Layout on disk
 
 ```

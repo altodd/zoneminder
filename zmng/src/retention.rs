@@ -47,16 +47,24 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
     let now = now_dts();
     let mut deleted = 0usize;
 
-    // 1. per-camera age limit
+    // 1. per-camera age limit, keeping segments that overlap a recent or
+    //    archived event for `event_retention_days`
     for cam in &cameras {
         let cutoff = now - (cam.retention_days * 86_400.0 * TIMESCALE as f64) as i64;
+        let ev_days = if cam.event_retention_days > 0.0 { cam.event_retention_days } else { cam.retention_days };
+        let event_cutoff = now - (ev_days * 86_400.0 * TIMESCALE as f64) as i64;
+        let mut skip_before = 0i64;
         loop {
-            let old = db.segments_older_than(cam.id, cutoff, 200)?;
+            let old: Vec<_> = db.segments_older_than(cam.id, cutoff, 200)?.into_iter().filter(|s| s.start_dts > skip_before).collect();
             if old.is_empty() {
                 break;
             }
             let mut progressed = false;
             for s in old {
+                skip_before = s.start_dts;
+                if db.segment_pinned(&s, event_cutoff)? {
+                    continue; // footage of an event worth keeping
+                }
                 if let Some(st) = storages.iter().find(|x| x.id == s.storage_id) {
                     if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
                         deleted += 1;
@@ -70,9 +78,17 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
         }
     }
 
-    // 2. per-storage space budget (oldest first, across cameras)
+    // 2. per-storage space budget (oldest first, across cameras). A primary
+    //    volume with a reachable archive is drained by tier.rs instead.
     for st in &storages {
         let p = Path::new(&st.path);
+        if let Some(a) = st.archive_to {
+            let archive_ok = storages.iter().find(|x| x.id == a).map(|x| Path::new(&x.path).is_dir()).unwrap_or(false);
+            if archive_ok {
+                continue;
+            }
+            warn!(storage = st.id, "archive volume unavailable: falling back to deleting oldest segments on the primary");
+        }
         let mut used = db.storage_used_bytes(st.id)?;
         for _round in 0..50 {
             let free = fs_free_bytes(p).unwrap_or(u64::MAX) as i64;
@@ -167,15 +183,24 @@ pub fn reindex(db: &Db) -> Result<usize> {
             if db.camera(cam_id)?.is_none() {
                 continue;
             }
-            let Ok(days) = std::fs::read_dir(cam_dir.path()) else { continue };
+            let mut roots = vec![(cam_dir.path(), cam_id.to_string())];
+            let sub = cam_dir.path().join("sub");
+            if sub.is_dir() {
+                roots.push((sub, format!("{cam_id}/sub")));
+            }
+            for (root_dir, prefix) in roots {
+            let Ok(days) = std::fs::read_dir(&root_dir) else { continue };
             for day in days.flatten() {
+                if day.file_name() == "sub" {
+                    continue;
+                }
                 let Ok(files) = std::fs::read_dir(day.path()) else { continue };
                 for f in files.flatten() {
                     let name = f.file_name().to_string_lossy().to_string();
                     if !name.ends_with(".mp4") {
                         continue;
                     }
-                    let rel = format!("{}/{}/{}", cam_id, day.file_name().to_string_lossy(), name);
+                    let rel = format!("{}/{}/{}", prefix, day.file_name().to_string_lossy(), name);
                     if known.contains(&rel) {
                         continue;
                     }
@@ -185,6 +210,7 @@ pub fn reindex(db: &Db) -> Result<usize> {
                         Err(e) => warn!(path = %rel, "could not adopt: {e:#}"),
                     }
                 }
+            }
             }
         }
     }
@@ -205,7 +231,8 @@ fn adopt_file(db: &Db, st: &crate::db::Storage, cam_id: i64, rel: &str, abs: &Pa
     let rfc = mp4::rfc6381_from_sample_entry(codec, &entry).unwrap_or_else(|| codec.to_string());
     let se = db.intern_sample_entry(codec, &rfc, w, h, &entry)?;
     let valid_len = scanned.frags.last().map(|f| f.offset + f.len as u64).unwrap_or(0);
-    db.insert_segment(cam_id, st.id, se, rel, valid_len as i64, scanned.init_len, &scanned.frags)?;
+    let stream = if rel.contains("/sub/") { "sub" } else { "main" };
+    db.insert_segment_ext(cam_id, st.id, se, rel, valid_len as i64, scanned.init_len, &scanned.frags, 0, None, stream)?;
     info!(path = %rel, frags = scanned.frags.len(), "adopted segment");
     Ok(true)
 }
