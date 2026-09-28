@@ -369,7 +369,7 @@ mod tests {
             retention_days: 1.0, detect_fps: 5.0, detect_width: 320, detect_height: 180, pixel_threshold: 25,
             min_area_pct: 1.0, min_blob_pct: 0.5, pre_secs: 5.0, post_secs: 8.0, cooldown_secs: 10.0,
             zones_json: "[]".into(), masks_json: "[]".into(), sort_order: 0, record_sub: true,
-            event_retention_days: 0.0, tags: String::new(),
+            event_retention_days: 0.0, tags: String::new(), objects: true, object_labels: String::new(), require_object: false,
         }
     }
 

@@ -422,10 +422,13 @@ struct EventOut {
     thumb: Option<String>,
     archived: bool,
     notes: Option<String>,
+    objects: Vec<crate::notify::DetectedObject>,
 }
 
 fn event_out(e: crate::db::Event) -> EventOut {
+    let objects = crate::notify::objects_from_meta(&e);
     EventOut {
+        objects,
         id: e.id,
         camera_id: e.camera_id,
         start: video::dts_to_ms(e.start_dts),
@@ -492,6 +495,8 @@ struct EventsQ {
     before: Option<i64>,
     limit: Option<usize>,
     order: Option<String>,
+    /// comma separated event kinds (motion, person, car, ...)
+    kind: Option<String>,
 }
 
 async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -501,6 +506,7 @@ async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<a
         Some(s) if !s.is_empty() => s.split(',').filter_map(|x| x.trim().parse().ok()).filter(|c| vis.contains(c)).collect(),
         _ => vis.clone(),
     };
+    let kinds: Option<Vec<String>> = q.kind.as_ref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
     let list = app
         .db
         .events(
@@ -512,6 +518,7 @@ async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<a
             q.before,
             q.limit.unwrap_or(50).min(500),
             q.order.as_deref() == Some("asc"),
+            kinds.as_deref(),
         )
         .map_err(err500)?;
     let out: Vec<EventOut> = list.into_iter().map(event_out).collect();

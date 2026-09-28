@@ -165,7 +165,7 @@ async fn detector_end_to_end_on_synthetic_source() {
     let fx = Fixture::new();
     let cam = fx.db.add_camera("synthetic", "rtsp://none/", Some("lavfi:testsrc=size=320x180:rate=10"), fx.storage_id).unwrap();
     fx.db.update_camera(cam, json!({"record_sub": false, "detect_fps": 10, "min_area_pct": 0.2, "min_blob_pct": 0.1, "cooldown_secs": 1}).as_object().unwrap()).unwrap();
-    let ctx = Arc::new(zmng::detect::DetectCtx { db: fx.db.clone(), hub: fx.hub.clone(), ffmpeg: "ffmpeg".into(), thumb_dir: fx.thumb_dir.clone(), bus: fx.bus.clone(), preview_secs: 1 });
+    let ctx = Arc::new(zmng::detect::DetectCtx { db: fx.db.clone(), hub: fx.hub.clone(), ffmpeg: "ffmpeg".into(), thumb_dir: fx.thumb_dir.clone(), bus: fx.bus.clone(), preview_secs: 1, objects: None });
     let mut rx = fx.bus.subscribe();
     zmng::detect::reconcile(ctx.clone()).await.unwrap();
     let start = loop {

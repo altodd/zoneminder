@@ -76,13 +76,30 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/preview.jpg?t` | scrub-preview tile (160 px, colour) nearest `t`, taken from the detector's frames every `preview_secs`; one small file read, no decode |
 | `GET /api/cameras/{id}/previews`, `GET /api/cameras/{id}/previews/{YYYYMMDDHH}.jpg|.json` | hours with previews; an hour as a sprite sheet (30 columns) plus its manifest `{cols, tile_w, tile_h, times}` |
 | `GET /api/segments/{id}/file.mp4` (Range), `/init.mp4`, `/frag/{n}.m4s` | raw media for HLS |
-| `GET /api/events?camera&start&end&min_score&archived&before&limit&order` | keyset-paged list |
+| `GET /api/events?camera&start&end&min_score&kind&archived&before&limit&order` | keyset-paged list (`kind`: comma list of `motion`, `person`, `car`, ...); each event carries `objects` |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
 | `GET /api/events/stream` | server-sent events: `event_start`, `event_end`, `camera_down`, `camera_up`, `storage_low` |
 | `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
+
+## Object detection (people, vehicles, animals)
+
+zmng keeps no neural network of its own. Point it at a detection server that speaks the DeepStack / CodeProject.AI API and the GPU box does the work:
+
+```toml
+[objects]
+url = "http://127.0.0.1:32168/v1/vision/detection"
+labels = ["person", "car", "truck", "bus", "motorcycle", "bicycle", "dog", "cat"]   # priority order
+min_confidence = 0.5
+interval_secs = 2        # per camera, while motion continues
+timeout_ms = 3000
+max_concurrent = 4
+```
+While the motion detector scores a camera, at most every `interval_secs` the current decoded substream frame is sent as a JPEG; boxes are filtered by label, confidence and the camera's zones/masks (a box counts where its bottom edge is), merged into the open event (`kind` = best label, `objects` = best box per label) and announced on the bus (`event_update`, or `event_start` when the camera has *Only keep events with a detected object* and this is the first object). Per camera: object detection on/off, a label override, and `require_object` (events with nothing detected are discarded at close). The Events view filters by kind (people, vehicles, animals, motion only). Set `detect_width`/`detect_height` to 640x360 on cameras with object detection: the JPEG is the detector's frame.
+
+Servers that work: CodeProject.AI (`/v1/vision/detection`, YOLO on CUDA), DeepStack, and `deploy/detector/server.py` — a ~150-line ONNX Runtime server (YOLOv8/YOLO11 ONNX export, CUDA execution provider when present; the Quadro P2200 runs YOLOv8n at ~25 ms) with the same API. Object detection failing or absent never affects recording or motion events.
 
 ## Notifications (Home Assistant, ntfy, the UI, zmNinjaNg)
 

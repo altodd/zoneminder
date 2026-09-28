@@ -45,6 +45,8 @@ pub struct Config {
     /// Seconds between scrub-preview tiles taken from the detector's frames
     /// (0 disables). Tiles are ~3 KB, so 5 s ≈ 2 MB per camera-hour.
     pub preview_secs: u32,
+    /// External object-detection server (DeepStack / CodeProject.AI API).
+    pub objects: Option<crate::objects::ObjectsConfig>,
 }
 
 impl Default for Config {
@@ -66,6 +68,7 @@ impl Default for Config {
             mqtt: None,
             backup_dir: None,
             preview_secs: 5,
+            objects: None,
         }
     }
 }

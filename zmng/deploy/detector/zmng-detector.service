@@ -1,0 +1,14 @@
+[Unit]
+Description=zmng object-detection server (ONNX Runtime)
+After=network-online.target
+
+[Service]
+User=zmng
+Group=zmng
+WorkingDirectory=/opt/zmng-detector
+ExecStart=/opt/zmng-detector/bin/python3 /opt/zmng-detector/server.py --model /opt/zmng-detector/yolov8n.onnx --host 127.0.0.1 --port 32168
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS camera (
   event_retention_days REAL NOT NULL DEFAULT 0,
   -- comma separated group names (Outside, Inside, ...), used for filtering
   tags             TEXT NOT NULL DEFAULT '',
+  -- object detection: on/off, label override (comma list, empty = server default),
+  -- and whether an event without a detected object is discarded
+  objects          INTEGER NOT NULL DEFAULT 1,
+  object_labels    TEXT NOT NULL DEFAULT '',
+  require_object   INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL
 );
 
@@ -163,9 +168,9 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
                 anyhow::bail!("{k} must be a non-empty string");
             }
         }
-        "tags" => {
+        "tags" | "object_labels" => {
             if !v.is_string() {
-                anyhow::bail!("tags must be a string");
+                anyhow::bail!("{k} must be a string");
             }
         }
         "sub_url" => {
@@ -174,7 +179,7 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
             }
         }
         "event_retention_days" => num(0.0, 3650.0)?,
-        "enabled" | "record_sub" => {
+        "enabled" | "record_sub" | "objects" | "require_object" => {
             if !(v.is_boolean() || v.as_i64().map(|i| i == 0 || i == 1).unwrap_or(false)) {
                 anyhow::bail!("enabled must be true/false");
             }
@@ -217,6 +222,9 @@ fn migrate(c: &Connection) -> Result<()> {
     }
     if !has_col("camera", "tags")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !has_col("camera", "objects")? {
+        c.execute_batch("ALTER TABLE camera ADD COLUMN objects INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN object_labels TEXT NOT NULL DEFAULT ''; ALTER TABLE camera ADD COLUMN require_object INTEGER NOT NULL DEFAULT 0;")?;
     }
     if !has_col("camera", "record_sub")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN record_sub INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN event_retention_days REAL NOT NULL DEFAULT 0;")?;
@@ -264,6 +272,9 @@ pub struct Camera {
     pub record_sub: bool,
     pub event_retention_days: f64,
     pub tags: String,
+    pub objects: bool,
+    pub object_labels: String,
+    pub require_object: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -484,6 +495,9 @@ impl Db {
             record_sub: r.get::<_, i64>("record_sub")? != 0,
             event_retention_days: r.get("event_retention_days")?,
             tags: r.get("tags")?,
+            objects: r.get::<_, i64>("objects")? != 0,
+            object_labels: r.get("object_labels")?,
+            require_object: r.get::<_, i64>("require_object")? != 0,
         })
     }
 
@@ -517,7 +531,7 @@ impl Db {
             "name", "main_url", "sub_url", "enabled", "storage_id", "retention_days", "detect_fps",
             "detect_width", "detect_height", "pixel_threshold", "min_area_pct", "min_blob_pct",
             "pre_secs", "post_secs", "cooldown_secs", "zones_json", "masks_json", "sort_order",
-            "record_sub", "event_retention_days", "tags",
+            "record_sub", "event_retention_days", "tags", "objects", "object_labels", "require_object",
         ];
         self.with(|c| {
             for (k, v) in patch {
@@ -857,6 +871,14 @@ impl Db {
         })
     }
 
+    /// Record detected objects on an open or closed event.
+    pub fn update_event_objects(&self, id: i64, kind: &str, meta_json: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE event SET kind=?1, meta_json=?2 WHERE id=?3", params![kind, meta_json, id])?;
+            Ok(())
+        })
+    }
+
     pub fn set_event_thumb(&self, id: i64, thumb_path: &str) -> Result<()> {
         self.with(|c| {
             c.execute("UPDATE event SET thumb_path=?1 WHERE id=?2", params![thumb_path, id])?;
@@ -896,9 +918,21 @@ impl Db {
         before_id: Option<i64>,
         limit: usize,
         ascending: bool,
+        kinds: Option<&[String]>,
     ) -> Result<Vec<Event>> {
         let mut sql = String::from("SELECT * FROM event WHERE end_dts IS NOT NULL AND score>=?1");
         let mut args: Vec<rusqlite::types::Value> = vec![(min_score as i64).into()];
+        if let Some(ks) = kinds {
+            if ks.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut ph = Vec::new();
+            for k in ks {
+                args.push(k.to_lowercase().into());
+                ph.push(format!("?{}", args.len()));
+            }
+            sql.push_str(&format!(" AND kind IN ({})", ph.join(",")));
+        }
         if let Some(cs) = cameras {
             if cs.is_empty() {
                 return Ok(Vec::new());
@@ -1193,8 +1227,13 @@ mod tests {
         let e = db.event(ev).unwrap().unwrap();
         assert_eq!(e.score, 50);
         assert_eq!(e.peak_dts, Some(6000));
-        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false).unwrap().len(), 1);
-        assert_eq!(db.events(Some(&[cid]), None, None, 60, false, None, 10, false).unwrap().len(), 0);
+        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false, None).unwrap().len(), 1);
+        assert_eq!(db.events(Some(&[cid]), None, None, 60, false, None, 10, false, None).unwrap().len(), 0);
+        db.update_event_objects(ev, "person", r#"{"objects":[{"label":"person","confidence":0.9,"bbox":[0,0,1,1]}]}"#).unwrap();
+        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false, Some(&["person".to_string()])).unwrap().len(), 1);
+        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false, Some(&["motion".to_string()])).unwrap().len(), 0);
+        assert_eq!(db.events(Some(&[cid]), None, None, 0, false, None, 10, false, Some(&[])).unwrap().len(), 0);
+        assert_eq!(db.event(ev).unwrap().unwrap().kind, "person");
         let _ = std::fs::remove_dir_all(dir);
     }
 

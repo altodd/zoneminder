@@ -1,0 +1,326 @@
+//! Object detection (phase 3), motion-gated.
+//!
+//! zmng does not link a neural-network runtime. When the motion detector
+//! scores a frame, and at most every `interval_secs` per camera, the current
+//! decoded substream frame is sent as a JPEG to an external detection server
+//! speaking the DeepStack / CodeProject.AI protocol (`POST /v1/vision/
+//! detection`, multipart field `image`, JSON `predictions[]` with `label`,
+//! `confidence`, `x_min`..`y_max`). `deploy/detector/server.py` is a small
+//! reference implementation on ONNX Runtime (YOLO, CUDA when available) so
+//! the GPU does what it is good at without the recorder depending on it.
+//!
+//! Results are filtered by label, confidence and the camera's zones (a box
+//! counts when its bottom-centre lies inside a zone), merged into the open
+//! event (`event.kind` becomes the best label, `meta_json.objects` keeps the
+//! best box per label) and announced on the bus. Losing the detection server
+//! never affects motion events or recording.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::{debug, warn};
+
+use crate::notify::DetectedObject;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObjectsConfig {
+    /// Detection endpoint, e.g. `http://127.0.0.1:32168/v1/vision/detection`.
+    pub url: String,
+    /// Sent as `X-API-Key` (CodeProject.AI) when set.
+    pub api_key: Option<String>,
+    /// Labels worth an event, in priority order (first = most important).
+    pub labels: Vec<String>,
+    pub min_confidence: f64,
+    /// Minimum seconds between detections per camera while motion continues.
+    pub interval_secs: f64,
+    pub timeout_ms: u64,
+    /// Detections in flight across all cameras.
+    pub max_concurrent: usize,
+}
+
+impl Default for ObjectsConfig {
+    fn default() -> Self {
+        ObjectsConfig {
+            url: "http://127.0.0.1:32168/v1/vision/detection".into(),
+            api_key: None,
+            labels: ["person", "car", "truck", "bus", "motorcycle", "bicycle", "dog", "cat"].iter().map(|s| s.to_string()).collect(),
+            min_confidence: 0.5,
+            interval_secs: 2.0,
+            timeout_ms: 3000,
+            max_concurrent: 4,
+        }
+    }
+}
+
+/// Parse a DeepStack/CodeProject.AI response into normalized boxes.
+pub fn parse_predictions(v: &serde_json::Value, w: u32, h: u32) -> Vec<DetectedObject> {
+    let (fw, fh) = (w.max(1) as f64, h.max(1) as f64);
+    v.get("predictions")
+        .and_then(|p| p.as_array())
+        .map(|preds| {
+            preds
+                .iter()
+                .filter_map(|p| {
+                    let label = p.get("label")?.as_str()?.to_string();
+                    let confidence = p.get("confidence")?.as_f64()?;
+                    let g = |k: &str| p.get(k).and_then(|x| x.as_f64());
+                    let bbox = [
+                        (g("x_min")? / fw).clamp(0.0, 1.0),
+                        (g("y_min")? / fh).clamp(0.0, 1.0),
+                        (g("x_max")? / fw).clamp(0.0, 1.0),
+                        (g("y_max")? / fh).clamp(0.0, 1.0),
+                    ];
+                    Some(DetectedObject { label, confidence, bbox })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Point-in-polygon (even-odd) on normalized coordinates.
+pub fn inside(poly: &[(f64, f64)], x: f64, y: f64) -> bool {
+    let mut c = false;
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            c = !c;
+        }
+        j = i;
+    }
+    c
+}
+
+/// Keep detections whose label is wanted, confidence high enough, and whose
+/// bottom-centre (where feet/wheels are) lies inside a zone (no zones =
+/// whole frame) and outside every mask.
+pub fn filter(objs: Vec<DetectedObject>, labels: &[String], min_confidence: f64, zones: &[Vec<(f64, f64)>], masks: &[Vec<(f64, f64)>]) -> Vec<DetectedObject> {
+    objs.into_iter()
+        .filter(|o| o.confidence >= min_confidence)
+        .filter(|o| labels.is_empty() || labels.iter().any(|l| l.eq_ignore_ascii_case(&o.label)))
+        .filter(|o| {
+            let (x, y) = ((o.bbox[0] + o.bbox[2]) / 2.0, o.bbox[3]);
+            (zones.is_empty() || zones.iter().any(|z| inside(z, x, y))) && !masks.iter().any(|m| inside(m, x, y))
+        })
+        .collect()
+}
+
+/// Objects seen during one event: the best box per label.
+#[derive(Default, Debug, Clone)]
+pub struct EventObjects {
+    pub best: HashMap<String, DetectedObject>,
+    pub detections: u32,
+}
+
+impl EventObjects {
+    /// Merge one detection result; returns true when the set of labels or a
+    /// best confidence changed (worth a DB update + notification).
+    pub fn merge(&mut self, objs: &[DetectedObject]) -> bool {
+        self.detections += 1;
+        let mut changed = false;
+        for o in objs {
+            match self.best.get(&o.label) {
+                Some(b) if b.confidence >= o.confidence => {}
+                _ => {
+                    self.best.insert(o.label.clone(), o.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+    pub fn is_empty(&self) -> bool {
+        self.best.is_empty()
+    }
+    /// The event kind: the highest-priority label seen (by `labels` order),
+    /// else the most confident one; `motion` when nothing was seen.
+    pub fn kind(&self, labels: &[String]) -> String {
+        if let Some(l) = labels.iter().find(|l| self.best.keys().any(|k| k.eq_ignore_ascii_case(l))) {
+            return l.to_lowercase();
+        }
+        self.best.values().max_by(|a, b| a.confidence.total_cmp(&b.confidence)).map(|o| o.label.to_lowercase()).unwrap_or_else(|| "motion".into())
+    }
+    /// Sorted by confidence, best first.
+    pub fn list(&self) -> Vec<DetectedObject> {
+        let mut v: Vec<DetectedObject> = self.best.values().cloned().collect();
+        v.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        v
+    }
+}
+
+pub struct ObjectDetector {
+    pub cfg: ObjectsConfig,
+    client: reqwest::Client,
+    sem: Arc<tokio::sync::Semaphore>,
+}
+
+impl ObjectDetector {
+    pub fn new(cfg: ObjectsConfig) -> Result<ObjectDetector> {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100))).build()?;
+        Ok(ObjectDetector { sem: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent.max(1))), cfg, client })
+    }
+
+    /// Send one JPEG; returns normalized, unfiltered boxes. Waits for a slot
+    /// only briefly: an overloaded detector drops frames rather than queueing.
+    pub async fn detect(&self, jpeg: Vec<u8>, w: u32, h: u32) -> Result<Vec<DetectedObject>> {
+        let permit = match tokio::time::timeout(std::time::Duration::from_millis(200), self.sem.acquire()).await {
+            Ok(Ok(p)) => p,
+            _ => anyhow::bail!("detector busy"),
+        };
+        let part = reqwest::multipart::Part::bytes(jpeg).file_name("frame.jpg").mime_str("image/jpeg")?;
+        let form = reqwest::multipart::Form::new().part("image", part).text("min_confidence", format!("{}", self.cfg.min_confidence * 0.5));
+        let mut req = self.client.post(&self.cfg.url).multipart(form);
+        if let Some(k) = &self.cfg.api_key {
+            req = req.header("X-API-Key", k);
+        }
+        let res = req.send().await.context("detection request")?;
+        drop(permit);
+        if !res.status().is_success() {
+            anyhow::bail!("detector returned {}", res.status());
+        }
+        let v: serde_json::Value = res.json().await.context("detection response")?;
+        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+            anyhow::bail!("detector error: {}", v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
+        }
+        let objs = parse_predictions(&v, w, h);
+        debug!(n = objs.len(), "detection");
+        Ok(objs)
+    }
+}
+
+/// Per-camera gate: decides when to send a frame and carries results back
+/// to the detector loop without blocking it.
+pub struct ObjectGate {
+    det: Arc<ObjectDetector>,
+    labels: Vec<String>,
+    zones: Vec<Vec<(f64, f64)>>,
+    masks: Vec<Vec<(f64, f64)>>,
+    interval: i64,
+    last_sent: i64,
+    in_flight: bool,
+    tx: tokio::sync::mpsc::UnboundedSender<(i64, Result<Vec<DetectedObject>>)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(i64, Result<Vec<DetectedObject>>)>,
+}
+
+impl ObjectGate {
+    pub fn new(det: Arc<ObjectDetector>, cam: &crate::db::Camera) -> ObjectGate {
+        let labels: Vec<String> = if cam.object_labels.trim().is_empty() {
+            det.cfg.labels.clone()
+        } else {
+            cam.object_labels.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ObjectGate {
+            interval: (det.cfg.interval_secs * crate::mp4::TIMESCALE as f64) as i64,
+            det,
+            labels,
+            zones: crate::detect::parse_polys(&cam.zones_json),
+            masks: crate::detect::parse_polys(&cam.masks_json),
+            last_sent: 0,
+            in_flight: false,
+            tx,
+            rx,
+        }
+    }
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Called with every motion-positive frame (yuv420p at `w`x`h`); sends a
+    /// detection when the interval allows and none is in flight.
+    pub fn maybe_send(&mut self, dts: i64, yuv: &[u8], w: usize, h: usize) -> bool {
+        if self.in_flight || dts - self.last_sent < self.interval {
+            return false;
+        }
+        let rgb = crate::preview::yuv420_to_rgb_tile(yuv, w, h, w as u32, h as u32);
+        let Ok(jpeg) = crate::preview::encode_jpeg(&rgb, w as u32, h as u32, 85) else { return false };
+        self.in_flight = true;
+        self.last_sent = dts;
+        let (det, tx) = (self.det.clone(), self.tx.clone());
+        let (w, h) = (w as u32, h as u32);
+        tokio::spawn(async move {
+            let r = det.detect(jpeg, w, h).await;
+            let _ = tx.send((dts, r));
+        });
+        true
+    }
+
+    /// Filtered results that arrived since the last call (non-blocking).
+    pub fn poll(&mut self) -> Vec<(i64, Vec<DetectedObject>)> {
+        let mut out = Vec::new();
+        while let Ok((dts, r)) = self.rx.try_recv() {
+            self.in_flight = false;
+            match r {
+                Ok(objs) => out.push((dts, filter(objs, &self.labels, self.det.cfg.min_confidence, &self.zones, &self.masks))),
+                Err(e) => warn!("object detection: {e:#}"),
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(label: &str, c: f64, bbox: [f64; 4]) -> DetectedObject {
+        DetectedObject { label: label.into(), confidence: c, bbox }
+    }
+
+    #[test]
+    fn parses_deepstack_predictions_into_normalized_boxes() {
+        let v = serde_json::json!({"success": true, "predictions": [
+            {"label": "person", "confidence": 0.91, "x_min": 320, "y_min": 90, "x_max": 480, "y_max": 360},
+            {"label": "junk"}
+        ]});
+        let o = parse_predictions(&v, 640, 360);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].label, "person");
+        assert_eq!(o[0].bbox, [0.5, 0.25, 0.75, 1.0]);
+        assert!(parse_predictions(&serde_json::json!({"success": false}), 640, 360).is_empty());
+    }
+
+    #[test]
+    fn filter_by_label_confidence_zone_and_mask() {
+        let left = vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)];
+        let objs = vec![
+            obj("person", 0.9, [0.1, 0.1, 0.3, 0.9]),  // bottom centre (0.2, 0.9): in zone
+            obj("person", 0.9, [0.6, 0.1, 0.8, 0.9]),  // (0.7, 0.9): outside zone
+            obj("car", 0.3, [0.1, 0.1, 0.3, 0.9]),     // low confidence
+            obj("bird", 0.99, [0.1, 0.1, 0.3, 0.9]),   // label not wanted
+        ];
+        let labels = vec!["person".to_string(), "car".to_string()];
+        let kept = filter(objs.clone(), &labels, 0.5, std::slice::from_ref(&left), &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].bbox[0], 0.1);
+        // a mask over the left half removes it; no zones = whole frame
+        let kept = filter(objs.clone(), &labels, 0.5, &[], std::slice::from_ref(&left));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].bbox[0], 0.6);
+        assert_eq!(filter(objs, &[], 0.0, &[], &[]).len(), 4);
+        assert!(!inside(&[(0.0, 0.0), (1.0, 1.0)], 0.5, 0.5));
+    }
+
+    #[test]
+    fn event_objects_merge_and_kind() {
+        let mut e = EventObjects::default();
+        assert!(e.merge(&[obj("car", 0.6, [0.0; 4])]));
+        assert!(!e.merge(&[obj("car", 0.5, [0.0; 4])]));
+        assert!(e.merge(&[obj("car", 0.7, [0.0; 4]), obj("person", 0.55, [0.0; 4])]));
+        assert_eq!(e.detections, 3);
+        let prio = vec!["person".to_string(), "car".to_string()];
+        assert_eq!(e.kind(&prio), "person");
+        assert_eq!(e.kind(&[]), "car"); // most confident
+        assert_eq!(EventObjects::default().kind(&prio), "motion");
+        let l = e.list();
+        assert_eq!(l[0].label, "car");
+        assert_eq!(l[0].confidence, 0.7);
+    }
+}

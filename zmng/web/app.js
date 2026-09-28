@@ -459,7 +459,7 @@ function reviewSession(stage, cams, range, startAt) {
 // ---------------------------------------------------------------------------
 async function viewEvents(main) {
   const cams = state.cameras;
-  const q = { camera: localStorage.getItem('evCam') || '', min_score: Number(localStorage.getItem('evMin') || 0), archived: false, range: localStorage.getItem('evRange') || '7d' };
+  const q = { camera: localStorage.getItem('evCam') || '', min_score: Number(localStorage.getItem('evMin') || 0), archived: false, range: localStorage.getItem('evRange') || '7d', kind: localStorage.getItem('evKind') || '' };
   const list = h('div', { class: 'events' });
   const more = h('button', { class: 'ghost' }, 'Load more');
   const count = h('span', { class: 'muted' });
@@ -470,7 +470,9 @@ async function viewEvents(main) {
   const rangeSel = h('select', { onchange: (e) => { q.range = e.target.value; localStorage.setItem('evRange', q.range); load(true); } },
     ...[['1d', 'Last 24 h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['all', 'All']].map(([v, l]) => h('option', { value: v, selected: v === q.range }, l)));
   const arch = h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', onchange: (e) => { q.archived = e.target.checked; load(true); } }), ' Archived only');
-  main.replaceChildren(h('div', { class: 'toolbar' }, camSel, minSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
+  const kindSel = h('select', { onchange: (e) => { q.kind = e.target.value; localStorage.setItem('evKind', q.kind); load(true); } },
+    ...[['', 'Anything'], ['person', 'People'], ['car,truck,bus,motorcycle,bicycle', 'Vehicles'], ['dog,cat', 'Animals'], ['motion', 'Motion only (no object)']].map(([v, l]) => h('option', { value: v, selected: v === q.kind }, l)));
+  main.replaceChildren(h('div', { class: 'toolbar' }, camSel, kindSel, minSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
   let before = null, total = 0;
   async function load(reset) {
     if (reset) { list.replaceChildren(); before = null; total = 0; }
@@ -479,6 +481,7 @@ async function viewEvents(main) {
     if (q.camera.startsWith('g:')) p.set('camera', cams.filter((c) => groupsOf(c).includes(q.camera.slice(2))).map((c) => c.id).join(',') || '0');
     else if (q.camera) p.set('camera', q.camera);
     if (q.min_score) p.set('min_score', q.min_score);
+    if (q.kind) p.set('kind', q.kind);
     if (q.archived) p.set('archived', 'true');
     if (days) p.set('start', Date.now() - days * 86400000);
     if (before) p.set('before', before);
@@ -496,7 +499,9 @@ function eventCard(ev) {
   const cam = camById(ev.camera_id);
   return h('div', { class: 'event' + (ev.archived ? ' archived' : ''), onclick: () => openEvent(ev) },
     h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`)),
-    h('div', { class: 'meta' }, h('b', {}, cam?.name || `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`, ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
+    h('div', { class: 'meta' }, h('b', {}, cam?.name || `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`,
+      ev.objects?.length ? h('div', { class: 'labels' }, ...ev.objects.map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`))) : null,
+      ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
 }
 function openEvent(ev) {
   const cam = camById(ev.camera_id);
@@ -511,7 +516,7 @@ function openEvent(ev) {
         h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/camera/${ev.camera_id}/${ev.peak || ev.start}`; } }, 'Open camera timeline'),
         h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/review/${ev.peak || ev.start}`; } }, 'Review all cameras at this time'),
         h('a', { class: 'muted', href: `/api/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}`, download: `event-${ev.id}.mp4`, onclick: (e) => e.stopPropagation() }, 'Download'),
-        h('span', { class: 'muted' }, `peak ${ev.score}`)),
+        h('span', { class: 'muted' }, `peak ${ev.score}${ev.objects?.length ? ' · ' + ev.objects.map((o) => `${o.label} ${Math.round(o.confidence * 100)}%`).join(', ') : ''}`)),
       h('label', {}, notes),
       h('button', { class: 'small', onclick: async () => { await api.patch(`/api/events/${ev.id}`, { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
   document.body.append(modal);
@@ -587,13 +592,15 @@ async function viewAdmin(main) {
 }
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
 function editCamera(c) {
-  const fields = [['name', 'Name'], ['tags', 'Groups (comma separated, e.g. Outside, CBA)'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
-  const strings = ['name', 'tags', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
+  const fields = [['name', 'Name'], ['tags', 'Groups (comma separated, e.g. Outside, CBA)'], ['object_labels', 'Object labels (comma separated; blank = server default)'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
+  const strings = ['name', 'tags', 'object_labels', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
   const inputs = {};
-  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v); if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); state.cameras = await api.get('/api/cameras'); route(); } catch (err) { errEl.textContent = err.message; } } },
+  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v); if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; patch.objects = inputs.objects.checked; patch.require_object = inputs.require_object.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); state.cameras = await api.get('/api/cameras'); route(); } catch (err) { errEl.textContent = err.message; } } },
     ...fields.map(([k, l]) => h('label', {}, l, inputs[k] = h('input', { value: c[k] ?? '' }))),
     h('label', { class: 'row' }, inputs.enabled = h('input', { type: 'checkbox', style: 'width:auto', checked: c.enabled }), ' Enabled'),
     h('label', { class: 'row' }, inputs.record_sub = h('input', { type: 'checkbox', style: 'width:auto', checked: c.record_sub }), ' Record substream too (review, phones, previews)'),
+    h('label', { class: 'row' }, inputs.objects = h('input', { type: 'checkbox', style: 'width:auto', checked: c.objects }), ' Object detection on motion (needs [objects] in zmng.toml)'),
+    h('label', { class: 'row' }, inputs.require_object = h('input', { type: 'checkbox', style: 'width:auto', checked: c.require_object }), ' Only keep events with a detected object'),
     h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
   const errEl = h('p', { class: 'err' });
   const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Camera ${c.id}`), form, errEl));

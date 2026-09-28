@@ -278,6 +278,10 @@ fn run(cfg: config::Config) -> Result<()> {
             thumb_dir: cfg.thumb_dir.clone(),
             bus: bus.clone(),
             preview_secs: cfg.preview_secs,
+            objects: match cfg.objects.clone() {
+                Some(o) => Some(Arc::new(zmng::objects::ObjectDetector::new(o)?)),
+                None => None,
+            },
         });
         detect::reconcile(dctx.clone()).await?;
 

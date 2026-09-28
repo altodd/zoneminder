@@ -56,7 +56,7 @@ async fn detector_writes_preview_tiles_from_its_frames() {
     let fx = Fixture::new();
     let cam = fx.db.add_camera("synthetic", "rtsp://none/", Some("lavfi:testsrc=size=320x180:rate=10"), fx.storage_id).unwrap();
     fx.db.update_camera(cam, json!({"record_sub": false, "detect_fps": 10}).as_object().unwrap()).unwrap();
-    let ctx = Arc::new(zmng::detect::DetectCtx { db: fx.db.clone(), hub: fx.hub.clone(), ffmpeg: "ffmpeg".into(), thumb_dir: fx.thumb_dir.clone(), bus: fx.bus.clone(), preview_secs: 1 });
+    let ctx = Arc::new(zmng::detect::DetectCtx { db: fx.db.clone(), hub: fx.hub.clone(), ffmpeg: "ffmpeg".into(), thumb_dir: fx.thumb_dir.clone(), bus: fx.bus.clone(), preview_secs: 1, objects: None });
     zmng::detect::reconcile(ctx.clone()).await.unwrap();
     let store = Store::new(&fx.thumb_dir);
     let mut tiles = Vec::new();

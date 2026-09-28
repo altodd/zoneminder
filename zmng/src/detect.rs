@@ -32,6 +32,8 @@ pub struct DetectCtx {
     pub bus: Arc<crate::notify::Bus>,
     /// seconds between preview tiles (0 = off)
     pub preview_secs: u32,
+    /// external object detector (None = motion only)
+    pub objects: Option<Arc<crate::objects::ObjectDetector>>,
 }
 
 pub struct DetectorHandle {
@@ -307,7 +309,7 @@ impl Drop for TempFile {
     }
 }
 
-async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Result<()> {
+async fn detect_session(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Camera) -> Result<()> {
     if cam.record_sub {
         if let Some(sh) = ctx.hub.get_stream(cam.id, crate::recorder::StreamKind::Sub) {
             return detect_from_recorder(ctx, h, cam, sh).await;
@@ -366,32 +368,38 @@ async fn detect_session(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera) -> Re
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started");
     h.status.write().running = true;
 
-    let mut run = DetectRun::new(ctx, cam);
+    let mut run = DetectRun::new(ctx.clone(), cam.clone(), h.clone());
     let mut frame = vec![0u8; w * hh * 3 / 2];
     // pipeline latency of the substream decode is small (< 300 ms); we stamp frames with wallclock at read time
+    // (dropping `run` at any exit closes an open event)
     loop {
         tokio::time::timeout(Duration::from_secs(30), stdout.read_exact(&mut frame))
             .await
             .map_err(|_| anyhow::anyhow!("no frames for 30 s"))?
             .context("ffmpeg pipe closed")?;
         let dts = now_dts() - TIMESCALE as i64 / 4; // ~250 ms decode/pipe latency
-        run.on_frame(ctx, cam, h, dts, &frame).await?;
+        run.on_frame(dts, &frame).await?;
     }
 }
 
 /// Per-session detector state shared by both feeding modes.
 struct DetectRun {
+    ctx: Arc<DetectCtx>,
+    cam: Camera,
+    handle: Arc<DetectorHandle>,
     det: MotionDetector,
     ev: EventState,
     fps_t: Instant,
     fps_n: u32,
     preview: Option<crate::preview::PreviewWriter>,
+    gate: Option<crate::objects::ObjectGate>,
     w: usize,
     h: usize,
+    last_dts: i64,
 }
 
 impl DetectRun {
-    fn new(ctx: &DetectCtx, cam: &Camera) -> Self {
+    fn new(ctx: Arc<DetectCtx>, cam: Camera, handle: Arc<DetectorHandle>) -> Self {
         let zones = parse_polys(&cam.zones_json);
         let masks = parse_polys(&cam.masks_json);
         DetectRun {
@@ -400,18 +408,34 @@ impl DetectRun {
             fps_t: Instant::now(),
             fps_n: 0,
             preview: (ctx.preview_secs > 0).then(|| crate::preview::PreviewWriter::new(&ctx.thumb_dir, cam.id, ctx.preview_secs, cam.detect_width, cam.detect_height)),
+            gate: ctx.objects.as_ref().filter(|_| cam.objects).map(|d| crate::objects::ObjectGate::new(d.clone(), &cam)),
             w: cam.detect_width as usize,
             h: cam.detect_height as usize,
+            last_dts: 0,
+            ctx,
+            cam,
+            handle,
         }
     }
 
-    /// `frame` is a planar yuv420p picture; the detector uses its Y plane,
-    /// the preview writer the whole thing.
-    async fn on_frame(&mut self, ctx: &DetectCtx, cam: &Camera, h: &DetectorHandle, dts: i64, frame: &[u8]) -> Result<()> {
+    /// `frame` is a planar yuv420p picture; the motion detector uses its Y
+    /// plane, the preview writer and the object detector the whole thing.
+    async fn on_frame(&mut self, dts: i64, frame: &[u8]) -> Result<()> {
+        let (ctx, cam, h) = (self.ctx.clone(), self.cam.clone(), self.handle.clone());
+        self.last_dts = dts;
         let score = self.det.feed(&frame[..self.w * self.h]);
         if let Some(p) = self.preview.as_mut() {
             if let Err(e) = p.maybe(dts, frame, self.w, self.h) {
                 warn!(camera = cam.id, "preview tile: {e:#}");
+            }
+        }
+        if let Some(g) = self.gate.as_mut() {
+            if score > 0 {
+                g.maybe_send(dts, frame, self.w, self.h);
+            }
+            let labels = g.labels().to_vec();
+            for (d, objs) in g.poll() {
+                self.ev.on_objects(&ctx, &cam, d, objs, &labels)?;
             }
         }
         self.fps_n += 1;
@@ -426,7 +450,20 @@ impl DetectRun {
         if let Some(hh2) = ctx.hub.get(cam.id) {
             hh2.motion.push(dts, score);
         }
-        self.ev.step(ctx, cam, dts, score, h).await
+        self.ev.step(&ctx, &cam, dts, score, &h)
+    }
+}
+
+impl Drop for DetectRun {
+    /// A session ending for any reason (stream error, config change, stop)
+    /// must not leave its event open until the next process restart.
+    fn drop(&mut self) {
+        if self.ev.event_id.is_some() {
+            let end_dts = if self.last_dts > 0 { self.last_dts } else { now_dts() };
+            if let Err(e) = self.ev.close(&self.ctx, &self.cam, end_dts, &self.handle) {
+                error!(camera = self.cam.id, "closing event at session end: {e:#}");
+            }
+        }
     }
 }
 
@@ -434,7 +471,7 @@ impl DetectRun {
 /// opening a second RTSP session: no extra camera connection, credentials
 /// never leave the process, and every decoded frame carries the recording's
 /// own absolute timestamp (read back from ffmpeg's `showinfo` filter).
-async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera, sh: Arc<crate::recorder::CamHandle>) -> Result<()> {
+async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Camera, sh: Arc<crate::recorder::CamHandle>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (w, hh) = (cam.detect_width as usize, cam.detect_height as usize);
     let fps = cam.detect_fps.max(0.5);
@@ -520,7 +557,7 @@ async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera,
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started (fed by substream recorder)");
     h.status.write().running = true;
 
-    let mut run = DetectRun::new(ctx, cam);
+    let mut run = DetectRun::new(ctx.clone(), cam.clone(), h.clone());
     let mut frame = vec![0u8; w * hh * 3 / 2];
     loop {
         tokio::select! {
@@ -536,7 +573,7 @@ async fn detect_from_recorder(ctx: &DetectCtx, h: &DetectorHandle, cam: &Camera,
             Ok(Some(pts)) if pts > 1.0e9 => (pts * TIMESCALE as f64) as i64,
             _ => now_dts() - TIMESCALE as i64 / 4,
         };
-        run.on_frame(ctx, cam, h, dts, &frame).await?;
+        run.on_frame(dts, &frame).await?;
     }
 }
 
@@ -551,10 +588,88 @@ struct EventState {
     last_db_update: i64,
     motion_frames: u32,
     frames: u32,
+    /// objects seen during this event
+    objects: crate::objects::EventObjects,
+    /// EventStart was published (deferred until the first object when the
+    /// camera requires one)
+    announced: bool,
+    /// detections that arrived before the event row existed
+    pending: Vec<(i64, Vec<crate::notify::DetectedObject>)>,
 }
 
 impl EventState {
-    async fn step(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, score: u8, h: &DetectorHandle) -> Result<()> {
+    fn meta(&self) -> serde_json::Value {
+        serde_json::json!({
+            "frames": self.frames,
+            "motion_frames": self.motion_frames,
+            "peak": self.peak,
+            "detections": self.objects.detections,
+            "objects": self.objects.list(),
+        })
+    }
+
+    /// Merge a detection result into the open event (or keep it for the
+    /// event that is about to open). Publishes EventStart/EventUpdate.
+    fn on_objects(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, objs: Vec<crate::notify::DetectedObject>, labels: &[String]) -> Result<()> {
+        let Some(id) = self.event_id else {
+            if !objs.is_empty() {
+                self.pending.retain(|(d, _)| dts - *d < 10 * TIMESCALE as i64);
+                self.pending.push((dts, objs));
+            }
+            return Ok(());
+        };
+        let changed = self.objects.merge(&objs);
+        if !changed {
+            return Ok(());
+        }
+        let kind = self.objects.kind(labels);
+        ctx.db.update_event_objects(id, &kind, &self.meta().to_string())?;
+        info!(camera = cam.id, event = id, %kind, objects = ?self.objects.list().iter().map(|o| format!("{}:{:.2}", o.label, o.confidence)).collect::<Vec<_>>(), "objects");
+        if self.announced {
+            ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventUpdate);
+        } else {
+            self.announced = true;
+            ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);
+        }
+        Ok(())
+    }
+
+    /// Close the open event at `end_dts` (post-roll included), or discard it
+    /// when the camera requires an object and none was seen.
+    fn close(&mut self, ctx: &DetectCtx, cam: &Camera, last_motion_dts: i64, h: &DetectorHandle) -> Result<()> {
+        let ts = TIMESCALE as i64;
+        let Some(id) = self.event_id else { return Ok(()) };
+        let peak_dts = self.peak_dts;
+        h.status.write().in_event = None;
+        if cam.require_object && self.objects.is_empty() {
+            ctx.db.delete_event(id)?;
+            info!(camera = cam.id, event = id, "event discarded: no object detected");
+            *self = EventState::default();
+            return Ok(());
+        }
+        let end = last_motion_dts + (cam.post_secs * ts as f64) as i64;
+        ctx.db.close_event(id, end, None, &self.meta().to_string())?;
+        info!(camera = cam.id, event = id, peak = self.peak, kind = %self.objects.kind(&[]), secs = (end - self.start_dts) / ts, "event end");
+        ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventEnd);
+        *self = EventState::default();
+        // thumbnail in the background (waits for the segment to close if needed)
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let db = ctx.db.clone();
+            let ffmpeg = ctx.ffmpeg.clone();
+            let thumb_dir = ctx.thumb_dir.clone();
+            let bus = ctx.bus.clone();
+            let cam_id = cam.id;
+            rt.spawn(async move {
+                match make_thumbnail(&db, &ffmpeg, &thumb_dir, cam_id, id, peak_dts).await {
+                    Ok(jpeg) => bus.publish(crate::notify::Notification::EventThumbnail { event_id: id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) }),
+                    Err(e) => error!(camera = cam_id, event = id, "thumbnail: {e:#}"),
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn step(&mut self, ctx: &DetectCtx, cam: &Camera, dts: i64, score: u8, h: &DetectorHandle) -> Result<()> {
         let ts = TIMESCALE as i64;
         if score > 0 {
             self.consecutive = self.consecutive.saturating_add(1);
@@ -577,7 +692,15 @@ impl EventState {
                     self.frames = 1;
                     h.status.write().in_event = Some(id);
                     ctx.db.update_event_progress(id, score, dts)?;
-                    ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);
+                    self.announced = !cam.require_object;
+                    if self.announced {
+                        ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);
+                    }
+                    let pending = std::mem::take(&mut self.pending);
+                    let labels: Vec<String> = ctx.objects.as_ref().map(|d| d.cfg.labels.clone()).unwrap_or_default();
+                    for (d, objs) in pending.into_iter().filter(|(d, _)| dts - *d < 10 * TIMESCALE as i64) {
+                        self.on_objects(ctx, cam, d, objs, &labels)?;
+                    }
                 }
             }
             Some(id) => {
@@ -597,30 +720,8 @@ impl EventState {
                 let quiet = dts - self.last_motion_dts;
                 let max_len = ts * 600; // hard cap 10 min from event start; a new event starts if motion continues
                 if quiet > (cam.cooldown_secs * ts as f64) as i64 || dts - self.start_dts > max_len {
-                    let end = self.last_motion_dts + (cam.post_secs * ts as f64) as i64;
-                    let meta = serde_json::json!({
-                        "frames": self.frames,
-                        "motion_frames": self.motion_frames,
-                        "peak": self.peak,
-                    });
-                    ctx.db.close_event(id, end, None, &meta.to_string())?;
-                    info!(camera = cam.id, event = id, peak = self.peak, secs = (end - (self.peak_dts)) / ts, "event end");
-                    h.status.write().in_event = None;
-                    ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventEnd);
-                    let peak_dts = self.peak_dts;
-                    *self = EventState::default();
-                    // thumbnail in the background (waits for the segment to close if needed)
-                    let db = ctx.db.clone();
-                    let ffmpeg = ctx.ffmpeg.clone();
-                    let thumb_dir = ctx.thumb_dir.clone();
-                    let bus = ctx.bus.clone();
-                    let cam_id = cam.id;
-                    tokio::spawn(async move {
-                        match make_thumbnail(&db, &ffmpeg, &thumb_dir, cam_id, id, peak_dts).await {
-                            Ok(jpeg) => bus.publish(crate::notify::Notification::EventThumbnail { event_id: id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) }),
-                            Err(e) => error!(camera = cam_id, event = id, "thumbnail: {e:#}"),
-                        }
-                    });
+                    let last = self.last_motion_dts;
+                    self.close(ctx, cam, last, h)?;
                 }
             }
         }

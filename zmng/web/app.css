@@ -129,3 +129,6 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 .issue { padding: 4px 8px; border-left: 3px solid var(--accent2); }
 .issue.error { border-left-color: var(--motion); }
 .card + .card { margin-top: 12px; }
+
+/* detected objects */
+.event .labels { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0; }
