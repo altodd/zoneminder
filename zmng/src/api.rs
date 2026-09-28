@@ -40,6 +40,8 @@ pub struct App {
     pub transcoder: Option<Arc<crate::transcode::Transcoder>>,
     /// pending PTZ auto-stop timers per camera
     pub ptz_timers: Arc<parking_lot::Mutex<std::collections::HashMap<i64, tokio::task::AbortHandle>>>,
+    /// HTTP client for peers, webhooks and probes
+    pub http: reqwest::Client,
 }
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
@@ -300,6 +302,7 @@ async fn me(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> 
         "setup_needed": app.db.user_count().unwrap_or(0) == 0,
         "go2rtc_url": app.cfg.go2rtc_url,
         "transcode": app.transcoder.is_some(),
+        "peers": app.cfg.peers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
     }))
     .into_response())
 }
@@ -1174,6 +1177,70 @@ async fn metrics(State(app): State<App>, user: Option<axum::Extension<AuthUser>>
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::health::prometheus(&r)).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// federation: peers
+// ---------------------------------------------------------------------------
+
+/// Peers and whether they answer right now (admins also see the URL).
+async fn peers(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let admin = u.role == "admin";
+    let checks = app.cfg.peers.iter().map(|p| {
+        let (http, p) = (app.http.clone(), p.clone());
+        async move {
+            let ok = tokio::time::timeout(std::time::Duration::from_secs(3), http.get(format!("{}/api/health", p.url.trim_end_matches('/'))).send())
+                .await
+                .map(|r| r.map(|r| r.status().is_success()).unwrap_or(false))
+                .unwrap_or(false);
+            let mut v = serde_json::json!({"name": p.name, "ok": ok});
+            if admin {
+                v["url"] = serde_json::Value::String(p.url.clone());
+            }
+            v
+        }
+    });
+    let out: Vec<serde_json::Value> = futures::future::join_all(checks).await;
+    Ok(Json(out).into_response())
+}
+
+/// Reverse proxy to a peer's read API with the peer token. The browser
+/// never sees the token; the peer's own ACL (for the token's account)
+/// decides what comes back.
+async fn peer_proxy(State(app): State<App>, Path((name, path)): Path<(String, String)>, user: Option<axum::Extension<AuthUser>>, req: Request<Body>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let peer = app.cfg.peers.iter().find(|p| p.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, "no such peer").into_response())?;
+    let need_admin = crate::peers::allowed(req.method(), &path).ok_or_else(|| (StatusCode::NOT_FOUND, "not proxied").into_response())?;
+    if need_admin && u.role != "admin" {
+        return Err((StatusCode::FORBIDDEN, "admin only").into_response());
+    }
+    let mut url = format!("{}/{}", peer.url.trim_end_matches('/'), path.trim_start_matches('/'));
+    if let Some(q) = req.uri().query() {
+        url.push('?');
+        url.push_str(q);
+    }
+    let method = req.method().clone();
+    let mut out = app.http.request(method, &url).bearer_auth(&peer.token).timeout(std::time::Duration::from_secs(3600));
+    for h in ["range", "content-type", "if-none-match", "accept"] {
+        if let Some(v) = req.headers().get(h) {
+            out = out.header(h, v.clone());
+        }
+    }
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20).await.map_err(|_| bad("body too large"))?;
+    if !body.is_empty() {
+        out = out.body(body);
+    }
+    let res = out.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("peer {name}: {e}")}))).into_response())?;
+    let mut b = Response::builder().status(res.status().as_u16());
+    for h in crate::peers::PASS_HEADERS {
+        if let Some(v) = res.headers().get(*h) {
+            b = b.header(*h, v.clone());
+        }
+    }
+    use futures::TryStreamExt;
+    let stream = res.bytes_stream().map_err(std::io::Error::other);
+    Ok(b.body(Body::from_stream(stream)).unwrap())
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true, "ts": TIMESCALE}))
 }
@@ -1196,6 +1263,7 @@ impl App {
             started_ms: crate::db::now_dts() / 90,
             transcoder,
             ptz_timers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(3)).build().expect("reqwest client"),
         }
     }
 }
@@ -1240,6 +1308,8 @@ pub fn router(app: App) -> Router {
         .route("/api/storages", get(storages).post(storage_create))
         .route("/api/storages/{id}", axum::routing::patch(storage_update))
         .route("/api/stats", get(stats))
+        .route("/api/peers", get(peers))
+        .route("/api/peers/{name}/{*path}", axum::routing::any(peer_proxy))
         .route("/api/status", get(status))
         .route("/api/metrics", get(metrics))
         .merge(crate::zmapi::router())

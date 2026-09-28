@@ -45,7 +45,14 @@ const api = {
 };
 
 const state = { me: null, cameras: [], cleanup: null };
-const camById = (id) => state.cameras.find((c) => c.id === Number(id));
+// Federation: cameras from peers carry `peer`; their key is "peer:id" and their API lives under /api/peers/<peer>/.
+const keyOf = (c) => (c.peer ? `${c.peer}:${c.id}` : String(c.id));
+const camById = (key) => { const k = String(key); return state.cameras.find((c) => keyOf(c) === k) || state.cameras.find((c) => !c.peer && String(c.id) === k); };
+const apiBase = (peer) => (peer ? `/api/peers/${peer}/api` : '/api');
+const camApi = (c) => `${apiBase(c.peer)}/cameras/${c.id}`;
+const evApi = (ev) => `${apiBase(ev.peer)}/events/${ev.id}`;
+const evCam = (ev) => camById(ev.peer ? `${ev.peer}:${ev.camera_id}` : ev.camera_id);
+const camLabel = (c) => (c.peer ? `${c.name} @${c.peer}` : c.name);
 const groupsOf = (c) => (c.tags || '').split(',').map((s) => s.trim()).filter(Boolean);
 const allGroups = () => [...new Set(state.cameras.flatMap(groupsOf))].sort();
 
@@ -158,7 +165,7 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
     const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
     const rowH = Math.max(6, (H - 14) / Math.max(1, rows.length));
     rows.forEach((row, i) => {
-      const tl = data.get(row.id); const y = 14 + i * rowH;
+      const tl = data.get(row.key); const y = 14 + i * rowH;
       ctx.fillStyle = '#2b3442'; if (tl) for (const [a, b] of tl.coverage) ctx.fillRect(xOf(a), y, Math.max(1, xOf(b) - xOf(a)), rowH - 1);
       if (tl) {
         const bw = Math.max(1, W / ((range.end - range.start) / tl.bucket_ms));
@@ -173,8 +180,8 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
     cursor.style.left = `${xOf(playhead)}px`;
   }
   async function load() {
-    const res = await Promise.all(rows.map((r) => api.get(`/api/cameras/${r.id}/timeline?start=${Math.round(range.start)}&end=${Math.round(range.end)}`).catch(() => null)));
-    data = new Map(rows.map((r, i) => [r.id, res[i]]));
+    const res = await Promise.all(rows.map((r) => api.get(`${r.api}/timeline?start=${Math.round(range.start)}&end=${Math.round(range.end)}`).catch(() => null)));
+    data = new Map(rows.map((r, i) => [r.key, res[i]]));
     draw();
   }
   function showPreview(ev) {
@@ -183,14 +190,14 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
     preview.hidden = false; preview.style.left = `${Math.min(canvas.clientWidth - 170, Math.max(0, xOf(t) - 80))}px`;
     $('.ptime', preview).textContent = (rows.length > 1 ? row.name + ' · ' : '') + fmtTime(t);
     if (t > Date.now() - 3000) return;
-    const key = `${row.id}:${Math.round(t / 2000)}`;
+    const key = `${row.key}:${Math.round(t / 2000)}`;
     clearTimeout(previewTimer);
     if (cache.has(key)) { $('img', preview).src = cache.get(key); return; }
     previewTimer = setTimeout(async () => {
       try {
         // preview tiles (no decode) first; keyframe decode of the substream as the fallback
-        let r = await fetch(`/api/cameras/${row.id}/preview.jpg?t=${Math.round(t)}`);
-        if (r.status === 404) r = await fetch(`/api/cameras/${row.id}/frame.jpg?t=${Math.round(t)}&width=320&stream=sub`);
+        let r = await fetch(`${row.api}/preview.jpg?t=${Math.round(t)}`);
+        if (r.status === 404) r = await fetch(`${row.api}/frame.jpg?t=${Math.round(t)}&width=320&stream=sub`);
         if (!r.ok) return;
         const url = URL.createObjectURL(await r.blob());
         cache.set(key, url); if (cache.size > 400) { const k = cache.keys().next().value; URL.revokeObjectURL(cache.get(k)); cache.delete(k); }
@@ -239,22 +246,23 @@ async function viewLive(main) {
   main.replaceChildren(toolbar, grid);
   const players = [];
   for (const c of shown) {
-    const tile = h('div', { class: 'tile', onclick: () => { location.hash = `#/camera/${c.id}`; } },
-      h('div', { class: 'label' }, c.name), h('div', { class: 'stat' }, statusText(c)), h('div', { class: 'motion' }));
+    const tile = h('div', { class: 'tile', onclick: () => { location.hash = `#/camera/${keyOf(c)}`; } },
+      h('div', { class: 'label' }, camLabel(c)), h('div', { class: 'stat' }, statusText(c)), h('div', { class: 'motion' }));
     grid.append(tile);
     if (mode === 'sub' && support.h264Mse && c.sub_status?.connected) {
       const v = h('video', { muted: true, playsinline: true, autoplay: true }); tile.prepend(v);
-      const p = new MsePlayer(v); const start = () => p.play(`/api/cameras/${c.id}/live.mp4?stream=sub`, { live: true }).catch(() => fallbackSnapshot(tile, c));
+      const p = new MsePlayer(v); const start = () => p.play(`${camApi(c)}/live.mp4?stream=sub`, { live: true }).catch(() => fallbackSnapshot(tile, c));
       p.onLiveEnded = () => setTimeout(start, 2000); start(); players.push(p);
-    } else if (mode === 'webrtc' && state.me.go2rtc_url) {
+    } else if (mode === 'webrtc' && state.me.go2rtc_url && !c.peer) {
       tile.prepend(h('iframe', { src: `${state.me.go2rtc_url}/stream.html?src=${encodeURIComponent(c.id + '_CameraDirectSecondary')}&mode=webrtc`, style: 'width:100%;height:100%;border:0;background:#000;pointer-events:none', allow: 'autoplay' }));
     } else fallbackSnapshot(tile, c);
   }
   const poll = setInterval(async () => {
     try {
-      const st = await api.get('/api/stats');
-      for (const s of st.cameras) {
-        const i = shown.findIndex((c) => c.id === s.id); if (i < 0) continue;
+      const peers = [...new Set(shown.map((c) => c.peer || ''))];
+      const all = await Promise.all(peers.map((pr) => api.get(`${apiBase(pr)}/stats`).then((st) => st.cameras.map((s) => ({ ...s, peer: pr || undefined }))).catch(() => [])));
+      for (const s of all.flat()) {
+        const i = shown.findIndex((c) => c.id === s.id && (c.peer || '') === (s.peer || '')); if (i < 0) continue;
         shown[i].status = s.status; shown[i].detect = s.detect;
         const tile = grid.children[i]; if (!tile) continue;
         $('.stat', tile).textContent = statusText(shown[i]);
@@ -278,7 +286,7 @@ function fallbackSnapshot(tile, c, every = 2000, width = 640) {
     const next = new Image();
     next.onload = () => { img.src = next.src; busy = false; };
     next.onerror = () => { busy = false; };
-    next.src = `/api/cameras/${c.id}/snapshot.jpg?width=${width}&t=${Date.now()}`;
+    next.src = `${camApi(c)}/snapshot.jpg?width=${width}&t=${Date.now()}`;
   };
   load(); img._t = setInterval(load, every);
   tile.prepend(img);
@@ -306,19 +314,19 @@ async function viewCamera(main, camId, atMs) {
     ...WINDOWS.map(([v, l]) => h('option', { value: v, selected: v === windowMs }, l)));
   const timeLabel = h('span', { class: 'time' });
   const head = h('div', { class: 'toolbar' },
-    h('a', { href: '#/live', class: 'muted' }, '◀ all cameras'), h('h2', { style: 'margin:0' }, cam.name),
+    h('a', { href: '#/live', class: 'muted' }, '◀ all cameras'), h('h2', { style: 'margin:0' }, camLabel(cam)),
     h('span', { class: 'pill ' + (cam.status?.connected ? 'ok' : 'bad') }, statusText(cam)), h('span', { class: 'grow' }), timeLabel, liveBtn);
-  const tl = makeTimeline({ rows: [{ id: cam.id, name: cam.name }], range, onSeek: (t) => play(t), onRangeChange: () => {} });
+  const tl = makeTimeline({ rows: [{ id: cam.id, key: keyOf(cam), name: cam.name, api: camApi(cam) }], range, onSeek: (t) => play(t), onRangeChange: () => {} });
   const controls = h('div', { class: 'controls' }, winSel,
     h('button', { class: 'ghost', onclick: () => shift(-windowMs / 2) }, '◀'), h('button', { class: 'ghost', onclick: () => shift(windowMs / 2) }, '▶'),
     h('button', { class: 'ghost', onclick: () => play(playhead - 10000) }, '−10 s'), h('button', { class: 'ghost', onclick: () => play(playhead + 10000) }, '+10 s'),
     h('span', { class: 'grow' }),
-    h('button', { class: 'ghost', onclick: () => window.open(`/api/cameras/${cam.id}/video.mp4?start=${Math.round(playhead - 30000)}&end=${Math.round(playhead + 30000)}`) }, 'Export ±30 s'),
-    h('button', { class: 'ghost', onclick: () => window.open(`/api/cameras/${cam.id}/frame.jpg?t=${Math.round(playhead)}&width=3840`) }, 'Full-res frame'),
-    h('button', { class: 'ghost', onclick: () => { location.hash = '#/events'; localStorage.setItem('evCam', cam.id); } }, 'Events'),
+    h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/video.mp4?start=${Math.round(playhead - 30000)}&end=${Math.round(playhead + 30000)}`) }, 'Export ±30 s'),
+    h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/frame.jpg?t=${Math.round(playhead)}&width=3840`) }, 'Full-res frame'),
+    h('button', { class: 'ghost', onclick: () => { location.hash = '#/events'; localStorage.setItem('evCam', keyOf(cam)); } }, 'Events'),
     h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s'));
   main.replaceChildren(head, player, tl.el, controls);
-  if (cam.ptz && state.me.user.role === 'admin') player.append(ptzPad(cam));
+  if (cam.ptz && state.me.user.role === 'admin' && !cam.peer) player.append(ptzPad(cam));
 
   const mse = new MsePlayer(video);
   let playRange = null;
@@ -326,14 +334,14 @@ async function viewCamera(main, camId, atMs) {
   async function goLive() {
     mode = 'live'; liveBadge.hidden = false; liveBtn.disabled = true; overlay.textContent = 'connecting…';
     const mq = mainQuery(cam);
-    const url = mq !== null ? `/api/cameras/${cam.id}/live.mp4?${mq.slice(1)}` : (support.h264Mse && cam.sub_status ? `/api/cameras/${cam.id}/live.mp4?stream=sub` : null);
+    const url = mq !== null ? `${camApi(cam)}/live.mp4?${mq.slice(1)}` : (support.h264Mse && cam.sub_status ? `${camApi(cam)}/live.mp4?stream=sub` : null);
     if (!url) { overlay.textContent = 'browser cannot decode this stream — snapshots'; snapshots(); return; }
     mse.onLiveEnded = () => { if (mode === 'live') setTimeout(goLive, 2000); };
     try { await mse.play(url, { live: true }); overlay.textContent = url.includes('stream=sub') ? 'live (substream)' : url.includes('codec=h264') ? 'live (transcoded)' : 'live'; }
     catch (e) { overlay.textContent = `${e.message} — snapshots`; snapshots(); }
   }
   let snapTimer = null;
-  function snapshots() { const img = h('img', { style: 'width:100%;display:block' }); video.replaceWith(img); const load = () => { img.src = `/api/cameras/${cam.id}/snapshot.jpg?width=1920&t=${Date.now()}`; }; load(); snapTimer = setInterval(load, 1000); }
+  function snapshots() { const img = h('img', { style: 'width:100%;display:block' }); video.replaceWith(img); const load = () => { img.src = `${camApi(cam)}/snapshot.jpg?width=1920&t=${Date.now()}`; }; load(); snapTimer = setInterval(load, 1000); }
   async function play(ms) {
     mode = 'playback'; liveBadge.hidden = true; liveBtn.disabled = false; mse.onLiveEnded = null;
     playhead = Math.min(ms, Date.now() - 3000); tl.setPlayhead(playhead);
@@ -341,9 +349,9 @@ async function viewCamera(main, camId, atMs) {
     overlay.textContent = 'loading…';
     try {
       const mq = mainQuery(cam);
-      const url = mq !== null ? `/api/cameras/${cam.id}/video.mp4?start=${Math.round(s)}&end=${Math.round(e)}${mq}` : `/api/cameras/${cam.id}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`;
+      const url = mq !== null ? `${camApi(cam)}/video.mp4?start=${Math.round(s)}&end=${Math.round(e)}${mq}` : `${camApi(cam)}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`;
       if (support.mse) await mse.play(url, { startMs: s });
-      else if (support.nativeHls) { video.src = `/api/cameras/${cam.id}/playlist.m3u8?start=${Math.round(s)}&end=${Math.round(e)}`; video.play(); }
+      else if (support.nativeHls) { video.src = `${camApi(cam)}/playlist.m3u8?start=${Math.round(s)}&end=${Math.round(e)}`; video.play(); }
     } catch (err) { overlay.textContent = err.message; }
   }
   video.addEventListener('timeupdate', () => {
@@ -401,7 +409,7 @@ async function viewReview(main, atMs) {
   const quick = h('select', { onchange: (e) => { const m = Number(e.target.value); if (!m) return; toIn.value = toLocalInput(Date.now()); fromIn.value = toLocalInput(Date.now() - m); } },
     h('option', { value: 0 }, 'Quick range…'), ...[[900000, 'last 15 min'], [3600000, 'last hour'], [6 * 3600000, 'last 6 h'], [86400000, 'last 24 h'], [7 * 86400000, 'last 7 days']].map(([v, l]) => h('option', { value: v }, l)));
   const groupBoxes = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: f.groups.includes(g), onchange: syncCamsFromGroups }), g));
-  const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id, checked: f.cameras.length ? f.cameras.includes(c.id) : true }), c.name));
+  const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: keyOf(c), checked: f.cameras.length ? f.cameras.includes(keyOf(c)) : true }), camLabel(c)));
   const motionOnly = h('input', { type: 'checkbox', checked: f.motionOnly });
   function syncCamsFromGroups() {
     const gs = groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value);
@@ -421,9 +429,9 @@ async function viewReview(main, atMs) {
     const from = new Date(fromIn.value).getTime(), to = new Date(toIn.value).getTime();
     if (!(from < to)) { alert('From must be before To'); return; }
     let chosen = camBoxes.filter((b) => $('input', b).checked).map((b) => camById($('input', b).value)).filter(Boolean);
-    localStorage.setItem('reviewFilter', JSON.stringify({ from, to, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map((c) => c.id), motionOnly: motionOnly.checked }));
+    localStorage.setItem('reviewFilter', JSON.stringify({ from, to, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map(keyOf), motionOnly: motionOnly.checked }));
     if (motionOnly.checked) {
-      const res = await Promise.all(chosen.map((c) => api.get(`/api/cameras/${c.id}/timeline?start=${Math.round(from)}&end=${Math.round(to)}`).catch(() => null)));
+      const res = await Promise.all(chosen.map((c) => api.get(`${camApi(c)}/timeline?start=${Math.round(from)}&end=${Math.round(to)}`).catch(() => null)));
       chosen = chosen.filter((c, i) => res[i] && (res[i].events.length || res[i].motion.some((m) => m > 0)));
     }
     session?.destroy();
@@ -441,11 +449,11 @@ function reviewSession(stage, cams, range, startAt) {
   const grid = h('div', { class: 'grid montage' });
   const players = cams.map((c) => {
     const v = h('video', { muted: true, playsinline: true });
-    const tile = h('div', { class: 'tile', ondblclick: () => { location.hash = `#/camera/${c.id}/${Math.round(playhead)}`; } }, v, h('div', { class: 'label' }, c.name), h('div', { class: 'stat' }, ''));
+    const tile = h('div', { class: 'tile', ondblclick: () => { location.hash = `#/camera/${keyOf(c)}/${Math.round(playhead)}`; } }, v, h('div', { class: 'label' }, camLabel(c)), h('div', { class: 'stat' }, ''));
     grid.append(tile);
     return { cam: c, video: v, mse: new MsePlayer(v), stat: $('.stat', tile) };
   });
-  const tl = makeTimeline({ rows: cams.map((c) => ({ id: c.id, name: c.name })), range, fixedRange: true, tall: cams.length > 3, onSeek: (t) => seekAll(t) });
+  const tl = makeTimeline({ rows: cams.map((c) => ({ id: c.id, key: keyOf(c), name: camLabel(c), api: camApi(c) })), range, fixedRange: true, tall: cams.length > 3, onSeek: (t) => seekAll(t) });
   const timeLabel = h('span', { class: 'time' });
   const playBtn = h('button', { class: 'ghost', onclick: () => { paused = !paused; playBtn.textContent = paused ? '▶' : '⏸'; players.forEach((p) => paused ? p.video.pause() : p.video.play().catch(() => {})); } }, '⏸');
   const speedSel = h('select', { style: 'width:90px', onchange: (e) => players.forEach((p) => { p.video.playbackRate = Number(e.target.value); }) }, ...[1, 2, 4, 8].map((r) => h('option', { value: r }, `${r}×`)));
@@ -460,7 +468,7 @@ function reviewSession(stage, cams, range, startAt) {
       p.stat.textContent = '…';
       try {
         const stream = p.cam.sub_status ? 'sub' : 'main';
-        await p.mse.play(`/api/cameras/${p.cam.id}/video.mp4?stream=${stream}&start=${Math.round(s)}&end=${Math.round(e)}`, { startMs: s });
+        await p.mse.play(`${camApi(p.cam)}/video.mp4?stream=${stream}&start=${Math.round(s)}&end=${Math.round(e)}`, { startMs: s });
         p.stat.textContent = ''; p.video.playbackRate = Number(speedSel.value); if (paused) p.video.pause();
       } catch { p.stat.textContent = 'no recording'; }
     }));
@@ -486,7 +494,7 @@ async function viewEvents(main) {
   const more = h('button', { class: 'ghost' }, 'Load more');
   const count = h('span', { class: 'muted' });
   const camSel = h('select', { onchange: (e) => { q.camera = e.target.value; localStorage.setItem('evCam', q.camera); load(true); } },
-    h('option', { value: '' }, 'All cameras'), ...allGroups().map((g) => h('option', { value: 'g:' + g, selected: 'g:' + g === q.camera }, `Group: ${g}`)), ...cams.map((c) => h('option', { value: c.id, selected: String(c.id) === q.camera }, c.name)));
+    h('option', { value: '' }, 'All cameras'), ...allGroups().map((g) => h('option', { value: 'g:' + g, selected: 'g:' + g === q.camera }, `Group: ${g}`)), ...cams.map((c) => h('option', { value: keyOf(c), selected: keyOf(c) === q.camera }, camLabel(c))));
   const minSel = h('select', { onchange: (e) => { q.min_score = Number(e.target.value); localStorage.setItem('evMin', q.min_score); load(true); } },
     ...[[0, 'Any motion'], [60, 'Moderate+'], [120, 'Strong+'], [200, 'Very strong']].map(([v, l]) => h('option', { value: v, selected: v === q.min_score }, l)));
   const rangeSel = h('select', { onchange: (e) => { q.range = e.target.value; localStorage.setItem('evRange', q.range); load(true); } },
@@ -499,18 +507,28 @@ async function viewEvents(main) {
   async function load(reset) {
     if (reset) { list.replaceChildren(); before = null; total = 0; }
     const days = { '1d': 1, '7d': 7, '30d': 30 }[q.range];
-    const p = new URLSearchParams({ limit: 60 });
-    if (q.camera.startsWith('g:')) p.set('camera', cams.filter((c) => groupsOf(c).includes(q.camera.slice(2))).map((c) => c.id).join(',') || '0');
-    else if (q.camera) p.set('camera', q.camera);
-    if (q.min_score) p.set('min_score', q.min_score);
-    if (q.kind) p.set('kind', q.kind);
-    if (q.archived) p.set('archived', 'true');
-    if (days) p.set('start', Date.now() - days * 86400000);
-    if (before) p.set('before', before);
+    // one query per server: the local one pages with `before`, peers contribute their first page once
+    const servers = [...new Set(cams.map((c) => c.peer || ''))];
+    const wanted = q.camera.startsWith('g:') ? cams.filter((c) => groupsOf(c).includes(q.camera.slice(2))) : q.camera ? [camById(q.camera)].filter(Boolean) : cams;
     const t0 = performance.now();
-    const evs = await api.get(`/api/events?${p}`);
-    total += evs.length; before = evs.length ? evs[evs.length - 1].id : before;
-    more.disabled = evs.length < 60;
+    const pages = await Promise.all(servers.map(async (pr) => {
+      if (before && pr) return [];
+      const mine = wanted.filter((c) => (c.peer || '') === pr);
+      if (!mine.length) return [];
+      const p = new URLSearchParams({ limit: 60 });
+      if (q.camera) p.set('camera', mine.map((c) => c.id).join(','));
+      if (q.min_score) p.set('min_score', q.min_score);
+      if (q.kind) p.set('kind', q.kind);
+      if (q.archived) p.set('archived', 'true');
+      if (days) p.set('start', Date.now() - days * 86400000);
+      if (before && !pr) p.set('before', before);
+      const evs = await api.get(`${apiBase(pr)}/events?${p}`).catch(() => []);
+      return evs.map((ev) => (pr ? { ...ev, peer: pr, thumb: ev.thumb ? `/api/peers/${pr}${ev.thumb}` : null } : ev));
+    }));
+    const local = pages[servers.indexOf('')] || [];
+    const evs = pages.flat().sort((a, b) => b.start - a.start);
+    total += evs.length; before = local.length ? local[local.length - 1].id : before;
+    more.disabled = local.length < 60;
     count.textContent = `${total} events (${(performance.now() - t0).toFixed(0)} ms)`;
     for (const ev of evs) list.append(eventCard(ev));
   }
@@ -518,33 +536,34 @@ async function viewEvents(main) {
   await load(true);
 }
 function eventCard(ev) {
-  const cam = camById(ev.camera_id);
+  const cam = evCam(ev);
   return h('div', { class: 'event' + (ev.archived ? ' archived' : ''), onclick: () => openEvent(ev) },
     h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`)),
-    h('div', { class: 'meta' }, h('b', {}, cam?.name || `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`,
+    h('div', { class: 'meta' }, h('b', {}, cam ? camLabel(cam) : `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`,
       ev.objects?.length ? h('div', { class: 'labels' }, ...ev.objects.map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`))) : null,
       ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
 }
 function openEvent(ev) {
-  const cam = camById(ev.camera_id);
+  const cam = evCam(ev);
   const video = h('video', { controls: true, autoplay: true, playsinline: true, muted: true, style: 'width:100%;background:#000;border-radius:8px' });
   const notes = h('textarea', { rows: 2, placeholder: 'Notes' }, ev.notes || '');
-  const archBtn = h('button', { class: 'ghost', onclick: async () => { ev.archived = !ev.archived; await api.patch(`/api/events/${ev.id}`, { archived: ev.archived }); archBtn.textContent = ev.archived ? '★ Archived' : '☆ Archive'; } }, ev.archived ? '★ Archived' : '☆ Archive');
+  const archBtn = h('button', { class: 'ghost', onclick: async () => { ev.archived = !ev.archived; await api.patch(evApi(ev), { archived: ev.archived }); archBtn.textContent = ev.archived ? '★ Archived' : '☆ Archive'; } }, ev.archived ? '★ Archived' : '☆ Archive');
   const modal = h('div', { class: 'modal', onclick: (e) => { if (e.target === modal) close(); } },
     h('div', { class: 'card' },
-      h('div', { class: 'row' }, h('h2', {}, `${cam?.name || ''} — ${fmtDT(ev.start)}`), h('span', { class: 'grow' }), h('button', { class: 'ghost small', onclick: close }, '✕')),
+      h('div', { class: 'row' }, h('h2', {}, `${cam ? camLabel(cam) : ''} — ${fmtDT(ev.start)}`), h('span', { class: 'grow' }), h('button', { class: 'ghost small', onclick: close }, '✕')),
       video,
       h('div', { class: 'row', style: 'margin-top:8px' }, archBtn,
-        h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/camera/${ev.camera_id}/${ev.peak || ev.start}`; } }, 'Open camera timeline'),
+        h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/camera/${cam ? keyOf(cam) : ev.camera_id}/${ev.peak || ev.start}`; } }, 'Open camera timeline'),
         h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/review/${ev.peak || ev.start}`; } }, 'Review all cameras at this time'),
-        h('a', { class: 'muted', href: `/api/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}`, download: `event-${ev.id}.mp4`, onclick: (e) => e.stopPropagation() }, 'Download'),
+        h('a', { class: 'muted', href: `${apiBase(ev.peer)}/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}`, download: `event-${ev.id}.mp4`, onclick: (e) => e.stopPropagation() }, 'Download'),
         h('span', { class: 'muted' }, `peak ${ev.score}${ev.objects?.length ? ' · ' + ev.objects.map((o) => `${o.label} ${Math.round(o.confidence * 100)}%`).join(', ') : ''}`)),
       h('label', {}, notes),
-      h('button', { class: 'small', onclick: async () => { await api.patch(`/api/events/${ev.id}`, { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
+      h('button', { class: 'small', onclick: async () => { await api.patch(evApi(ev), { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
   document.body.append(modal);
   const mse = new MsePlayer(video);
   const mq = cam ? mainQuery(cam) : null;
-  const url = mq !== null ? `/api/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}${mq}` : `/api/cameras/${ev.camera_id}/video.mp4?stream=sub&start=${ev.start}&end=${ev.end || ev.start + 60000}`;
+  const base = `${apiBase(ev.peer)}/cameras/${ev.camera_id}`;
+  const url = mq !== null ? `${base}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}${mq}` : `${base}/video.mp4?stream=sub&start=${ev.start}&end=${ev.end || ev.start + 60000}`;
   if (support.mse) mse.play(url, { startMs: ev.start }).catch((e) => { video.replaceWith(h('p', { class: 'err' }, e.message)); });
   else video.src = url;
   function close() { mse.stop(); modal.remove(); }
@@ -569,7 +588,10 @@ async function viewStatus(main) {
       ...s.storages.map((v) => h('tr', {}, h('td', {}, h('code', {}, v.path), v.available ? '' : h('span', { class: 'pill bad' }, ' missing'), v.archive_to ? h('span', { class: 'muted small' }, ` → archive ${v.archive_to}`) : null),
         h('td', {}, gb(v.used_bytes)), h('td', {}, gb(v.free_bytes)), h('td', {}, gb(v.headroom_bytes)), h('td', {}, gb(v.ingest_24h)),
         h('td', {}, v.effective_days === null ? '—' : `${v.effective_days.toFixed(1)} days`), h('td', {}, v.oldest_ms ? fmtDur(Date.now() - v.oldest_ms) : '—')))) : null;
+    const peers = state.me.peers?.length ? await api.get('/api/peers').catch(() => []) : [];
+    const peerCard = peers.length ? h('div', { class: 'card' }, h('h2', {}, 'Peers'), ...peers.map((p) => h('div', {}, h('span', { class: 'pill ' + (p.ok ? 'ok' : 'bad') }, p.ok ? 'reachable' : 'unreachable'), ' ', p.name, p.url ? h('span', { class: 'muted small' }, ` ${p.url}`) : null))) : null;
     main.replaceChildren(
+      peerCard,
       h('div', { class: 'toolbar' }, h('h2', {}, 'Status'), h('span', { class: 'muted' }, `zmng ${s.version} · up ${fmtDur(s.uptime_secs * 1000)} · load ${s.load.map((l) => l.toFixed(1)).join(' ')}`), h('span', { class: 'grow' }), h('button', { class: 'ghost small', onclick: render }, 'Refresh')),
       issues,
       h('div', { class: 'card' }, h('h2', {}, 'Cameras'), cams),
@@ -702,6 +724,9 @@ async function boot() {
   try { state.me = await api.get('/api/me'); } catch { return; }
   if (state.me.setup_needed) { showLogin(true); return; }
   state.cameras = await api.get('/api/cameras');
+  for (const pr of state.me.peers || []) {
+    try { const remote = await api.get(`/api/peers/${pr}/api/cameras`); state.cameras.push(...remote.map((c) => ({ ...c, peer: pr }))); } catch (e) { toast(`Peer ${pr}: ${e.message}`, { kind: 'bad' }); }
+  }
   document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = state.me.user.role !== 'admin'; });
   listen();
   route();

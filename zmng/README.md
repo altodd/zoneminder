@@ -82,7 +82,20 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/events/stream` | server-sent events: `event_start`, `event_update`, `event_end`, `camera_down`, `camera_up`, `storage_low` (ACL re-checked per message) |
 | `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
+| `GET /api/peers`, `/api/peers/{name}/api/...` | federation: peer reachability; proxied read API of a peer |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
+
+## Several servers, one UI (federation)
+
+Each server records its own cameras; one of them (or all of them) lists the others as peers:
+
+```toml
+[[peers]]
+name = "barn"                         # [a-z0-9-]+, used in URLs and labels
+url = "http://10.10.100.101:8080"
+token = "…"                           # created on the peer: POST /api/tokens while logged in as the account this site may use
+```
+`/api/peers/<name>/api/...` proxies the peer's *read* API with that token (cameras, events, segments, previews, timeline, media, status; PATCH on events; PTZ for local admins), never its users, tokens, storage or its own peers. Create the token on the peer for a **viewer** account limited to the cameras this site is allowed to see: the peer's ACL for that account is what the proxy returns. The browser merges the peers' cameras into the live wall, Review and Events (labelled `name @peer`) and plays their media through the proxy; `GET /api/peers` shows which peers answer. Recording, retention, detection, notifications and the Status page stay per server. Peer events are not pushed over SSE and their go2rtc/WebRTC tiles are not available through the proxy.
 
 ## PTZ (ONVIF)
 

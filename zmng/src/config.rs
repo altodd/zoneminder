@@ -50,6 +50,8 @@ pub struct Config {
     /// On-demand H.264 transcode for clients without HEVC decode
     /// (`video.mp4?codec=h264`, `live.mp4?codec=h264`).
     pub transcode: Option<crate::transcode::TranscodeConfig>,
+    /// Other zmng servers whose cameras this UI shows (`[[peers]]`).
+    pub peers: Vec<crate::peers::PeerConfig>,
 }
 
 impl Default for Config {
@@ -73,6 +75,7 @@ impl Default for Config {
             preview_secs: 5,
             objects: None,
             transcode: None,
+            peers: Vec::new(),
         }
     }
 }
@@ -82,6 +85,9 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&text)?;
+        for p in &cfg.peers {
+            p.validate()?;
+        }
         Ok(cfg)
     }
 }
