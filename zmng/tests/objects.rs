@@ -261,3 +261,58 @@ async fn camera_object_fields_validate() {
     assert_eq!(c["require_object"], true);
     assert_eq!(c["object_labels"], "person");
 }
+
+/// A finished event is classified from its thumbnail: the labels are merged
+/// into the event, its kind follows, and the events filter finds it by any
+/// label it contains (not only the top one). The admin endpoint re-runs the
+/// pass over past events in the background.
+#[tokio::test]
+async fn events_are_classified_from_their_thumbnail() {
+    // a person and a car, both confident, feet/wheels inside the frame
+    let (port, calls) = mock_detector(json!({"success": true, "predictions": [
+        {"label": "person", "confidence": 0.91, "x_min": 100, "y_min": 60, "x_max": 180, "y_max": 300},
+        {"label": "car", "confidence": 0.8, "x_min": 300, "y_min": 150, "x_max": 600, "y_max": 340}
+    ]})).await;
+    let fx = Fixture::new();
+    let cam_id = fx.add_camera("door");
+    let cam = fx.db.camera(cam_id).unwrap().unwrap();
+    assert!(cam.objects, "cameras opt in to object detection by default");
+    let jpeg = zmng::preview::encode_jpeg(&vec![90u8; 640 * 360 * 3], 640, 360, 80).unwrap();
+    assert_eq!(zmng::objects::jpeg_size(&jpeg).unwrap(), (640, 360));
+    let ev = fx.db.insert_event(cam_id, 1_000, "motion").unwrap();
+    fx.db.close_event(ev, 2_000, None, r#"{"frames":10}"#).unwrap();
+    let det = ObjectDetector::new(cfg(port)).unwrap();
+    let kind = zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg.clone()).await.unwrap();
+    assert_eq!(kind.as_deref(), Some("person"), "person outranks car in the default label order");
+    let e = fx.db.event(ev).unwrap().unwrap();
+    let meta: Value = serde_json::from_str(&e.meta_json).unwrap();
+    assert_eq!(meta["frames"], 10, "other metadata is kept");
+    assert_eq!(meta["classified"], true);
+    assert_eq!(meta["objects"].as_array().unwrap().len(), 2);
+    // the same answer again changes nothing
+    assert_eq!(zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg).await.unwrap(), None);
+    assert_eq!(*calls.lock().unwrap(), 2);
+    assert!(det.failing(i64::MAX / 2, i64::MAX).is_none());
+
+    let admin = fx.add_admin("admin", "password123");
+    let tok = fx.token_for(admin);
+    let r = fx.router();
+    // kind "person", but the car inside it counts for a vehicles search
+    assert_eq!(get(&r, "/api/events?kind=car,truck,bus", &tok).await.json().as_array().unwrap().len(), 1);
+    assert_eq!(get(&r, "/api/events?kind=person", &tok).await.json().as_array().unwrap().len(), 1);
+    assert!(get(&r, "/api/events?kind=dog,cat", &tok).await.json().as_array().unwrap().is_empty());
+    // a malformed meta_json must not break the filter for everyone else
+    let bad = fx.db.insert_event(cam_id, 3_000, "motion").unwrap();
+    fx.db.close_event(bad, 4_000, None, "not json").unwrap();
+    assert_eq!(get(&r, "/api/events?kind=car", &tok).await.json().as_array().unwrap().len(), 1);
+
+    // the re-classification endpoint needs a configured detector
+    let res = call(&r, "POST", "/api/events/classify", Some(&tok), Some(json!({"days": 1}))).await;
+    assert_eq!(res.status, 400, "{}", res.text());
+    *fx.hub.objects.write() = Some(Arc::new(ObjectDetector::new(cfg(port)).unwrap()));
+    assert_eq!(get(&r, "/api/me", &tok).await.json()["objects"], true);
+    // events without a thumbnail are skipped; already classified ones too unless `again`
+    let res = call(&r, "POST", "/api/events/classify", Some(&tok), Some(json!({"days": 36500, "again": true}))).await;
+    assert_eq!(res.status, 202, "{}", res.text());
+    assert_eq!(res.json()["queued"], 0);
+}

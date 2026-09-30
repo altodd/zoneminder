@@ -139,11 +139,14 @@ pub struct LiveHub {
     pub subs: RwLock<HashMap<i64, Arc<CamHandle>>>,
     /// motion/object detectors by camera id
     pub detectors: RwLock<HashMap<i64, Arc<crate::detect::DetectorHandle>>>,
+    /// the external object detector when `[objects]` is configured (for
+    /// status/health and event re-classification outside the detector loop)
+    pub objects: RwLock<Option<Arc<crate::objects::ObjectDetector>>>,
 }
 
 impl LiveHub {
     pub fn new() -> Self {
-        LiveHub { cams: RwLock::new(HashMap::new()), subs: RwLock::new(HashMap::new()), detectors: RwLock::new(HashMap::new()) }
+        LiveHub { cams: RwLock::new(HashMap::new()), subs: RwLock::new(HashMap::new()), detectors: RwLock::new(HashMap::new()), objects: RwLock::new(None) }
     }
     pub fn get(&self, id: i64) -> Option<Arc<CamHandle>> {
         self.cams.read().get(&id).cloned()

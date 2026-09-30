@@ -170,11 +170,11 @@ async fn get_disk_percent(State(app): State<App>) -> Response {
     usage.insert("Total".into(), json!({"space": format!("{pct:.1}"), "color": "#8b93a1"}));
     Json(json!({"usage": usage})).into_response()
 }
-async fn config_by_name(State(app): State<App>, Path(name): Path<String>) -> Response {
+async fn config_by_name(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap) -> Response {
     let name = name.trim_end_matches(".json");
     let value = match name {
         "ZM_PATH_ZMS" => "/zm/cgi-bin/nph-zms".to_string(),
-        "ZM_GO2RTC_PATH" => app.cfg.go2rtc_url.clone().unwrap_or_default(),
+        "ZM_GO2RTC_PATH" => go2rtc_path(&app, &headers).unwrap_or_default(),
         "ZM_MIN_STREAMING_PORT" => String::new(),
         "ZM_OPT_USE_API" | "ZM_OPT_USE_AUTH" => "1".into(),
         _ => String::new(),
@@ -218,11 +218,14 @@ async fn saved() -> Response {
 
 fn monitor_json(app: &App, c: &crate::db::Camera, seq: usize) -> Value {
     let st = app.hub.get(c.id).map(|h| h.status.read().clone()).unwrap_or_default();
-    let go2rtc = app.cfg.go2rtc_url.is_some();
+    // an external go2rtc, or our own MSE websocket (see go2rtc_session)
+    let go2rtc = app.cfg.go2rtc_url.is_some() || app.cfg.zmninja_mse;
+    let det = crate::detect::status(&app.hub, c.id).filter(|d| d.running);
+    let on = |b: bool| if b { "Always" } else { "None" };
     json!({
         "Monitor": {
-            "Id": c.id.to_string(), "Name": c.name, "Type": "Ffmpeg", "Function": "Mocord",
-            "Capturing": "Always", "Analysing": "Always", "Recording": "Always", "Decoding": "Always",
+            "Id": c.id.to_string(), "Name": c.name, "Type": "Ffmpeg", "Function": if c.enabled { "Mocord" } else { "None" },
+            "Capturing": on(c.enabled), "Analysing": on(c.enabled && det.is_some()), "Recording": on(c.enabled), "Decoding": on(c.enabled),
             "Enabled": if c.enabled { "1" } else { "0" }, "Width": st.width.to_string(), "Height": st.height.to_string(),
             "Orientation": "ROTATE_0", "Controllable": if c.ptz { "1" } else { "0" }, "ControlId": if c.ptz { json!("1") } else { Value::Null }, "ServerId": null, "StorageId": c.storage_id.to_string(),
             "Sequence": seq.to_string(), "Deleted": false, "LinkedMonitors": null, "Path": "", "Options": null,
@@ -235,7 +238,7 @@ fn monitor_json(app: &App, c: &crate::db::Camera, seq: usize) -> Value {
         "Monitor_Status": {
             "MonitorId": c.id.to_string(),
             "Status": if st.connected { "Connected" } else { "NotRunning" },
-            "CaptureFPS": format!("{:.1}", st.fps), "AnalysisFPS": format!("{:.1}", crate::detect::status(&app.hub, c.id).map(|d| d.fps).unwrap_or(0.0)),
+            "CaptureFPS": format!("{:.1}", st.fps), "AnalysisFPS": format!("{:.1}", det.map(|d| d.fps).unwrap_or(0.0)),
             "CaptureBandwidth": ((st.kbps * 125.0) as i64).to_string()
         }
     })
@@ -533,8 +536,14 @@ async fn index_php(State(app): State<App>, RawQuery(raw): RawQuery, headers: Hea
             if q.get("request").map(|s| s.as_str()) == Some("control") {
                 return zm_control(&app, u, &q).await;
             }
-            // stream control (pause/quit/query): acknowledge
+            // stream control (pause/quit/query): quit ends that MJPEG stream,
+            // the rest are acknowledged
             let cmd = q.get("command").map(|s| s.as_str()).unwrap_or("");
+            if cmd == "17" {
+                if let Some(stop) = q.get("connkey").and_then(|k| app.mjpeg_streams.lock().remove(k)) {
+                    let _ = stop.send(());
+                }
+            }
             if cmd == "99" {
                 return Ok(Json(json!({"result": "Ok", "status": {"progress": 0, "duration": 0, "rate": 1, "zoom": 1, "paused": 0, "delayed": 0}})).into_response());
             }
@@ -712,10 +721,15 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
     let mode = q.get("mode").map(|s| s.as_str()).unwrap_or("jpeg");
     let single = mode == "single" || q.get("frames").map(|f| f == "1").unwrap_or(false);
     let maxfps: f32 = q.get("maxfps").and_then(|s| s.parse::<f32>().ok()).unwrap_or(5.0).clamp(0.5, 15.0);
+    // ZoneMinder's scale is relative to the monitor's native size; `width`
+    // wins when given. The substream serves anything up to its own width
+    // (640 px), so a tile never costs a 4 MP HEVC decode.
     let st = app.hub.get(mid).map(|h| h.status.read().clone()).unwrap_or_default();
-    let width = (st.width.max(640) * scale / 100).max(160);
+    let width = q.get("width").and_then(|s| s.parse::<u32>().ok()).unwrap_or((st.width.max(640) * scale / 100).max(160)).clamp(64, 3840);
+    let sub_w = app.hub.get_stream(mid, crate::recorder::StreamKind::Sub).and_then(|h| h.recent.read().as_ref().map(|r| r.params.width));
     if single {
-        return crate::api::frame_jpeg_pub(&app, mid, crate::db::now_dts(), width).await;
+        let (jpeg, _) = crate::api::live_jpeg(&app, mid, Some(sub_w.map(|w| width.min(w)).unwrap_or(width)), false).await?;
+        return Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")], jpeg).into_response());
     }
     // MJPEG from the substream recorder (fall back to main if no substream)
     let h = app
@@ -723,22 +737,28 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
         .get_stream(mid, crate::recorder::StreamKind::Sub)
         .or_else(|| app.hub.get(mid))
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "monitor not running"))?;
-    let (init, first) = {
+    let (init, first, src_w) = {
         let r = h.recent.read();
         let r = r.as_ref().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no frames yet"))?;
         let f = r.frags.back().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no frames yet"))?;
-        (r.init.clone(), f.2.clone())
+        (r.init.clone(), f.2.clone(), r.params.width)
     };
+    let width = width.min(src_w.max(160)).min(1280);
+    // a client reusing its connkey replaces its old stream (and frees its slot)
+    let connkey = q.get("connkey").filter(|k| !k.is_empty()).cloned();
+    if let Some(old) = connkey.as_ref().and_then(|k| app.mjpeg_streams.lock().remove(k)) {
+        let _ = old.send(());
+    }
     // fail fast: a montage that opens more streams than the pool gets a 503
     // it can retry, not a hung request
     let _permit = app.mjpeg_sem.clone().try_acquire_owned().map_err(|_| {
         (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "2")], "too many MJPEG streams; use the web UI or zmNinja's substream").into_response()
     })?;
-    let mut child = tokio::process::Command::new(&app.cfg.ffmpeg)
+    let mut child = crate::thumbs::ffmpeg_command(&app.cfg.ffmpeg)
         .args([
             "-nostdin", "-loglevel", "error", "-threads", "1", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-probesize", "65536", "-analyzeduration", "0", "-f", "mp4", "-i", "pipe:0", "-an",
-            "-vf", &format!("fps={maxfps},scale={}:-2", width.min(1280)),
+            "-probesize", "65536", "-analyzeduration", "0", "-f", "mp4", "-i", "pipe:0", "-an", "-threads", "1", "-filter_threads", "1",
+            "-vf", &format!("fps={maxfps},scale={width}:-2"),
             "-q:v", "6", "-f", "mpjpeg", "-boundary_tag", "ZoneMinderFrame", "pipe:1",
         ])
         .stdin(Stdio::piped())
@@ -766,11 +786,21 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
             }
         }
     });
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    // with a connkey the registry holds the sender (quit = send); without one
+    // the stream keeps it, or the dropped sender would end the stream at once
+    let (registered, unregistered) = match connkey {
+        Some(k) => {
+            app.mjpeg_streams.lock().insert(k.clone(), stop_tx);
+            (Some(StreamGuard { key: k, streams: app.mjpeg_streams.clone() }), None)
+        }
+        None => (None, Some(stop_tx)),
+    };
     let permit = _permit;
-    let stream = tokio_util::io::ReaderStream::new(stdout);
+    let stream = futures::StreamExt::take_until(tokio_util::io::ReaderStream::new(stdout), stop_rx);
     let stream = futures::StreamExt::map(stream, move |chunk| {
-        let _keep = &permit; // released when the client disconnects
-        let _child = &child;
+        // released (ffmpeg killed, slot freed) when the client disconnects or quits
+        let _keep = (&permit, &child, &registered, &unregistered);
         chunk
     });
     Ok(Response::builder()
@@ -778,6 +808,209 @@ async fn nph_zms(State(app): State<App>, RawQuery(raw): RawQuery, user: Option<a
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+/// Forgets a stream's `connkey` when its response is dropped.
+struct StreamGuard {
+    key: String,
+    streams: std::sync::Arc<parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let mut m = self.streams.lock();
+        // only our own entry: a newer stream may have taken the key over
+        if m.get(&self.key).is_some_and(|tx| tx.is_closed()) {
+            m.remove(&self.key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// go2rtc-compatible live stream (MSE over a websocket) for zmNinjaNg
+//
+// zmNinjaNg plays live video through go2rtc's `video-rtc` element when a
+// monitor has `Go2RTCEnabled` and `ZM_GO2RTC_PATH` is set; otherwise it falls
+// back to MJPEG from nph-zms. We speak the part of go2rtc's websocket
+// protocol that MSE needs: the client sends `{"type":"mse","value":<codecs
+// it can play>}`, we answer `{"type":"mse","value":<mime>}` and then send the
+// init segment and every fragment as binary messages. WebRTC/HLS requests
+// (the client races WebRTC against MSE) get an `error`, which makes it keep
+// the MSE picture.
+// ---------------------------------------------------------------------------
+
+/// `ZM_GO2RTC_PATH`: an external go2rtc when configured, else this server's
+/// own endpoint as the client reached it (the client appends `/ws`).
+fn go2rtc_path(app: &App, headers: &HeaderMap) -> Option<String> {
+    if let Some(u) = &app.cfg.go2rtc_url {
+        return Some(u.clone());
+    }
+    if !app.cfg.zmninja_mse {
+        return None;
+    }
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()).filter(|v| !v.is_empty());
+    let proto = h("x-forwarded-proto").unwrap_or_else(|| if app.cfg.secure_cookies { "https".into() } else { "http".into() });
+    let host = h("x-forwarded-host").or_else(|| h("host"))?;
+    Some(format!("{proto}://{host}/zm/go2rtc"))
+}
+
+/// Camera and stream a go2rtc stream name means: `<id>` and
+/// `<id>_CameraDirectPrimary` = main, `<id>_CameraDirectSecondary` = substream.
+pub fn parse_go2rtc_src(src: &str) -> Option<(i64, bool)> {
+    let (id, suffix) = src.split_once('_').unwrap_or((src, ""));
+    Some((id.parse().ok()?, suffix == "CameraDirectSecondary"))
+}
+
+fn codec_family(c: &str) -> &str {
+    match c.trim().split('.').next().unwrap_or("") {
+        "hvc1" | "hev1" => "hevc",
+        "avc1" | "avc3" => "avc",
+        other => other,
+    }
+}
+
+/// Whether a client that listed `accepted` (go2rtc's comma-separated codec
+/// list) can play a stream with these parameters through MSE.
+pub fn client_accepts(accepted: &str, params: &crate::mp4::VideoParams) -> bool {
+    let fams: Vec<&str> = accepted.split(',').map(codec_family).collect();
+    fams.contains(&codec_family(&params.rfc6381)) && params.audio.as_ref().is_none_or(|a| fams.contains(&codec_family(&a.rfc6381)))
+}
+
+#[derive(Deserialize)]
+struct Go2rtcQ {
+    src: Option<String>,
+}
+
+async fn go2rtc_ws(State(app): State<App>, Query(q): Query<Go2rtcQ>, user: Option<axum::Extension<AuthUser>>, ws: axum::extract::ws::WebSocketUpgrade) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let (cam, sub) = q.src.as_deref().and_then(parse_go2rtc_src).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown stream"))?;
+    if !crate::api::visible_cameras_pub(&app, u).contains(&cam) {
+        return Err(err(StatusCode::NOT_FOUND, "unknown stream"));
+    }
+    Ok(ws.on_upgrade(move |socket| go2rtc_session(app, socket, cam, sub)))
+}
+
+fn go2rtc_msg(typ: &str, value: &str) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(json!({"type": typ, "value": value}).to_string().into())
+}
+
+/// Answer for a request we do not serve (None = ignore the message).
+fn go2rtc_decline(typ: &str) -> Option<axum::extract::ws::Message> {
+    match typ {
+        "webrtc/offer" | "webrtc" | "hls" | "mp4" | "mjpeg" => Some(go2rtc_msg("error", &format!("{typ}: not supported by zmng (MSE only)"))),
+        _ => None,
+    }
+}
+
+async fn go2rtc_session(app: App, mut socket: axum::extract::ws::WebSocket, cam: i64, prefer_sub: bool) {
+    use axum::extract::ws::Message;
+    use futures::StreamExt;
+    loop {
+        let m = match tokio::time::timeout(std::time::Duration::from_secs(30), socket.next()).await {
+            Ok(Some(Ok(m))) => m,
+            _ => return,
+        };
+        let v: Value = match m {
+            Message::Text(t) => serde_json::from_str(&t).unwrap_or(Value::Null),
+            Message::Ping(p) => {
+                let _ = socket.send(Message::Pong(p)).await;
+                continue;
+            }
+            Message::Close(_) => return,
+            _ => continue,
+        };
+        let typ = v["type"].as_str().unwrap_or("");
+        if typ != "mse" {
+            if let Some(r) = go2rtc_decline(typ) {
+                if socket.send(r).await.is_err() {
+                    return;
+                }
+            }
+            continue;
+        }
+        // the requested stream first, the other one if the client cannot decode it
+        let accepted = v["value"].as_str().unwrap_or("");
+        let order = if prefer_sub { [crate::recorder::StreamKind::Sub, crate::recorder::StreamKind::Main] } else { [crate::recorder::StreamKind::Main, crate::recorder::StreamKind::Sub] };
+        let pick = order.into_iter().filter_map(|k| app.hub.get_stream(cam, k)).find(|h| h.recent.read().as_ref().is_some_and(|r| client_accepts(accepted, &r.params)));
+        match pick {
+            Some(h) => {
+                debug!(camera = cam, "go2rtc-compatible MSE stream started");
+                mse_stream(&mut socket, h).await;
+                return;
+            }
+            None => {
+                if socket.send(go2rtc_msg("error", "mse: no stream in a codec this client can play")).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Stream one recorder as MSE: the mime, the init segment, the newest
+/// fragment (starts on a keyframe now), then every fragment as it closes.
+/// Timestamps are rebased so the session starts at 0 (go2rtc's player
+/// never seeks, so absolute times would leave it waiting at t=0).
+async fn mse_stream(socket: &mut axum::extract::ws::WebSocket, h: std::sync::Arc<crate::recorder::CamHandle>) {
+    use axum::extract::ws::Message;
+    use futures::StreamExt;
+    let mut rx = h.live.subscribe();
+    let Some((params, init, first)) = h.recent.read().as_ref().map(|r| (r.params.clone(), r.init.clone(), r.frags.back().map(|f| (f.0, f.2.clone())))) else { return };
+    if socket.send(go2rtc_msg("mse", &params.mime())).await.is_err() || socket.send(Message::Binary(init.clone())).await.is_err() {
+        return;
+    }
+    let audio_rate = params.audio.as_ref().map(|a| a.sample_rate);
+    let mut base: Option<i64> = None;
+    let mut last_dts = i64::MIN;
+    let mut send_frag = |dts: i64, data: &[u8]| -> Option<Vec<Message>> {
+        if dts <= last_dts {
+            return Some(Vec::new()); // already sent (primed from `recent`)
+        }
+        last_dts = dts;
+        let b = *base.get_or_insert(dts);
+        let mut d = data.to_vec();
+        crate::mp4::shift_tfdt_av(&mut d, -b, audio_rate);
+        // go2rtc's player buffers at most 2 MB while its SourceBuffer is busy
+        Some(d.chunks(512 * 1024).map(|c| Message::Binary(bytes::Bytes::copy_from_slice(c))).collect())
+    };
+    if let Some((dts, data)) = first {
+        for m in send_frag(dts, &data).unwrap_or_default() {
+            if socket.send(m).await.is_err() {
+                return;
+            }
+        }
+    }
+    loop {
+        tokio::select! {
+            m = socket.next() => match m {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if let Some(r) = go2rtc_decline(v["type"].as_str().unwrap_or("")) {
+                        if socket.send(r).await.is_err() { return; }
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => { if socket.send(Message::Pong(p)).await.is_err() { return; } }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => {}
+            },
+            f = rx.recv() => match f {
+                Ok(f) => {
+                    // new parameters (camera reconnected with another resolution or
+                    // codec): end the session; the player reconnects and renegotiates
+                    if f.init != init {
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                    for m in send_frag(f.dts, &f.data).unwrap_or_default() {
+                        if socket.send(m).await.is_err() { return; }
+                    }
+                }
+                // fell behind (slow phone link): a gap would stall MSE, so start over
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { let _ = socket.send(Message::Close(None)).await; return; }
+                Err(_) => return,
+            },
+        }
+    }
 }
 
 
@@ -940,6 +1173,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/configs/viewByName/{name}", get(config_by_name))
         .route("/zm/api/servers.json", get(|| async { Json(json!({"servers": []})).into_response() }))
         .route("/zm/api/states.json", get(|| async { Json(json!({"states": []})).into_response() }))
+        .route("/zm/api/states/change/{*rest}", post(saved))
         .route("/zm/api/groups.json", get(|| async { Json(json!({"groups": []})).into_response() }))
         .route("/zm/api/tags.json", get(not_found))
         .route("/zm/api/tags/{*rest}", get(not_found))
@@ -960,6 +1194,8 @@ pub fn router() -> Router<App> {
         .route("/zm/api/{*rest}", get(empty_list))
         .route("/zm/index.php", get(index_php))
         .route("/zm/cgi-bin/nph-zms", get(nph_zms))
+        .route("/zm/go2rtc/ws", get(go2rtc_ws))
+        .route("/zm/go2rtc/api/ws", get(go2rtc_ws))
         .route("/zm/ws", get(es_ws))
 }
 
@@ -998,6 +1234,28 @@ mod tests {
         assert_eq!(a["events"][0]["DetectionJson"][0]["confidence"], "91%");
         let plain = crate::notify::EventInfo { objects: vec![], ..e };
         assert_eq!(es_alarm_json(&plain)["events"][0]["Cause"], "Motion");
+    }
+
+    #[test]
+    fn go2rtc_stream_names_and_codecs() {
+        assert_eq!(parse_go2rtc_src("7"), Some((7, false)));
+        assert_eq!(parse_go2rtc_src("7_CameraDirectPrimary"), Some((7, false)));
+        assert_eq!(parse_go2rtc_src("12_CameraDirectSecondary"), Some((12, true)));
+        assert_eq!(parse_go2rtc_src("x_CameraDirectSecondary"), None);
+        let p = |v: &str, a: Option<&str>| crate::mp4::VideoParams {
+            codec: if v.starts_with("avc") { crate::mp4::Codec::H264 } else { crate::mp4::Codec::H265 },
+            width: 640,
+            height: 360,
+            sample_entry: bytes::Bytes::new(),
+            rfc6381: v.into(),
+            audio: a.map(|a| crate::mp4::AudioParams { sample_entry: bytes::Bytes::new(), sample_rate: 16000, channels: 1, rfc6381: a.into() }),
+        };
+        let chrome = "avc1.640029,avc1.64002A,avc1.640033,mp4a.40.2,mp4a.40.5,opus";
+        assert!(client_accepts(chrome, &p("avc1.4D401E", None)));
+        assert!(!client_accepts(chrome, &p("hvc1.1.6.L150.80", None)));
+        assert!(client_accepts("hvc1.1.6.L153.B0", &p("hev1.1.6.L150.90", None)));
+        assert!(client_accepts(chrome, &p("avc1.4D401E", Some("mp4a.40.2"))));
+        assert!(!client_accepts("avc1.640029", &p("avc1.4D401E", Some("mp4a.40.2"))), "audio the client cannot play");
     }
 
     #[test]

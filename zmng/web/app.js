@@ -14,6 +14,9 @@ const h = (tag, attrs = {}, ...kids) => {
   for (const [k, v] of Object.entries(attrs)) {
     if (k === 'class') el.className = v;
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    // the attribute alone does not mute a video made by script (only the
+    // parser copies it to .muted), and an unmuted video may not autoplay
+    else if (k === 'muted') { el.muted = !!v; if (v) el.setAttribute('muted', ''); }
     else if (v !== null && v !== undefined && v !== false) el.setAttribute(k, v === true ? '' : v);
   }
   for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) el.append(k.nodeType ? k : document.createTextNode(k));
@@ -22,6 +25,18 @@ const h = (tag, attrs = {}, ...kids) => {
 const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const fmtDate = (ms) => new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
 const fmtDT = (ms) => `${fmtDate(ms)} ${fmtTime(ms)}`;
+const fmtClock = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+// replaceChildren() turns null into the text "null"
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
+const debounce = (fn, ms) => { let t = null; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+// object kinds as the event filters and timeline colours group them
+const VEHICLES = ['car', 'truck', 'bus', 'motorcycle', 'bicycle'];
+const ANIMALS = ['dog', 'cat'];
+const KINDS = [['person', 'People', 'person'], ['vehicle', 'Vehicles', VEHICLES.join(',')], ['animal', 'Animals', ANIMALS.join(',')]];
+const labelsOf = (ev) => [ev.kind, ...(ev.objects || []).map((o) => o.label)];
+const kindClass = (ev) => { const l = labelsOf(ev); return l.includes('person') ? 'person' : l.some((x) => VEHICLES.includes(x)) ? 'vehicle' : l.some((x) => ANIMALS.includes(x)) ? 'animal' : 'motion'; };
+const KIND_COLOR = { person: '#3ddc84', vehicle: '#c38bff', animal: '#4fd1c5', motion: 'rgba(79,156,249,.85)' };
+const matchesKinds = (ev, kinds) => !kinds || labelsOf(ev).some((l) => kinds.includes(l));
 const fmtDur = (ms) => { const s = Math.round(ms / 1000); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; };
 const toLocalInput = (ms) => { const d = new Date(ms); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
 const WINDOWS = [[900000, '15 min'], [3600000, '1 h'], [3 * 3600000, '3 h'], [12 * 3600000, '12 h'], [86400000, '24 h']];
@@ -170,13 +185,20 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
       if (tl) {
         const bw = Math.max(1, W / ((range.end - range.start) / tl.bucket_ms));
         for (let k = 0; k < tl.motion.length; k++) { const m = tl.motion[k]; if (!m) continue; const hh = rows.length === 1 ? (rowH - 1) * m / 255 : rowH - 1; ctx.fillStyle = m > 120 ? '#ff5a5f' : '#f9b84f'; ctx.fillRect(xOf(range.start + k * tl.bucket_ms), y + (rowH - 1 - hh), bw, hh); }
-        ctx.fillStyle = 'rgba(79,156,249,.8)'; for (const ev of tl.events) ctx.fillRect(xOf(ev.start), y, Math.max(2, xOf(ev.end || ev.start) - xOf(ev.start)), 3);
+        for (const ev of tl.events) { const k = kindClass(ev); ctx.fillStyle = KIND_COLOR[k]; ctx.fillRect(xOf(ev.start), y, Math.max(2, xOf(ev.end || ev.start) - xOf(ev.start)), k === 'motion' ? 3 : 5); }
       }
       if (rows.length > 1) { ctx.fillStyle = '#c8ced8'; ctx.font = '10px system-ui'; ctx.fillText(row.name, 3, y + Math.min(rowH - 2, 11)); }
     });
     ctx.fillStyle = '#8b93a1'; ctx.font = '11px system-ui';
-    const span = range.end - range.start; const step = span > 3 * 86400000 ? 86400000 : span > 20 * 3600000 ? 4 * 3600000 : span > 6 * 3600000 ? 3600000 : span > 2 * 3600000 ? 1800000 : span > 3600000 ? 900000 : span > 1200000 ? 300000 : 60000;
-    for (let t = Math.ceil(range.start / step) * step; t < range.end; t += step) { const x = xOf(t); ctx.fillRect(x, 0, 1, 10); ctx.fillText(step >= 86400000 ? fmtDate(t) : fmtTime(t).slice(0, 5), x + 3, 10); }
+    // ticks at least ~80 px apart, on local-time boundaries, labelled "5:15 PM" (a date at midnight)
+    const span = range.end - range.start;
+    const step = [60000, 300000, 900000, 1800000, 3600000, 3 * 3600000, 6 * 3600000, 12 * 3600000, 86400000].find((st) => W * st / span >= 80) || 86400000;
+    const tz = new Date(range.start).getTimezoneOffset() * 60000;
+    for (let t = Math.ceil((range.start - tz) / step) * step + tz; t < range.end; t += step) {
+      const x = xOf(t); const d = new Date(t);
+      ctx.fillRect(x, 0, 1, 10);
+      ctx.fillText(step >= 86400000 || (d.getHours() === 0 && d.getMinutes() === 0) ? fmtDate(t) : fmtClock(t), x + 3, 10);
+    }
     cursor.style.left = `${xOf(playhead)}px`;
   }
   async function load() {
@@ -219,6 +241,7 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
   window.addEventListener('resize', draw);
   return {
     el, load, draw,
+    events() { return [...data.values()].flatMap((tl) => tl?.events || []).sort((a, b) => a.start - b.start); },
     setPlayhead(ms) { playhead = ms; cursor.style.left = `${xOf(ms)}px`; },
     setRange(s, e) { range.start = s; range.end = e; return load(); },
     get range() { return range; },
@@ -393,76 +416,110 @@ function ptzPad(cam) {
 }
 
 // ---------------------------------------------------------------------------
-// Review: filters (date range, groups, cameras) + synchronized multi-camera
-// playback of the substreams on a shared timeline with per-row previews.
+// Review: filters (date range, groups, cameras, what to show) + synchronized
+// multi-camera playback of the substreams on a shared timeline.
+// Picking cameras or groups updates the view at once (keeping the playhead);
+// dates and the "Show" filter wait for Apply so the page does not reload
+// while they are being edited.
 // ---------------------------------------------------------------------------
 async function viewReview(main, atMs) {
   const cams = state.cameras.filter((c) => c.sub_status || c.status?.connected);
   const now = Date.now();
   const saved = JSON.parse(localStorage.getItem('reviewFilter') || '{}');
-  const f = { from: saved.from || now - 3600000, to: saved.to || now, groups: saved.groups || [], cameras: saved.cameras || [], motionOnly: saved.motionOnly || false };
+  const f = { from: saved.from || now - 3600000, to: saved.to || now, groups: saved.groups || [], cameras: saved.cameras || [], show: saved.show ?? (saved.motionOnly ? 'motion' : '') };
   if (f.to > now) f.to = now;
   if (atMs) { f.from = atMs - 1800000; f.to = Math.min(now, atMs + 1800000); }
+  const SHOW = [['', 'All selected cameras'], ['motion', 'Cameras with motion'], ...(state.me.objects ? KINDS.map(([k, l]) => [k, `Cameras with ${l.toLowerCase()}`]) : [])];
+  if (!SHOW.some(([v]) => v === f.show)) f.show = '';
+  const applied = { from: f.from, to: f.to, show: f.show };
 
-  const fromIn = h('input', { type: 'datetime-local', value: toLocalInput(f.from) });
-  const toIn = h('input', { type: 'datetime-local', value: toLocalInput(f.to) });
-  const quick = h('select', { onchange: (e) => { const m = Number(e.target.value); if (!m) return; toIn.value = toLocalInput(Date.now()); fromIn.value = toLocalInput(Date.now() - m); } },
+  const applyBtn = h('button', { onclick: () => apply() }, 'Apply');
+  const dirty = () => applyBtn.classList.add('pending');
+  const fromIn = h('input', { type: 'datetime-local', value: toLocalInput(f.from), oninput: dirty });
+  const toIn = h('input', { type: 'datetime-local', value: toLocalInput(f.to), oninput: dirty });
+  const quick = h('select', { onchange: (e) => { const m = Number(e.target.value); e.target.value = 0; if (!m) return; toIn.value = toLocalInput(Date.now()); fromIn.value = toLocalInput(Date.now() - m); dirty(); } },
     h('option', { value: 0 }, 'Quick range…'), ...[[900000, 'last 15 min'], [3600000, 'last hour'], [6 * 3600000, 'last 6 h'], [86400000, 'last 24 h'], [7 * 86400000, 'last 7 days']].map(([v, l]) => h('option', { value: v }, l)));
-  const groupBoxes = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: f.groups.includes(g), onchange: syncCamsFromGroups }), g));
-  const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: keyOf(c), checked: f.cameras.length ? f.cameras.includes(keyOf(c)) : true }), camLabel(c)));
-  const motionOnly = h('input', { type: 'checkbox', checked: f.motionOnly });
+  const showSel = h('select', { onchange: dirty }, ...SHOW.map(([v, l]) => h('option', { value: v, selected: v === f.show }, l)));
+  const soon = debounce(() => apply({ camerasOnly: true }), 350);
+  const groupBoxes = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: f.groups.includes(g), onchange: () => { syncCamsFromGroups(); soon(); } }), g));
+  const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: keyOf(c), checked: f.cameras.length ? f.cameras.includes(keyOf(c)) : true, onchange: soon }), camLabel(c)));
+  const setAll = (on) => { camBoxes.forEach((b) => { $('input', b).checked = on; }); groupBoxes.forEach((b) => { $('input', b).checked = false; }); soon(); };
   function syncCamsFromGroups() {
     const gs = groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value);
-    if (!gs.length) return;
-    camBoxes.forEach((b) => { const c = camById($('input', b).value); $('input', b).checked = groupsOf(c).some((g) => gs.includes(g)); });
+    // no group ticked: every camera again
+    camBoxes.forEach((b) => { const c = camById($('input', b).value); $('input', b).checked = !gs.length || groupsOf(c).some((g) => gs.includes(g)); });
   }
+  const manage = state.me.user.role === 'admin' ? h('a', { href: '#/admin', class: 'small', onclick: () => sessionStorage.setItem('adminFocus', 'groups') }, groupBoxes.length ? 'manage groups' : '+ create camera groups') : null;
   const filters = h('div', { class: 'card filters' },
-    h('div', { class: 'row' }, h('label', {}, 'From', fromIn), h('label', {}, 'To', toIn), h('label', {}, ' ', quick),
-      h('label', { class: 'row', style: 'align-self:end' }, motionOnly, ' only cameras with motion in range'),
-      h('span', { class: 'grow' }), h('button', { onclick: apply }, 'Apply')),
-    groupBoxes.length ? h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Groups:'), ...groupBoxes) : null,
-    h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Cameras:'), h('button', { class: 'ghost small', onclick: () => camBoxes.forEach((b) => { $('input', b).checked = true; }) }, 'all'), h('button', { class: 'ghost small', onclick: () => camBoxes.forEach((b) => { $('input', b).checked = false; }) }, 'none'), ...camBoxes));
+    h('div', { class: 'row' }, h('label', {}, 'From', fromIn), h('label', {}, 'To', toIn), h('label', {}, 'Range', quick), h('label', {}, 'Show', showSel),
+      h('span', { class: 'grow' }), applyBtn),
+    groupBoxes.length || manage ? h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Groups:'), ...groupBoxes, manage) : null,
+    h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Cameras:'), h('button', { class: 'ghost small', onclick: () => setAll(true) }, 'all'), h('button', { class: 'ghost small', onclick: () => setAll(false) }, 'none'), ...camBoxes));
   const stage = h('div');
-  main.replaceChildren(filters, stage);
+  fill(main, filters, stage);
   let session = null;
-  async function apply() {
-    const from = new Date(fromIn.value).getTime(), to = new Date(toIn.value).getTime();
-    if (!(from < to)) { alert('From must be before To'); return; }
-    let chosen = camBoxes.filter((b) => $('input', b).checked).map((b) => camById($('input', b).value)).filter(Boolean);
-    localStorage.setItem('reviewFilter', JSON.stringify({ from, to, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map(keyOf), motionOnly: motionOnly.checked }));
-    if (motionOnly.checked) {
-      const res = await Promise.all(chosen.map((c) => api.get(`${camApi(c)}/timeline?start=${Math.round(from)}&end=${Math.round(to)}`).catch(() => null)));
-      chosen = chosen.filter((c, i) => res[i] && (res[i].events.length || res[i].motion.some((m) => m > 0)));
+  let gen = 0;
+  async function apply({ camerasOnly = false } = {}) {
+    if (!camerasOnly) {
+      const from = new Date(fromIn.value).getTime(), to = new Date(toIn.value).getTime();
+      if (!(from < to)) { toast('"From" must be before "To"', { kind: 'bad' }); return; }
+      Object.assign(applied, { from, to, show: showSel.value });
+      applyBtn.classList.remove('pending');
     }
+    const my = ++gen;
+    let chosen = camBoxes.filter((b) => $('input', b).checked).map((b) => camById($('input', b).value)).filter(Boolean);
+    localStorage.setItem('reviewFilter', JSON.stringify({ from: applied.from, to: applied.to, show: applied.show, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map(keyOf) }));
+    const range = { start: applied.from, end: Math.min(applied.to, Date.now()) };
+    const kinds = KINDS.find(([k]) => k === applied.show)?.[2].split(',') || null;
+    if (applied.show && chosen.length) {
+      const res = await Promise.all(chosen.map((c) => api.get(`${camApi(c)}/timeline?start=${Math.round(range.start)}&end=${Math.round(range.end)}`).catch(() => null)));
+      if (my !== gen) return;
+      chosen = chosen.filter((c, i) => res[i] && (kinds ? res[i].events.some((ev) => matchesKinds(ev, kinds)) : res[i].events.length || res[i].motion.some((m) => m > 0)));
+    }
+    // a camera change keeps watching the same moment
+    const keep = camerasOnly && session?.playhead ? session.playhead() : null;
+    const startAt = keep ?? (atMs && atMs > range.start && atMs < range.end ? atMs : range.start);
     session?.destroy();
-    session = reviewSession(stage, chosen, { start: from, end: Math.min(to, Date.now()) }, atMs && atMs > from && atMs < to ? atMs : from);
+    session = reviewSession(stage, chosen, range, startAt, { kinds, empty: applied.show ? `No selected camera has ${SHOW.find(([v]) => v === applied.show)[1].replace('Cameras with ', '')} in this range.` : 'No cameras selected.' });
     atMs = null;
   }
   await apply();
   state.cleanup = () => session?.destroy();
 }
 
-function reviewSession(stage, cams, range, startAt) {
-  if (!cams.length) { stage.replaceChildren(h('p', { class: 'muted' }, 'No cameras selected (or none with motion in this range).')); return { destroy() {} }; }
+function reviewSession(stage, cams, range, startAt, { kinds = null, empty = 'No cameras selected.' } = {}) {
+  if (!cams.length) { fill(stage, h('p', { class: 'muted' }, empty)); return { destroy() {} }; }
   const CHUNK = 2 * 60 * 1000;
   let playhead = startAt, paused = false;
   const grid = h('div', { class: 'grid montage' });
   const players = cams.map((c) => {
     const v = h('video', { muted: true, playsinline: true });
-    const tile = h('div', { class: 'tile', ondblclick: () => { location.hash = `#/camera/${keyOf(c)}/${Math.round(playhead)}`; } }, v, h('div', { class: 'label' }, camLabel(c)), h('div', { class: 'stat' }, ''));
+    const open = () => { location.hash = `#/camera/${keyOf(c)}/${Math.round(playhead)}`; };
+    const tile = h('div', { class: 'tile', ondblclick: open }, v, h('div', { class: 'label', onclick: open, title: 'open this camera at this moment' }, camLabel(c), ' ⤢'), h('div', { class: 'stat' }, ''));
     grid.append(tile);
     return { cam: c, video: v, mse: new MsePlayer(v), stat: $('.stat', tile) };
   });
   const tl = makeTimeline({ rows: cams.map((c) => ({ id: c.id, key: keyOf(c), name: camLabel(c), api: camApi(c) })), range, fixedRange: true, tall: cams.length > 3, onSeek: (t) => seekAll(t) });
   const timeLabel = h('span', { class: 'time' });
-  const playBtn = h('button', { class: 'ghost', onclick: () => { paused = !paused; playBtn.textContent = paused ? '▶' : '⏸'; players.forEach((p) => paused ? p.video.pause() : p.video.play().catch(() => {})); } }, '⏸');
-  const speedSel = h('select', { style: 'width:90px', onchange: (e) => players.forEach((p) => { p.video.playbackRate = Number(e.target.value); }) }, ...[1, 2, 4, 8].map((r) => h('option', { value: r }, `${r}×`)));
+  const togglePause = () => { paused = !paused; playBtn.textContent = paused ? '▶' : '⏸'; players.forEach((p) => paused ? p.video.pause() : p.video.play().catch(() => {})); };
+  const playBtn = h('button', { class: 'ghost', title: 'play / pause (space)', onclick: togglePause }, '⏸');
+  const speedSel = h('select', { onchange: (e) => players.forEach((p) => { p.video.playbackRate = Number(e.target.value); }) }, ...[1, 2, 4, 8].map((r) => h('option', { value: r }, `${r}×`)));
+  // previous / next event of the shown cameras (of the chosen kind when "Show" asks for one)
+  const events = () => tl.events().filter((ev) => matchesKinds(ev, kinds));
+  const jump = (dir) => {
+    const evs = events();
+    const ev = dir > 0 ? evs.find((e) => e.start - 2000 > playhead + 1000) : [...evs].reverse().find((e) => e.start - 2000 < playhead - 3000);
+    if (ev) seekAll(ev.start - 2000); else toast(dir > 0 ? 'No later event in this range' : 'No earlier event in this range');
+  };
+  const legend = state.me.objects ? h('span', { class: 'legend small' }, ...['motion', 'person', 'vehicle', 'animal'].map((k) => h('span', {}, h('i', { style: `background:${KIND_COLOR[k]}` }), k))) : null;
   const controls = h('div', { class: 'controls' }, playBtn, speedSel,
+    h('button', { class: 'ghost', title: 'previous event (P)', onclick: () => jump(-1) }, '⏮ event'), h('button', { class: 'ghost', title: 'next event (N)', onclick: () => jump(1) }, 'event ⏭'),
     h('button', { class: 'ghost', onclick: () => seekAll(playhead - 60000) }, '−1 min'), h('button', { class: 'ghost', onclick: () => seekAll(playhead + 60000) }, '+1 min'),
-    timeLabel, h('span', { class: 'grow' }), h('span', { class: 'muted small' }, `${cams.length} cameras · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag to scrub · double-click a tile for full resolution`));
-  stage.replaceChildren(grid, tl.el, controls);
+    timeLabel, h('span', { class: 'grow' }), legend,
+    h('span', { class: 'muted small' }, `${cams.length} camera${cams.length === 1 ? '' : 's'} · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag to scrub · N/P next/previous event · click a camera name for full resolution`));
+  fill(stage, grid, tl.el, controls);
   async function seekAll(ms) {
-    playhead = Math.max(range.start, Math.min(ms, range.end - 1000)); tl.setPlayhead(playhead);
+    playhead = Math.max(range.start, Math.min(ms, range.end - 1000)); tl.setPlayhead(playhead); timeLabel.textContent = fmtDT(playhead);
     const s = playhead, e = Math.min(range.end, s + CHUNK);
     await Promise.all(players.map(async (p) => {
       p.stat.textContent = '…';
@@ -480,8 +537,17 @@ function reviewSession(stage, cams, range, startAt) {
     for (const p of players) { if (p === lead) continue; const w = p.mse.wallMs(); if (w === null) continue; const d = (t - w) / 1000; if (Math.abs(d) > 0.3) p.video.currentTime += d; }
   }, 1000);
   players[0].video.addEventListener('ended', () => { if (playhead + 2000 < range.end) seekAll(playhead + 500); });
+  const keys = (e) => {
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.metaKey || e.ctrlKey) return;
+    if (e.key === ' ') { e.preventDefault(); togglePause(); }
+    else if (e.key === 'n' || e.key === 'N') jump(1);
+    else if (e.key === 'p' || e.key === 'P') jump(-1);
+    else if (e.key === 'ArrowRight') seekAll(playhead + (e.shiftKey ? 60000 : 10000));
+    else if (e.key === 'ArrowLeft') seekAll(playhead - (e.shiftKey ? 60000 : 10000));
+  };
+  document.addEventListener('keydown', keys);
   tl.load().then(() => seekAll(startAt));
-  return { destroy() { clearInterval(sync); players.forEach((p) => p.mse.stop()); tl.destroy(); } };
+  return { playhead: () => playhead, destroy() { clearInterval(sync); document.removeEventListener('keydown', keys); players.forEach((p) => p.mse.stop()); tl.destroy(); } };
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +556,8 @@ function reviewSession(stage, cams, range, startAt) {
 async function viewEvents(main) {
   const cams = state.cameras;
   const q = { camera: localStorage.getItem('evCam') || '', min_score: Number(localStorage.getItem('evMin') || 0), archived: false, range: localStorage.getItem('evRange') || '7d', kind: localStorage.getItem('evKind') || '' };
+  // without a detector every event is "motion": an object filter would only ever come back empty
+  if (!state.me.objects) q.kind = '';
   const list = h('div', { class: 'events' });
   const more = h('button', { class: 'ghost' }, 'Load more');
   const count = h('span', { class: 'muted' });
@@ -500,9 +568,9 @@ async function viewEvents(main) {
   const rangeSel = h('select', { onchange: (e) => { q.range = e.target.value; localStorage.setItem('evRange', q.range); load(true); } },
     ...[['1d', 'Last 24 h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['all', 'All']].map(([v, l]) => h('option', { value: v, selected: v === q.range }, l)));
   const arch = h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', onchange: (e) => { q.archived = e.target.checked; load(true); } }), ' Archived only');
-  const kindSel = h('select', { onchange: (e) => { q.kind = e.target.value; localStorage.setItem('evKind', q.kind); load(true); } },
-    ...[['', 'Anything'], ['person', 'People'], ['car,truck,bus,motorcycle,bicycle', 'Vehicles'], ['dog,cat', 'Animals'], ['motion', 'Motion only (no object)']].map(([v, l]) => h('option', { value: v, selected: v === q.kind }, l)));
-  main.replaceChildren(h('div', { class: 'toolbar' }, camSel, kindSel, minSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
+  const kindSel = state.me.objects ? h('select', { onchange: (e) => { q.kind = e.target.value; localStorage.setItem('evKind', q.kind); load(true); } },
+    ...[['', 'Anything'], ...KINDS.map(([, l, v]) => [v, l]), ['motion', 'Motion only (no object)']].map(([v, l]) => h('option', { value: v, selected: v === q.kind }, l))) : null;
+  fill(main, h('div', { class: 'toolbar' }, camSel, kindSel, minSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
   let before = null, total = 0;
   async function load(reset) {
     if (reset) { list.replaceChildren(); before = null; total = 0; }
@@ -538,7 +606,8 @@ async function viewEvents(main) {
 function eventCard(ev) {
   const cam = evCam(ev);
   return h('div', { class: 'event' + (ev.archived ? ' archived' : ''), onclick: () => openEvent(ev) },
-    h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`)),
+    h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`),
+      kindClass(ev) !== 'motion' ? h('span', { class: 'kind', style: `background:${KIND_COLOR[kindClass(ev)]}` }, ev.kind) : null),
     h('div', { class: 'meta' }, h('b', {}, cam ? camLabel(cam) : `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`,
       ev.objects?.length ? h('div', { class: 'labels' }, ...ev.objects.map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`))) : null,
       ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
@@ -559,6 +628,7 @@ function openEvent(ev) {
         h('span', { class: 'muted' }, `peak ${ev.score}${ev.objects?.length ? ' · ' + ev.objects.map((o) => `${o.label} ${Math.round(o.confidence * 100)}%`).join(', ') : ''}`)),
       h('label', {}, notes),
       h('button', { class: 'small', onclick: async () => { await api.patch(evApi(ev), { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
+  closeOnEscape(modal, () => close());
   document.body.append(modal);
   const mse = new MsePlayer(video);
   const mq = cam ? mainQuery(cam) : null;
@@ -591,7 +661,7 @@ async function viewStatus(main) {
         h('td', {}, v.archive_to ? (v.ingest_24h > 0 && v.archive_backlog_bytes > v.ingest_24h ? h('span', { class: 'pill bad' }, gb(v.archive_backlog_bytes)) : gb(v.archive_backlog_bytes)) : '—')))) : null;
     const peers = state.me.peers?.length ? await api.get('/api/peers').catch(() => []) : [];
     const peerCard = peers.length ? h('div', { class: 'card' }, h('h2', {}, 'Peers'), ...peers.map((p) => h('div', {}, h('span', { class: 'pill ' + (p.ok ? 'ok' : 'bad') }, p.ok ? 'reachable' : 'unreachable'), ' ', p.name, p.url ? h('span', { class: 'muted small' }, ` ${p.url}`) : null))) : null;
-    main.replaceChildren(
+    fill(main,
       peerCard,
       h('div', { class: 'toolbar' }, h('h2', {}, 'Status'), h('span', { class: 'muted' }, `zmng ${s.version} · up ${fmtDur(s.uptime_secs * 1000)} · load ${s.load.map((l) => l.toFixed(1)).join(' ')}`), h('span', { class: 'grow' }), h('button', { class: 'ghost small', onclick: render }, 'Refresh')),
       issues,
@@ -607,50 +677,153 @@ async function viewStatus(main) {
 // Admin
 // ---------------------------------------------------------------------------
 async function viewAdmin(main) {
-  if (state.me.user.role !== 'admin') { main.replaceChildren(h('p', { class: 'muted' }, 'Admins only.')); return; }
+  if (state.me.user.role !== 'admin') { fill(main, h('p', { class: 'muted' }, 'Admins only.')); return; }
   const [cams, users, storages] = await Promise.all([api.get('/api/cameras'), api.get('/api/users'), api.get('/api/storages')]);
+  state.cameras = [...cams, ...state.cameras.filter((c) => c.peer)];
   const pill = (st, label) => h('span', { class: 'pill ' + (st?.connected ? 'ok' : 'bad') }, st?.connected ? label : (st?.last_error || 'offline'));
-  const camTable = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Name'), h('th', {}, 'Groups'), h('th', {}, 'Status'), h('th', {}, 'Storage'), h('th', {}, 'Retention'), h('th', {}, 'Detect'), h('th', {}, '')),
+  const codecName = (c) => (c?.startsWith('hvc') || c?.startsWith('hev') ? 'HEVC' : c?.startsWith('avc') ? 'H.264' : c || '');
+  const chips = (list) => list.map((g) => h('span', { class: 'pill' }, g));
+  const camTable = h('table', {}, h('tr', {}, h('th', {}, 'Camera'), h('th', {}, 'Groups'), h('th', {}, 'Streams'), h('th', {}, 'Storage'), h('th', {}, 'Retention'), h('th', {}, 'Motion'), h('th', {}, '')),
     ...cams.map((c) => h('tr', {},
-      h('td', {}, c.id), h('td', {}, c.name), h('td', {}, c.tags),
-      h('td', {}, pill(c.status, `${c.status.codec} ${c.status.width}×${c.status.height} ${c.status.fps.toFixed(0)}fps`), ' ', c.sub_status ? pill(c.sub_status, `sub ${c.sub_status.width}×${c.sub_status.height}`) : null),
-      h('td', {}, c.storage_id), h('td', {}, `${c.retention_days} d${c.event_retention_days ? ` / events ${c.event_retention_days} d` : ''}`),
-      h('td', {}, c.detect ? `${c.detect.fps.toFixed(1)} fps, score ${c.detect.score}` : '—'),
-      h('td', {}, h('button', { class: 'ghost small', onclick: () => editCamera(c) }, 'Edit'), ' ', h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete camera ${c.name} and all its recordings?`)) { await api.del(`/api/cameras/${c.id}`); route(); } } }, 'Delete')))));
-  const addCam = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); await api.post('/api/cameras', { name: f.get('name'), main_url: f.get('main_url'), sub_url: f.get('sub_url') || null }); route(); } },
-    h('input', { name: 'name', placeholder: 'Name', required: true, style: 'width:160px' }), h('input', { name: 'main_url', placeholder: 'rtsp://user:pass@ip/Streaming/Channels/101', required: true, style: 'flex:2;min-width:240px' }), h('input', { name: 'sub_url', placeholder: 'substream rtsp:// (optional)', style: 'flex:2;min-width:240px' }), h('button', {}, 'Add camera'));
+      h('td', {}, h('b', {}, c.name), h('div', { class: 'muted small' }, `#${c.id}${c.enabled ? '' : ' · disabled'}`)),
+      h('td', {}, ...chips(groupsOf(c))),
+      h('td', {}, pill(c.status, `${codecName(c.status.codec)} ${c.status.width}×${c.status.height} ${c.status.fps.toFixed(0)} fps`), ' ', c.sub_status ? pill(c.sub_status, `sub ${c.sub_status.width}×${c.sub_status.height}`) : null),
+      h('td', {}, storageName(storages, c.storage_id)), h('td', {}, `${c.retention_days} d${c.event_retention_days ? ` · events ${c.event_retention_days} d` : ''}`),
+      h('td', {}, c.detect ? `${c.detect.fps.toFixed(1)} fps${c.objects && state.me.objects ? ' + objects' : ''}` : '—'),
+      h('td', { class: 'actions' }, h('button', { class: 'ghost small', onclick: () => editCamera(c) }, 'Edit'), h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete camera ${c.name} and ALL its recordings? This cannot be undone.`)) { await api.del(`/api/cameras/${c.id}`); route(); } } }, 'Delete')))));
+  // new cameras go to the primary volume (the one that tiers to an archive), not the archive itself
+  const primary = storages.find((st) => st.archive_to && !st.read_only) || storages.find((st) => !st.read_only);
+  const addCam = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); try { await api.post('/api/cameras', { name: f.get('name'), main_url: f.get('main_url'), sub_url: f.get('sub_url') || null, storage_id: Number(f.get('storage_id')) }); toast(`Added ${f.get('name')}; recording starts within ~30 s`, { kind: 'ok' }); route(); } catch (err) { toast(err.message, { kind: 'bad' }); } } },
+    h('input', { name: 'name', placeholder: 'Name', required: true, style: 'width:160px' }), h('input', { name: 'main_url', placeholder: 'main rtsp://user:pass@ip/Streaming/Channels/101', required: true, style: 'flex:2;min-width:240px' }), h('input', { name: 'sub_url', placeholder: 'substream rtsp://…/102 (recommended)', style: 'flex:2;min-width:240px' }),
+    h('select', { name: 'storage_id', style: 'width:auto', title: 'where new recordings go' }, ...storages.filter((st) => !st.read_only).map((st) => h('option', { value: st.id, selected: st === primary }, `→ ${storageName(storages, st.id)}`))), h('button', {}, 'Add camera'));
   const userTable = h('table', {}, h('tr', {}, h('th', {}, 'User'), h('th', {}, 'Role'), h('th', {}, 'Cameras'), h('th', {}, '')),
     ...users.map((u) => h('tr', {}, h('td', {}, u.username), h('td', {}, u.role), h('td', {}, u.role === 'admin' ? 'all' : u.cameras.map((id) => cams.find((c) => c.id === id)?.name || id).join(', ') || h('span', { class: 'err' }, 'none')),
-      h('td', {}, h('button', { class: 'ghost small', onclick: () => editUserCams(u, cams) }, 'Cameras'), ' ', h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete user ${u.username}?`)) { await api.del(`/api/users/${u.id}`); route(); } } }, 'Delete')))));
-  const addUser = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); await api.post('/api/users', { username: f.get('username'), password: f.get('password'), role: f.get('role') }); route(); } },
-    h('input', { name: 'username', placeholder: 'username', required: true, style: 'width:160px' }), h('input', { name: 'password', type: 'password', placeholder: 'password (8+)', required: true, style: 'width:180px' }), h('select', { name: 'role', style: 'width:120px' }, h('option', { value: 'viewer' }, 'viewer'), h('option', { value: 'admin' }, 'admin')), h('button', {}, 'Add user'));
-  const stor = h('table', {}, h('tr', {}, h('th', {}, 'Id'), h('th', {}, 'Path'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Reserve'), h('th', {}, 'Archive to'), h('th', {}, '')),
-    ...storages.map((s) => h('tr', {}, h('td', {}, s.id), h('td', {}, h('code', {}, s.path), s.available ? '' : h('span', { class: 'pill bad' }, 'not mounted')), h('td', {}, gb(s.used_bytes)), h('td', {}, gb(s.free_bytes)), h('td', {}, s.max_bytes ? gb(s.max_bytes) : '—'), h('td', {}, gb(s.reserve_bytes)),
-      h('td', {}, s.read_only ? h('span', { class: 'pill' }, 'read-only') : s.archive_to ? `storage ${s.archive_to} after ${s.archive_after_days ?? '—'} d @ ${s.archive_rate_mbps} Mb/s` : '—'),
-      h('td', {}, h('button', { class: 'ghost small', onclick: () => editStorage(s, storages) }, 'Edit')))));
+      h('td', { class: 'actions' }, u.role === 'admin' ? null : h('button', { class: 'ghost small', onclick: () => editUserCams(u, cams) }, 'Cameras'), u.id === state.me.user.id ? null : h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete user ${u.username}?`)) { await api.del(`/api/users/${u.id}`); route(); } } }, 'Delete')))));
+  const addUser = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); try { await api.post('/api/users', { username: f.get('username'), password: f.get('password'), role: f.get('role') }); route(); } catch (err) { toast(err.message, { kind: 'bad' }); } } },
+    h('input', { name: 'username', placeholder: 'username', required: true, style: 'width:150px' }), h('input', { name: 'password', type: 'password', placeholder: 'password (8+)', required: true, style: 'width:160px' }), h('select', { name: 'role', style: 'width:auto' }, h('option', { value: 'viewer' }, 'viewer'), h('option', { value: 'admin' }, 'admin')), h('button', {}, 'Add user'));
+  const stor = h('table', {}, h('tr', {}, h('th', {}, 'Volume'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Keep free'), h('th', {}, 'Tiering'), h('th', {}, '')),
+    ...storages.map((st) => h('tr', {}, h('td', {}, h('b', {}, storageName(storages, st.id)), h('div', {}, h('code', {}, st.path)), st.available ? null : h('span', { class: 'pill bad' }, 'not mounted')), h('td', {}, gb(st.used_bytes)), h('td', {}, gb(st.free_bytes)), h('td', {}, st.max_bytes ? gb(st.max_bytes) : '—'), h('td', {}, gb(st.reserve_bytes)),
+      h('td', {}, st.read_only ? h('span', { class: 'pill' }, 'read-only') : st.archive_to ? `→ ${storageName(storages, st.archive_to)} after ${st.archive_after_days ?? '—'} d @ ${st.archive_rate_mbps} Mb/s` : '—'),
+      h('td', { class: 'actions' }, h('button', { class: 'ghost small', onclick: () => editStorage(st, storages) }, 'Edit')))));
   const tokenBtn = h('button', { class: 'ghost small', onclick: async () => { const t = await api.post('/api/tokens'); prompt('Long-lived API token (Home Assistant etc.). Shown once:', t.token); } }, 'Create API token');
-  main.replaceChildren(h('div', { class: 'two' },
-    h('div', { class: 'card', style: 'grid-column:1/-1' }, h('h2', {}, 'Cameras'), camTable, h('div', { style: 'margin-top:10px' }, addCam)),
-    h('div', { class: 'card' }, h('h2', {}, 'Users'), userTable, h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted' }, 'Viewers see only the cameras assigned to them (fails closed). '), tokenBtn),
-    h('div', { class: 'card' }, h('h2', {}, 'Storage'), stor, h('p', { class: 'muted' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
-    h('div', { class: 'card' }, h('h2', {}, 'Browser'), h('p', {}, `MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL.'))));
+  const objects = state.me.objects
+    ? h('div', {}, h('p', {}, h('span', { class: 'pill ok' }, 'detector configured'), ' People, vehicles and animals are labelled on motion, and again from each event\'s full-resolution picture when it ends.'),
+      h('div', { class: 'row' }, h('button', { class: 'ghost small', onclick: async (e) => { e.target.disabled = true; try { const r = await api.post('/api/events/classify', { days: 7 }); toast(`Checking ${r.queued} events from the last 7 days in the background`, { kind: 'ok' }); } catch (err) { toast(err.message, { kind: 'bad' }); } } }, 'Label the last 7 days of events'), h('span', { class: 'muted small' }, 'for events recorded before the detector was set up')))
+    : h('p', {}, h('span', { class: 'pill' }, 'not configured'), ' Only motion is detected, so events cannot be filtered by people or vehicles. Add an ', h('code', {}, '[objects]'), ' section to zmng.toml pointing at a detection server (see deploy/detector).');
+  const focus = sessionStorage.getItem('adminFocus'); sessionStorage.removeItem('adminFocus');
+  const groupsCard = h('div', { class: 'card', id: 'groups' }, h('h2', {}, 'Camera groups'), groupsEditor(cams));
+  fill(main,
+    h('div', { class: 'card' }, h('h2', {}, 'Cameras'), h('div', { class: 'tablewrap' }, camTable), h('div', { style: 'margin-top:10px' }, addCam), h('p', { class: 'muted small' }, 'Camera changes take effect within about 30 seconds.')),
+    groupsCard,
+    h('div', { class: 'two' },
+      h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see only the cameras assigned to them (nothing until you assign some).'), tokenBtn),
+      h('div', { class: 'card' }, h('h2', {}, 'Object detection'), objects)),
+    h('div', { class: 'card' }, h('h2', {}, 'Storage'), h('div', { class: 'tablewrap' }, stor), h('p', { class: 'muted small' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
+    h('details', { class: 'card' }, h('summary', {}, 'Diagnostics'), h('p', {}, `This browser — MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL. Live video plays as MSE (H.264 substream) through the app\'s go2rtc player.')));
+  if (focus === 'groups') groupsCard.scrollIntoView({ block: 'start' });
 }
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
+const storageName = (all, id) => { const st = all.find((x) => x.id === id); if (!st) return `storage ${id}`; return st.read_only ? `imported (${id})` : st.archive_to ? `primary (${id})` : all.some((x) => x.archive_to === id) ? `archive (${id})` : `storage ${id}`; };
+
+// Groups are the cameras' comma-separated tags: one matrix of checkboxes
+// (cameras × groups), saved as you click.
+function groupsEditor(cams) {
+  const groups = [...new Set(cams.flatMap(groupsOf))].sort((a, b) => a.localeCompare(b));
+  const save = async (c, tags) => {
+    const t = [...new Set(tags)];
+    await api.patch(`/api/cameras/${c.id}`, { tags: t.join(', ') });
+    c.tags = t.join(', ');
+    const sc = state.cameras.find((x) => !x.peer && x.id === c.id); if (sc) sc.tags = c.tags;
+  };
+  const redraw = () => { const card = $('#groups'); if (card) fill(card, h('h2', {}, 'Camera groups'), groupsEditor(cams)); };
+  const renameGroup = async (g) => {
+    const n = (prompt(`Rename group "${g}" to:`, g) || '').trim();
+    if (!n || n === g) return;
+    if (n.includes(',')) { toast('Group names cannot contain commas', { kind: 'bad' }); return; }
+    for (const c of cams.filter((x) => groupsOf(x).includes(g))) await save(c, groupsOf(c).map((x) => (x === g ? n : x)));
+    toast(`Renamed "${g}" to "${n}"`, { kind: 'ok' }); redraw();
+  };
+  const deleteGroup = async (g) => {
+    if (!confirm(`Remove group "${g}"? The cameras themselves are not changed.`)) return;
+    for (const c of cams.filter((x) => groupsOf(x).includes(g))) await save(c, groupsOf(c).filter((x) => x !== g));
+    toast(`Removed group "${g}"`, { kind: 'ok' }); redraw();
+  };
+  const newName = h('input', { placeholder: 'New group name, e.g. Outside', style: 'width:220px' });
+  const newBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id }), c.name));
+  const create = async (e) => {
+    e.preventDefault();
+    const n = newName.value.trim();
+    if (!n) { newName.focus(); return; }
+    if (n.includes(',')) { toast('Group names cannot contain commas', { kind: 'bad' }); return; }
+    const picked = newBoxes.filter((b) => $('input', b).checked).map((b) => cams.find((c) => String(c.id) === $('input', b).value));
+    if (!picked.length) { toast('Tick the cameras that belong in the group', { kind: 'bad' }); return; }
+    for (const c of picked) await save(c, [...groupsOf(c), n]);
+    toast(`Created group "${n}" with ${picked.length} camera${picked.length === 1 ? '' : 's'}`, { kind: 'ok' }); redraw();
+  };
+  const matrix = groups.length ? h('div', { class: 'tablewrap' }, h('table', { class: 'matrix' },
+    h('tr', {}, h('th', {}, 'Camera'), ...groups.map((g) => h('th', {}, h('span', {}, g), ' ', h('button', { class: 'ghost small', title: `rename ${g}`, onclick: () => renameGroup(g) }, '✎'), h('button', { class: 'ghost small', title: `remove ${g}`, onclick: () => deleteGroup(g) }, '✕')))),
+    ...cams.map((c) => h('tr', {}, h('td', {}, c.name), ...groups.map((g) => h('td', {}, h('input', { type: 'checkbox', checked: groupsOf(c).includes(g), 'aria-label': `${c.name} in ${g}`,
+      onchange: async (e) => { try { await save(c, e.target.checked ? [...groupsOf(c), g] : groupsOf(c).filter((x) => x !== g)); redraw(); } catch (err) { e.target.checked = !e.target.checked; toast(err.message, { kind: 'bad' }); } } }))))),
+    h('tr', {}, h('td', { class: 'muted small' }, 'cameras'), ...groups.map((g) => h('td', { class: 'muted small' }, String(cams.filter((c) => groupsOf(c).includes(g)).length))))))
+    : h('p', { class: 'muted' }, 'No groups yet. Groups let you pick a set of cameras with one click on the Live and Review pages (e.g. Outside, Doors, CBA).');
+  return h('div', {}, matrix,
+    h('form', { class: 'newgroup', onsubmit: create }, h('div', { class: 'row' }, newName, h('button', {}, 'Create group')), h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'with:'), ...newBoxes)),
+    h('p', { class: 'muted small' }, 'Ticks save immediately. A camera can be in several groups.'));
+}
+
+function closeOnEscape(modal, close) {
+  modal._close = close;
+  modal.tabIndex = -1;
+  setTimeout(() => modal.focus(), 0);
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const m = [...document.querySelectorAll('.modal')].pop();
+  if (m) { e.preventDefault(); (m._close || (() => m.remove()))(); }
+});
+
 function editCamera(c) {
-  const fields = [['name', 'Name'], ['tags', 'Groups (comma separated, e.g. Outside, CBA)'], ['object_labels', 'Object labels (comma separated; blank = server default)'], ['onvif_url', 'ONVIF device service URL (blank = http://<camera host>/onvif/device_service)'], ['onvif_user', 'ONVIF user (blank = RTSP user)'], ['onvif_pass', 'ONVIF password (blank = RTSP password; never shown)'], ['main_url', 'Main RTSP URL'], ['sub_url', 'Substream RTSP URL'], ['retention_days', 'Retention (days)'], ['event_retention_days', 'Keep footage with events (days, 0 = same)'], ['detect_fps', 'Detect fps'], ['detect_width', 'Detect width'], ['detect_height', 'Detect height'], ['pixel_threshold', 'Pixel threshold (0-255)'], ['min_area_pct', 'Min changed area %'], ['min_blob_pct', 'Min blob %'], ['pre_secs', 'Pre-roll s'], ['post_secs', 'Post-roll s'], ['cooldown_secs', 'Cooldown s'], ['zones_json', 'Zones JSON [[[x,y],...]] (0..1)'], ['masks_json', 'Masks JSON'], ['sort_order', 'Sort order']];
-  const strings = ['name', 'tags', 'object_labels', 'onvif_url', 'onvif_user', 'onvif_pass', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
   const inputs = {};
-  const form = h('form', { onsubmit: async (e) => { e.preventDefault(); const patch = {}; for (const [k] of fields) { let v = inputs[k].value; if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v); if (k === 'onvif_pass' && v === '') continue; if (v !== c[k]) patch[k] = v; } patch.enabled = inputs.enabled.checked; patch.record_sub = inputs.record_sub.checked; patch.objects = inputs.objects.checked; patch.require_object = inputs.require_object.checked; patch.record_audio = inputs.record_audio.checked; try { await api.patch(`/api/cameras/${c.id}`, patch); modal.remove(); state.cameras = await api.get('/api/cameras'); route(); } catch (err) { errEl.textContent = err.message; } } },
-    ...fields.map(([k, l]) => h('label', {}, l, inputs[k] = h('input', { value: c[k] ?? '' }))),
-    h('label', { class: 'row' }, inputs.enabled = h('input', { type: 'checkbox', style: 'width:auto', checked: c.enabled }), ' Enabled'),
-    h('label', { class: 'row' }, inputs.record_sub = h('input', { type: 'checkbox', style: 'width:auto', checked: c.record_sub }), ' Record substream too (review, phones, previews)'),
-    h('label', { class: 'row' }, inputs.record_audio = h('input', { type: 'checkbox', style: 'width:auto', checked: c.record_audio }), ' Record audio (AAC track of the main stream; opt-in)'),
-    h('label', { class: 'row' }, inputs.objects = h('input', { type: 'checkbox', style: 'width:auto', checked: c.objects }), ' Object detection on motion (needs [objects] in zmng.toml)'),
-    h('label', { class: 'row' }, inputs.require_object = h('input', { type: 'checkbox', style: 'width:auto', checked: c.require_object }), ' Only keep events with a detected object'),
-    h('div', { class: 'row' }, h('span', { class: 'muted small' }, c.ptz ? `PTZ: ${c.ptz_url} profile ${c.ptz_profile}` : 'PTZ: not probed'), h('button', { type: 'button', class: 'ghost small', onclick: async () => { try { const r = await api.post(`/api/cameras/${c.id}/ptz/probe`); errEl.textContent = `PTZ found: ${r.ptz_url} (profile ${r.profile})`; } catch (e) { errEl.textContent = `PTZ probe: ${e.message}`; } } }, 'Probe PTZ (ONVIF)')),
-    h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
+  const text = (k, label, opts = {}) => h('label', { class: opts.wide ? 'wide' : '' }, label, inputs[k] = h('input', { value: c[k] ?? '', type: opts.type || 'text', placeholder: opts.ph || '', autocomplete: 'off' }), opts.hint ? h('span', { class: 'hint' }, opts.hint) : null);
+  const num = (k, label, hint) => text(k, label, { type: 'number', hint });
+  const check = (k, label) => h('label', { class: 'row check' }, inputs[k] = h('input', { type: 'checkbox', checked: c[k] }), label);
+  const secret = (k, label) => {
+    const inp = h('input', { value: c[k] ?? '', type: 'password', autocomplete: 'off', spellcheck: 'false' });
+    inputs[k] = inp;
+    return h('label', { class: 'wide' }, label, h('div', { class: 'row nowrap' }, inp, h('button', { type: 'button', class: 'ghost small', onclick: (e) => { inp.type = inp.type === 'password' ? 'text' : 'password'; e.target.textContent = inp.type === 'password' ? 'show' : 'hide'; } }, 'show')));
+  };
+  // existing groups as one-click chips that edit the text field
+  const tagsField = text('tags', 'Groups', { wide: true, ph: 'comma separated, e.g. Outside, CBA' });
+  const groupChips = h('div', { class: 'row' }, ...allGroups().map((g) => h('button', { type: 'button', class: 'ghost small', onclick: () => { const cur = inputs.tags.value.split(',').map((x) => x.trim()).filter(Boolean); inputs.tags.value = (cur.includes(g) ? cur.filter((x) => x !== g) : [...cur, g]).join(', '); } }, g)));
+  const section = (title, ...kids) => h('fieldset', {}, h('legend', {}, title), h('div', { class: 'fgrid' }, ...kids));
+  const strings = ['name', 'tags', 'object_labels', 'onvif_url', 'onvif_user', 'onvif_pass', 'main_url', 'sub_url', 'zones_json', 'masks_json'];
+  const checks = ['enabled', 'record_sub', 'record_audio', 'objects', 'require_object'];
   const errEl = h('p', { class: 'err' });
-  const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Camera ${c.id}`), form, errEl));
+  const form = h('form', { onsubmit: async (e) => {
+    e.preventDefault(); const patch = {};
+    for (const [k, inp] of Object.entries(inputs)) {
+      if (checks.includes(k)) { if (inp.checked !== c[k]) patch[k] = inp.checked; continue; }
+      let v = inp.value;
+      if (k === 'onvif_pass' && v === '') continue;
+      if (v === '' && k === 'sub_url') v = null; else if (!strings.includes(k)) v = Number(v);
+      if (v !== (c[k] ?? (k === 'sub_url' ? null : ''))) patch[k] = v;
+    }
+    if (!Object.keys(patch).length) { close(); return; }
+    try { await api.patch(`/api/cameras/${c.id}`, patch); close(); toast(`Saved ${c.name}; changes apply within ~30 s`, { kind: 'ok' }); state.cameras = [...await api.get('/api/cameras'), ...state.cameras.filter((x) => x.peer)]; route(); } catch (err) { errEl.textContent = err.message; }
+  } },
+    section('General', text('name', 'Name'), h('div', { class: 'wide' }, check('enabled', 'Enabled (recording)')), tagsField, allGroups().length ? h('div', { class: 'wide' }, groupChips) : null, num('sort_order', 'Sort order')),
+    section('Streams', secret('main_url', 'Main RTSP URL'), secret('sub_url', 'Substream RTSP URL (low-res; used for live tiles, review and motion)'), h('div', { class: 'wide' }, check('record_sub', 'Record the substream too (review, phones, previews)')), h('div', { class: 'wide' }, check('record_audio', 'Record audio (AAC track of the main stream)'))),
+    section('Retention', num('retention_days', 'Keep footage (days)'), num('event_retention_days', 'Keep footage with events (days, 0 = same)')),
+    section('Motion detection', num('detect_fps', 'Frames per second'), num('pixel_threshold', 'Pixel threshold (0–255)', 'higher = ignores smaller brightness changes'), num('min_area_pct', 'Min changed area %'), num('min_blob_pct', 'Min blob %', 'size of the largest moving object'),
+      num('pre_secs', 'Pre-roll (s)'), num('post_secs', 'Post-roll (s)'), num('cooldown_secs', 'Cooldown (s)', 'quiet time before an event ends'), num('detect_width', 'Analysis width'), num('detect_height', 'Analysis height'),
+      text('zones_json', 'Zones JSON', { wide: true, hint: '[[[x,y],…]] in 0..1; empty = whole frame' }), text('masks_json', 'Masks JSON', { wide: true, hint: 'areas to ignore, same format' })),
+    section('Object detection', h('div', { class: 'wide' }, check('objects', state.me.objects ? 'Detect people, vehicles and animals on motion' : 'Detect objects on motion (no detector configured yet)')), h('div', { class: 'wide' }, check('require_object', 'Only keep events with a detected object')), text('object_labels', 'Labels', { wide: true, ph: 'blank = server default (person, car, truck, bus, motorcycle, bicycle, dog, cat)' })),
+    section('ONVIF / PTZ', text('onvif_url', 'ONVIF device URL', { wide: true, ph: 'blank = http://<camera host>/onvif/device_service' }), text('onvif_user', 'ONVIF user', { ph: 'blank = RTSP user' }), text('onvif_pass', 'ONVIF password', { type: 'password', ph: 'blank = keep / RTSP password' }),
+      h('div', { class: 'row wide' }, h('span', { class: 'muted small' }, c.ptz ? `PTZ: ${c.ptz_url} profile ${c.ptz_profile}` : 'PTZ: not probed'), h('button', { type: 'button', class: 'ghost small', onclick: async () => { try { const r = await api.post(`/api/cameras/${c.id}/ptz/probe`); errEl.textContent = `PTZ found: ${r.ptz_url} (profile ${r.profile})`; } catch (e) { errEl.textContent = `PTZ probe: ${e.message}`; } } }, 'Probe PTZ (ONVIF)'))),
+    h('div', { class: 'row sticky-actions' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Cancel'), h('span', { class: 'muted small' }, 'Changes apply within ~30 s')));
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card wide-modal' }, h('div', { class: 'row' }, h('h2', {}, `${c.name}`), h('span', { class: 'muted' }, `camera ${c.id}`), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')), form, errEl));
+  const close = () => modal.remove();
+  closeOnEscape(modal, close);
   document.body.append(modal);
 }
 function editStorage(s, all) {
@@ -666,12 +839,14 @@ function editStorage(s, all) {
     h('div', { class: 'row' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => modal.remove() }, 'Cancel')));
   const errEl = h('p', { class: 'err' });
   const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Storage ${s.id}`), form, errEl));
+  closeOnEscape(modal, () => modal.remove());
   document.body.append(modal);
 }
 function editUserCams(u, cams) {
   const boxes = cams.map((c) => h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', value: c.id, checked: u.cameras.includes(c.id) }), ` ${c.name}`));
   const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Cameras for ${u.username}`), ...boxes,
     h('div', { class: 'row' }, h('button', { onclick: async () => { const ids = boxes.map((b) => $('input', b)).filter((i) => i.checked).map((i) => Number(i.value)); await api.patch(`/api/users/${u.id}`, { cameras: ids }); modal.remove(); route(); } }, 'Save'), h('button', { class: 'ghost', onclick: () => modal.remove() }, 'Cancel'))));
+  closeOnEscape(modal, () => modal.remove());
   document.body.append(modal);
 }
 

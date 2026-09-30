@@ -45,7 +45,19 @@ pub struct App {
     pub ptz_timers: Arc<parking_lot::Mutex<std::collections::HashMap<i64, tokio::task::AbortHandle>>>,
     /// HTTP client for peers, webhooks and probes
     pub http: reqwest::Client,
+    /// newest live JPEG per (camera, from main stream, width), with the dts
+    /// of the fragment it was decoded from
+    pub snap_cache: Arc<parking_lot::Mutex<std::collections::HashMap<SnapKey, (i64, bytes::Bytes)>>>,
+    /// one decode at a time per snapshot key (the rest wait and reuse it)
+    pub snap_locks: Arc<parking_lot::Mutex<std::collections::HashMap<SnapKey, Arc<tokio::sync::Mutex<()>>>>>,
+    /// zmNinja MJPEG streams by `connkey`, so `command=17` (quit) ends one
+    pub mjpeg_streams: Arc<parking_lot::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    /// an event re-classification pass is running
+    pub classify_running: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// (camera, main stream, width)
+pub type SnapKey = (i64, bool, u32);
 
 /// Global brute-force limiter: after `MAX_FAILS` failed logins within a
 /// minute, every login is refused for a minute.
@@ -91,15 +103,61 @@ pub fn visible_cameras_pub(app: &App, u: &User) -> Vec<i64> {
 pub fn parse_range_pub(v: &str) -> Option<(u64, Option<u64>)> {
     parse_range(v)
 }
+/// JPEG of the newest live keyframe, `width` px wide (never upscaled;
+/// `None` = up to 1280). The substream is used when it runs and is wide
+/// enough, unless `force_main`: tiles that refresh every few seconds must
+/// never decode 4 MP HEVC keyframes. Cached per keyframe, so any number of
+/// viewers polling one camera cost one decode per fragment.
+pub async fn live_jpeg(app: &App, cam: i64, width: Option<u32>, force_main: bool) -> Result<(bytes::Bytes, &'static str), Response> {
+    let want = width.unwrap_or(1280).clamp(32, 3840);
+    let sub = if force_main {
+        None
+    } else {
+        app.hub
+            .get_stream(cam, crate::recorder::StreamKind::Sub)
+            .filter(|h| h.recent.read().as_ref().is_some_and(|r| r.params.width >= want || width.is_none()))
+    };
+    let source = if sub.is_some() { "sub" } else { "main" };
+    let h = sub.or_else(|| app.hub.get(cam)).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
+    let (init, frag_dts, frag, src_w) = {
+        let r = h.recent.read();
+        let r = r.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
+        let f = r.frags.back().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
+        (r.init.clone(), f.0, f.2.clone(), r.params.width)
+    };
+    let w = if src_w > 0 { want.min(src_w) } else { want };
+    let key: SnapKey = (cam, source == "main", w);
+    let cached = |app: &App| app.snap_cache.lock().get(&key).filter(|(d, _)| *d >= frag_dts).map(|(_, j)| j.clone());
+    if let Some(j) = cached(app) {
+        return Ok((j, source));
+    }
+    let lock = {
+        let mut locks = app.snap_locks.lock();
+        if locks.len() > 512 {
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+        }
+        locks.entry(key).or_default().clone()
+    };
+    let _one = lock.lock().await;
+    if let Some(j) = cached(app) {
+        return Ok((j, source));
+    }
+    let _permit = app.decode_sem.acquire().await.map_err(err500)?;
+    let jpeg = bytes::Bytes::from(crate::thumbs::frag_to_jpeg(&app.cfg.ffmpeg, &init, &frag, w, 4).await.map_err(err500)?);
+    let mut c = app.snap_cache.lock();
+    if c.len() > 512 {
+        c.clear();
+    }
+    c.insert(key, (frag_dts, jpeg.clone()));
+    Ok((jpeg, source))
+}
+
 /// JPEG of the keyframe nearest `dts` (recorded) or the latest live keyframe.
 pub async fn frame_jpeg_pub(app: &App, cam: i64, dts: i64, width: u32) -> Result<Response, Response> {
     let now = crate::db::now_dts();
     let (init, data) = if dts >= now - 5 * crate::mp4::TIMESCALE as i64 {
-        let h = app.hub.get(cam).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
-        let r = h.recent.read();
-        let r = r.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
-        let f = r.frags.back().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
-        (r.init.to_vec(), f.2.to_vec())
+        let (jpeg, _) = live_jpeg(app, cam, Some(width), false).await?;
+        return Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=5")], jpeg).into_response());
     } else {
         let segs = app.db.segments_in_range(cam, dts, dts + 1).map_err(err500)?;
         let seg = segs.first().ok_or_else(|| (StatusCode::NOT_FOUND, "no recording at that time").into_response())?;
@@ -305,6 +363,7 @@ async fn me(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> 
         "setup_needed": app.db.user_count().unwrap_or(0) == 0,
         "go2rtc_url": app.cfg.go2rtc_url,
         "transcode": app.transcoder.is_some(),
+        "objects": app.hub.objects.read().is_some(),
         "peers": app.cfg.peers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
     }))
     .into_response())
@@ -574,6 +633,64 @@ async fn event_update(State(app): State<App>, Path(id): Path<i64>, user: Option<
     Ok(Json(serde_json::json!({"ok": true})).into_response())
 }
 
+#[derive(Deserialize, Default)]
+struct ClassifyReq {
+    /// how far back (default 7 days)
+    days: Option<f64>,
+    /// only this camera
+    camera: Option<i64>,
+    /// also events that were classified before
+    #[serde(default)]
+    again: bool,
+}
+
+/// Run object detection on the thumbnails of past events (for events
+/// recorded before a detector was configured, or after changing labels).
+/// Runs in the background, one event at a time; returns how many are queued.
+async fn events_classify(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, body: Option<Json<ClassifyReq>>) -> ApiResult {
+    use std::sync::atomic::Ordering;
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let q = body.map(|b| b.0).unwrap_or_default();
+    let det = app.hub.objects.read().clone().ok_or_else(|| bad("no object detector configured ([objects] in zmng.toml)"))?;
+    let since = crate::db::now_dts() - (q.days.unwrap_or(7.0).clamp(0.01, 90.0) * 86_400.0 * TIMESCALE as f64) as i64;
+    let cams: std::collections::HashMap<i64, crate::db::Camera> =
+        app.db.cameras().map_err(err500)?.into_iter().filter(|c| c.objects && q.camera.is_none_or(|id| id == c.id)).map(|c| (c.id, c)).collect();
+    let ids: Vec<i64> = cams.keys().copied().collect();
+    let events: Vec<crate::db::Event> = app
+        .db
+        .events(Some(&ids), Some(since), None, 0, false, None, 5000, false, None)
+        .map_err(err500)?
+        .into_iter()
+        .filter(|e| e.thumb_path.is_some() && (q.again || !e.meta_json.contains("\"classified\"")))
+        .collect();
+    if app.classify_running.swap(true, Ordering::SeqCst) {
+        return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "a classification pass is already running"}))).into_response());
+    }
+    let queued = events.len();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let (mut changed, mut failed) = (0usize, 0usize);
+        for e in events {
+            let Some(cam) = cams.get(&e.camera_id) else { continue };
+            let Ok(jpeg) = tokio::fs::read(app2.cfg.thumb_dir.join(e.thumb_path.as_deref().unwrap_or_default())).await else { continue };
+            match crate::objects::classify_event(&det, &app2.db, cam, e.id, jpeg).await {
+                Ok(Some(_)) => {
+                    changed += 1;
+                    app2.bus.publish_event(&app2.db, e.id, crate::notify::Notification::EventUpdate);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(event = e.id, "classify: {err:#}");
+                }
+            }
+        }
+        info!(queued, changed, failed, "event classification pass done");
+        app2.classify_running.store(false, Ordering::SeqCst);
+    });
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"queued": queued}))).into_response())
+}
+
 async fn event_thumb(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     let e = app.db.event(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such event").into_response())?;
@@ -800,24 +917,17 @@ async fn live(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<Strea
 async fn snapshot(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<SnapQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
-    let width = q.width.unwrap_or(1280).min(3840);
-    let sub = app.hub.get_stream(id, crate::recorder::StreamKind::Sub).filter(|h| {
-        q.stream.as_deref() != Some("main") && h.recent.read().as_ref().is_some_and(|r| r.params.width >= width || q.width.is_none())
-    });
-    let source = if sub.is_some() { "sub" } else { "main" };
-    let h = sub.or_else(|| app.hub.get(id)).ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "camera not running").into_response())?;
-    // never upscale: the default 1280 means "up to 1280"
-    let src_w = h.recent.read().as_ref().map(|r| r.params.width).unwrap_or(0);
-    let width = if src_w > 0 { width.min(src_w) } else { width };
-    let (init, frag) = {
-        let r = h.recent.read();
-        let r = r.as_ref().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
-        let f = r.frags.back().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "no frames yet").into_response())?;
-        (r.init.clone(), f.2.clone())
-    };
-    let _permit = app.decode_sem.acquire().await.map_err(err500)?;
-    let jpeg = crate::thumbs::frag_to_jpeg(&app.cfg.ffmpeg, &init, &frag, width, 4).await.map_err(err500)?;
+    let (jpeg, source) = live_jpeg(&app, id, q.width, q.stream.as_deref() == Some("main")).await?;
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store"), (axum::http::HeaderName::from_static("x-stream"), source)], jpeg).into_response())
+}
+
+/// The fragment holding `dts` in a recorder's open (not yet indexed)
+/// segment: (file, fragment, init length, dts offset 0).
+fn open_fragment(app: &App, cam: i64, kind: crate::recorder::StreamKind, dts: i64) -> Option<(std::path::PathBuf, crate::mp4::FragEntry, u32, i64)> {
+    let h = app.hub.get_stream(cam, kind)?;
+    let open = h.open.read().clone()?;
+    let f = open.frags.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64).copied()?;
+    Some((open.abs_path, f, open.init_len, 0))
 }
 
 #[derive(Deserialize)]
@@ -834,15 +944,26 @@ async fn frame_at(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<F
     let dts = video::ms_to_dts(q.t);
     let kind = stream_of(&q.stream)?;
     let mut segs = app.db.segments_in_range_stream(id, kind.as_str(), dts, dts + 1).map_err(err500)?;
-    if segs.is_empty() && kind == crate::recorder::StreamKind::Sub {
-        segs = app.db.segments_in_range(id, dts, dts + 1).map_err(err500)?; // fall back to main
+    let mut located = None;
+    if segs.is_empty() {
+        // the last minute is still in the open segment (on disk, not indexed yet)
+        located = open_fragment(&app, id, kind, dts);
     }
-    let seg = segs.first().ok_or_else(|| (StatusCode::NOT_FOUND, "no recording at that time").into_response())?;
-    let frag = seg.index.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64).or_else(|| seg.index.first()).copied().ok_or_else(|| err500("empty segment"))?;
-    let storage = app.db.storage(seg.storage_id).map_err(err500)?.ok_or_else(|| err500("storage missing"))?;
-    let path = std::path::PathBuf::from(&storage.path).join(&seg.path);
-    let init_len = seg.init_len;
-    let off = seg.dts_offset;
+    if segs.is_empty() && located.is_none() && kind == crate::recorder::StreamKind::Sub {
+        segs = app.db.segments_in_range(id, dts, dts + 1).map_err(err500)?; // fall back to main
+        if segs.is_empty() {
+            located = open_fragment(&app, id, crate::recorder::StreamKind::Main, dts);
+        }
+    }
+    let (path, frag, init_len, off) = match located {
+        Some(l) => l,
+        None => {
+            let seg = segs.first().ok_or_else(|| (StatusCode::NOT_FOUND, "no recording at that time").into_response())?;
+            let frag = seg.index.iter().find(|f| f.dts <= dts && dts < f.dts + f.duration as i64).or_else(|| seg.index.first()).copied().ok_or_else(|| err500("empty segment"))?;
+            let storage = app.db.storage(seg.storage_id).map_err(err500)?.ok_or_else(|| err500("storage missing"))?;
+            (std::path::PathBuf::from(&storage.path).join(&seg.path), frag, seg.init_len, seg.dts_offset)
+        }
+    };
     let (init, data) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>)> {
         let d = crate::thumbs::read_range(&path, frag.offset, frag.len)?;
         Ok((crate::thumbs::read_range(&path, 0, init_len)?, crate::mp4::rebase_fragment(&d, off)))
@@ -1320,11 +1441,17 @@ impl App {
             setup_token: Arc::new(new_token()[..12].to_string()),
             login_guard: Arc::new(parking_lot::Mutex::new(LoginGuard::default())),
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
-            mjpeg_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            // a 640x360 MJPEG stream costs a few % of one core now that ffmpeg
+            // no longer starts a thread per core (see thumbs::ffmpeg_command)
+            mjpeg_sem: Arc::new(tokio::sync::Semaphore::new(8)),
             started_ms: crate::db::now_dts() / 90,
             transcoder,
             ptz_timers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(3)).build().expect("reqwest client"),
+            snap_cache: Default::default(),
+            snap_locks: Default::default(),
+            mjpeg_streams: Default::default(),
+            classify_running: Default::default(),
         }
     }
 }
@@ -1334,7 +1461,12 @@ impl App {
 pub fn router(app: App) -> Router {
     let web_dir = app.cfg.web_dir.clone();
     let index = ServeFile::new(web_dir.join("index.html"));
-    let static_files = ServeDir::new(&web_dir).not_found_service(index);
+    // revalidate the UI on every load (a 304 when unchanged): without a
+    // Cache-Control, browsers kept serving the previous app.js for hours
+    // after an upgrade (heuristic freshness from Last-Modified)
+    let static_files = tower::ServiceBuilder::new()
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, HeaderValue::from_static("no-cache")))
+        .service(ServeDir::new(&web_dir).not_found_service(index));
 
     let api = Router::new()
         .route("/api/health", get(health))
@@ -1360,6 +1492,7 @@ pub fn router(app: App) -> Router {
         .route("/api/segments/{id}/init.mp4", get(segment_init))
         .route("/api/segments/{id}/frag/{fi}/seg.m4s", get(segment_frag))
         .route("/api/events", get(events))
+        .route("/api/events/classify", post(events_classify))
         .route("/api/events/{id}", get(event_get).patch(event_update))
         .route("/api/events/{id}/thumb.jpg", get(event_thumb))
         .route("/api/events/stream", get(event_stream))

@@ -14,6 +14,10 @@ button.ghost:hover { color: var(--text); border-color: var(--muted); }
 button.small { padding: 4px 8px; font-size: 12px; }
 button:disabled { opacity: .5; cursor: default; }
 input, select, textarea { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%; }
+/* the rule above made every checkbox 100% wide, pushing its text onto the next line */
+input[type=checkbox], input[type=radio] { width: auto; margin: 0; accent-color: var(--accent); }
+/* inline controls size to their content (full width only inside forms) */
+.toolbar select, .controls select, .filters select, .row select, .toolbar input, .filters input { width: auto; }
 label { display: block; margin: 8px 0; color: var(--muted); font-size: 13px; }
 label input, label select { margin-top: 4px; }
 [hidden] { display: none !important; }
@@ -86,8 +90,32 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 .event.archived .thumb::after { content: "★"; position: absolute; left: 6px; top: 4px; color: var(--accent2); font-size: 16px; }
 
 /* admin */
-.two { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
-.two > .card { min-width: 0; }
+.two { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); margin-top: 14px; }
+.two > .card, .two > .card + .card { min-width: 0; margin: 0; }
+.two + .card, .card + .two { margin-top: 14px; }
+.tablewrap { overflow-x: auto; }
+td.actions { white-space: nowrap; text-align: right; }
+td.actions button + button { margin-left: 6px; }
+td .pill + .pill, td .pill + span { margin-left: 4px; }
+table.matrix th, table.matrix td { text-align: center; white-space: nowrap; }
+table.matrix th:first-child, table.matrix td:first-child { text-align: left; }
+table.matrix th span { text-transform: none; letter-spacing: 0; color: var(--text); font-size: 13px; }
+table.matrix th button { padding: 0 5px; margin-left: 2px; border: 0; }
+table.matrix input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
+.newgroup { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.newgroup .row + .row { margin-top: 8px; }
+details.card summary { cursor: pointer; font-weight: 700; }
+details.card[open] summary { margin-bottom: 8px; }
+fieldset { border: 1px solid var(--line); border-radius: var(--radius); margin: 10px 0; padding: 6px 12px 10px; min-width: 0; }
+legend { color: var(--text); font-weight: 700; padding: 0 6px; }
+.fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0 12px; align-items: start; }
+.fgrid .wide { grid-column: 1 / -1; }
+.fgrid label { margin: 6px 0; }
+.hint { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+label.check { display: flex; gap: 8px; align-items: center; color: var(--text); margin: 6px 0; }
+.row.nowrap { flex-wrap: nowrap; }
+.modal .card.wide-modal { width: min(860px, 100%); }
+.sticky-actions { position: sticky; bottom: -14px; background: var(--panel); padding: 10px 0; border-top: 1px solid var(--line); margin-top: 8px; z-index: 1; }
 code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: grid; place-items: center; z-index: 30; padding: 16px; }
 .modal .card { width: min(560px, 100%); max-height: 90vh; overflow: auto; }
@@ -110,7 +138,15 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-siz
 .timeline { overflow: visible; margin-top: 14px; }
 .player .livebadge { position: absolute; right: 10px; top: 8px; background: rgba(255,90,95,.85); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; }
 .filters label { margin: 0; }
+.filters .row + .row { margin-top: 10px; }
 .filters input[type=datetime-local] { width: auto; }
+/* Apply has unapplied date/filter changes */
+button.pending { box-shadow: 0 0 0 2px var(--accent2); }
+button.pending::after { content: " •"; }
+.legend { display: inline-flex; gap: 10px; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 4px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.grid.montage .tile .label { cursor: pointer; }
+.event .thumb .kind { position: absolute; left: 6px; bottom: 6px; color: #06121f; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 4px; text-transform: capitalize; }
 .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--text); cursor: pointer; margin: 0; }
 .chip input { width: auto; margin: 0; }
 .small { font-size: 12px; }

@@ -155,16 +155,39 @@ impl EventObjects {
     }
 }
 
+/// Outcome of the most recent requests, for the status page.
+#[derive(Clone, Debug, Default)]
+pub struct DetectorHealth {
+    /// epoch ms of the last successful detection
+    pub last_ok_ms: Option<i64>,
+    /// epoch ms and text of the last failure ("detector busy" is not one)
+    pub last_err: Option<(i64, String)>,
+}
+
 pub struct ObjectDetector {
     pub cfg: ObjectsConfig,
     client: reqwest::Client,
     sem: Arc<tokio::sync::Semaphore>,
+    health: parking_lot::Mutex<DetectorHealth>,
 }
 
 impl ObjectDetector {
     pub fn new(cfg: ObjectsConfig) -> Result<ObjectDetector> {
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100))).redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(ObjectDetector { sem: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent.max(1))), cfg, client })
+        Ok(ObjectDetector { sem: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent.max(1))), cfg, client, health: Default::default() })
+    }
+
+    pub fn health(&self) -> DetectorHealth {
+        self.health.lock().clone()
+    }
+
+    /// A failure newer than the last success, within the last `window_ms`.
+    pub fn failing(&self, now_ms: i64, window_ms: i64) -> Option<String> {
+        let h = self.health.lock();
+        match &h.last_err {
+            Some((t, e)) if now_ms - t < window_ms && h.last_ok_ms.is_none_or(|ok| ok < *t) => Some(e.clone()),
+            _ => None,
+        }
     }
 
     /// Send one JPEG; returns normalized, unfiltered boxes. Waits for a slot
@@ -174,6 +197,31 @@ impl ObjectDetector {
             Ok(Ok(p)) => p,
             _ => anyhow::bail!("detector busy"),
         };
+        let res = self.request(jpeg, w, h).await;
+        drop(permit);
+        let now = crate::db::now_dts() / 90;
+        let mut hl = self.health.lock();
+        match &res {
+            Ok(_) => hl.last_ok_ms = Some(now),
+            Err(e) => hl.last_err = Some((now, format!("{e:#}"))),
+        }
+        res
+    }
+
+    /// Like [`detect`](Self::detect) but waits for a slot (up to 30 s)
+    /// instead of dropping: for one-off work such as classifying a finished
+    /// event, where losing the frame means losing the label.
+    pub async fn detect_patiently(&self, jpeg: Vec<u8>, w: u32, h: u32) -> Result<Vec<DetectedObject>> {
+        for _ in 0..150 {
+            if self.sem.available_permits() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        self.detect(jpeg, w, h).await
+    }
+
+    async fn request(&self, jpeg: Vec<u8>, w: u32, h: u32) -> Result<Vec<DetectedObject>> {
         let part = reqwest::multipart::Part::bytes(jpeg).file_name("frame.jpg").mime_str("image/jpeg")?;
         let form = reqwest::multipart::Form::new().part("image", part).text("min_confidence", format!("{}", self.cfg.min_confidence * 0.5));
         let mut req = self.client.post(&self.cfg.url).multipart(form);
@@ -181,7 +229,6 @@ impl ObjectDetector {
             req = req.header("X-API-Key", k);
         }
         let res = req.send().await.context("detection request")?;
-        drop(permit);
         if !res.status().is_success() {
             anyhow::bail!("detector returned {}", res.status());
         }
@@ -194,6 +241,51 @@ impl ObjectDetector {
         debug!(n = objs.len(), "detection");
         Ok(objs)
     }
+}
+
+/// Labels this camera wants: its own list, else the server default.
+pub fn camera_labels(cfg: &ObjectsConfig, cam: &crate::db::Camera) -> Vec<String> {
+    if cam.object_labels.trim().is_empty() {
+        cfg.labels.clone()
+    } else {
+        cam.object_labels.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+    }
+}
+
+/// Width and height of a JPEG from its header.
+pub fn jpeg_size(jpeg: &[u8]) -> Result<(u32, u32)> {
+    let r = image::ImageReader::with_format(std::io::Cursor::new(jpeg), image::ImageFormat::Jpeg);
+    Ok(r.into_dimensions()?)
+}
+
+/// Run the detector on a finished event's picture (its thumbnail: the
+/// main-stream keyframe at the motion peak, 640 px wide, so small or distant
+/// objects the 320 px motion frames miss are still found) and merge what it
+/// finds into the event: the best box per label is kept, the kind becomes
+/// the highest-priority label. Returns the new kind when it changed.
+pub async fn classify_event(det: &ObjectDetector, db: &crate::db::Db, cam: &crate::db::Camera, event_id: i64, jpeg: Vec<u8>) -> Result<Option<String>> {
+    let (w, h) = jpeg_size(&jpeg)?;
+    let found = det.detect_patiently(jpeg, w, h).await?;
+    let labels = camera_labels(&det.cfg, cam);
+    let found = filter(found, &labels, det.cfg.min_confidence, &crate::detect::parse_polys(&cam.zones_json), &crate::detect::parse_polys(&cam.masks_json));
+    let Some(e) = db.event(event_id)? else { return Ok(None) };
+    let mut objs = EventObjects::default();
+    objs.merge(&crate::notify::objects_from_meta(&e));
+    let changed = objs.merge(&found);
+    let mut meta: serde_json::Value = serde_json::from_str(&e.meta_json).unwrap_or_else(|_| serde_json::json!({}));
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
+    meta["classified"] = serde_json::json!(true);
+    if !changed {
+        db.update_event_objects(event_id, &e.kind, &meta.to_string())?;
+        return Ok(None);
+    }
+    let kind = objs.kind(&labels);
+    meta["objects"] = serde_json::to_value(objs.list())?;
+    db.update_event_objects(event_id, &kind, &meta.to_string())?;
+    debug!(event = event_id, %kind, "event classified from its thumbnail");
+    Ok((kind != e.kind).then_some(kind))
 }
 
 /// Per-camera gate: decides when to send a frame and carries results back
@@ -212,11 +304,7 @@ pub struct ObjectGate {
 
 impl ObjectGate {
     pub fn new(det: Arc<ObjectDetector>, cam: &crate::db::Camera) -> ObjectGate {
-        let labels: Vec<String> = if cam.object_labels.trim().is_empty() {
-            det.cfg.labels.clone()
-        } else {
-            cam.object_labels.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
-        };
+        let labels = camera_labels(&det.cfg, cam);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         ObjectGate {
             interval: (det.cfg.interval_secs * crate::mp4::TIMESCALE as f64) as i64,

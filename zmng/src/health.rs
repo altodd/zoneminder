@@ -99,7 +99,12 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
     let oldest_cam = db.oldest_segment_per_camera()?;
     let mut issues = Vec::new();
     let mut cameras = Vec::new();
+    let object_detector = hub.objects.read().clone();
+    let mut wants_objects = Vec::new();
     for cam in db.cameras()?.into_iter().filter(|c| visible.contains(&c.id)) {
+        if cam.enabled && cam.objects {
+            wants_objects.push(cam.name.clone());
+        }
         let st = hub.get(cam.id).map(|h| h.status.read().clone()).unwrap_or_default();
         let sub = hub.get_stream(cam.id, crate::recorder::StreamKind::Sub).map(|h| h.status.read().connected);
         let det = crate::detect::status(hub, cam.id);
@@ -134,6 +139,14 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
             ingest_24h: ingest.iter().filter(|(c, _, _)| *c == cam.id).map(|(_, _, b)| *b).sum(),
             oldest_ms: oldest_cam.get(&cam.id).map(|d| dts_to_ms(*d)),
         });
+    }
+    // a detector that stops answering is otherwise invisible: events just
+    // stay "motion" and the people/vehicle filters find nothing. (Not
+    // configured at all is the default install; the Admin page says so.)
+    if let (false, Some(d)) = (wants_objects.is_empty(), &object_detector) {
+        if let Some(e) = d.failing(dts_to_ms(now), 30 * 60_000) {
+            issues.push(Issue { level: "warn".into(), subject: "Object detection".into(), text: if admin { format!("detector failing: {e}") } else { "detector failing".into() } });
+        }
     }
     let mut storages = Vec::new();
     if admin {

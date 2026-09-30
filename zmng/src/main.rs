@@ -290,6 +290,7 @@ fn run(cfg: config::Config) -> Result<()> {
                 None => None,
             },
         });
+        *hub.objects.write() = dctx.objects.clone();
         detect::reconcile(dctx.clone()).await?;
 
         // periodic: retention + reconcile (picks up camera changes made via API) + alerts + backup

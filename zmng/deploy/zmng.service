@@ -27,6 +27,11 @@ ProtectHome=true
 NoNewPrivileges=true
 PrivateTmp=true
 Environment=RUST_BACKTRACE=1
+# ffmpeg children: Ubuntu's ffmpeg starts an OpenMP pool of one thread per
+# core in every process (~130 threads and ~4 s of CPU per snapshot on a
+# 48-core box); zmng also sets this per child, this covers anything else
+Environment=OMP_NUM_THREADS=1
+TasksMax=2048
 
 [Install]
 WantedBy=multi-user.target

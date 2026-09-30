@@ -72,7 +72,10 @@ pub fn ffmpeg_args(cfg: &TranscodeConfig, fps_hint: f64) -> Vec<String> {
     // short piped input (a 2 s range encodes to nothing); low_delay alone
     // keeps live latency at one fragment
     let mut a: Vec<String> = ["-nostdin", "-loglevel", "error", "-nostats", "-flags", "low_delay",
-        "-probesize", "1000000", "-analyzeduration", "0", "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn"]
+        "-probesize", "1000000", "-analyzeduration", "0", "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
+        // keep the camera's variable frame rate: without it ffmpeg pads an
+        // 18 fps VFR source to 30 fps CFR (1829 frames out for 1098 in)
+        "-fps_mode", "passthrough"]
         .iter().map(|s| s.to_string()).collect();
     if cfg.max_height > 0 {
         a.extend(["-vf".into(), format!("scale=-2:'min({},ih)'", cfg.max_height)]);
@@ -118,7 +121,7 @@ impl Transcoder {
     /// the init segment is available or fails fast when no slot is free.
     pub async fn start(&self, input: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static, first_dts: i64, fps_hint: f64) -> Result<Transcoded> {
         let permit = self.sem.clone().try_acquire_owned().map_err(|_| anyhow::anyhow!("all {} transcode sessions are in use", self.cfg.max_sessions))?;
-        let mut child = tokio::process::Command::new(&self.ffmpeg)
+        let mut child = crate::thumbs::ffmpeg_command(&self.ffmpeg)
             .args(ffmpeg_args(&self.cfg, fps_hint))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

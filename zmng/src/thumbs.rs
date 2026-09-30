@@ -8,14 +8,29 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 
+/// An ffmpeg child with library thread pools pinned to one thread.
+///
+/// Ubuntu's ffmpeg links a library that starts an OpenMP pool of one thread
+/// per core in every process. On the 48-core production box each snapshot
+/// ffmpeg ran ~130 threads and burned ~4.5 s of CPU (mostly thread start-up)
+/// for one 640 px JPEG, and a few concurrent ones hit the unit's `TasksMax`
+/// (EAGAIN: "ff_frame_thread_encoder_init failed"). With the pool pinned it
+/// is 4 threads and ~0.35 s. Codec and filter threads are still chosen per
+/// command with `-threads` / `-filter_threads`.
+pub fn ffmpeg_command(ffmpeg: &str) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(ffmpeg);
+    c.env("OMP_NUM_THREADS", "1");
+    c
+}
+
 /// Decode the first frame of `frag` (which must start with a keyframe) and
 /// return a JPEG scaled to `width` pixels wide.
 pub async fn frag_to_jpeg(ffmpeg: &str, init: &[u8], frag: &[u8], width: u32, quality: u8) -> Result<Vec<u8>> {
-    let mut child = tokio::process::Command::new(ffmpeg)
+    let mut child = ffmpeg_command(ffmpeg)
         .args([
             "-nostdin", "-loglevel", "error", "-threads", "2",
             "-f", "mp4", "-i", "pipe:0",
-            "-frames:v", "1",
+            "-frames:v", "1", "-threads", "1", "-filter_threads", "1",
             "-vf", &format!("scale={width}:-2"),
             "-q:v", &quality.to_string(),
             "-f", "image2", "-vcodec", "mjpeg", "pipe:1",

@@ -1126,7 +1126,12 @@ impl Db {
                 args.push(k.to_lowercase().into());
                 ph.push(format!("?{}", args.len()));
             }
-            sql.push_str(&format!(" AND kind IN ({})", ph.join(",")));
+            // the kind is only the top label: a person walking past a car is
+            // kind "person" but still belongs under "vehicles"
+            let ph = ph.join(",");
+            sql.push_str(&format!(
+                " AND (kind IN ({ph}) OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(event.meta_json) THEN event.meta_json ELSE '{{}}' END, '$.objects') o WHERE lower(json_extract(o.value, '$.label')) IN ({ph})))"
+            ));
         }
         if let Some(cs) = cameras {
             if cs.is_empty() {

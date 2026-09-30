@@ -1,14 +1,32 @@
 [Unit]
-Description=zmng object-detection server (ONNX Runtime)
+Description=zmng object-detection server (ONNX Runtime, YOLO)
 After=network-online.target
 
 [Service]
 User=zmng
 Group=zmng
 WorkingDirectory=/opt/zmng-detector
-ExecStart=/opt/zmng-detector/bin/python3 /opt/zmng-detector/server.py --model /opt/zmng-detector/yolov8n.onnx --host 127.0.0.1 --port 32168
+# CPU is enough when detection is motion-gated (a few frames per event):
+# YOLO11s at 640 px is ~0.4 s on 2 threads of a Xeon Silver 4116 at nice 19.
+# With onnxruntime-gpu installed the CUDA provider is picked automatically.
+ExecStart=/opt/zmng-detector/bin/python3 /opt/zmng-detector/server.py --model /opt/zmng-detector/yolo11s.onnx --host 127.0.0.1 --port 32168 --threads 2
 Restart=always
 RestartSec=5
+Environment=OMP_NUM_THREADS=2
+# the recorder always wins
+Nice=19
+CPUWeight=20
+IOSchedulingClass=idle
+MemoryMax=1G
+TasksMax=64
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/opt/zmng-detector
+# it only ever talks to zmng on this host (no model downloads, no telemetry)
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

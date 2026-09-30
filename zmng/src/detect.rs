@@ -316,7 +316,7 @@ async fn detect_session(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Cam
     let url = cam.sub_url.clone().unwrap_or_else(|| cam.main_url.clone());
     let (w, hh) = (cam.detect_width as usize, cam.detect_height as usize);
     let fps = cam.detect_fps.max(0.5);
-    let mut cmd = tokio::process::Command::new(&ctx.ffmpeg);
+    let mut cmd = crate::thumbs::ffmpeg_command(&ctx.ffmpeg);
     cmd.args(["-nostdin", "-loglevel", "error", "-threads", "1"]);
     let _list_file; // keeps the temp file alive for the session
     if let Some(src) = url.strip_prefix("lavfi:") {
@@ -341,7 +341,7 @@ async fn detect_session(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Cam
     }
     let mut child = cmd
         .args([
-            "-an", "-sn", "-dn",
+            "-an", "-sn", "-dn", "-threads", "1", "-filter_threads", "1",
             "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=yuv420p"),
             "-f", "rawvideo", "pipe:1",
         ])
@@ -499,11 +499,11 @@ async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
-    let mut child = tokio::process::Command::new(&ctx.ffmpeg)
+    let mut child = crate::thumbs::ffmpeg_command(&ctx.ffmpeg)
         .args([
             "-nostdin", "-loglevel", "info", "-nostats", "-threads", "1",
             "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "65536", "-analyzeduration", "0",
-            "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
+            "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn", "-threads", "1", "-filter_threads", "1",
             "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=yuv420p,showinfo"),
             "-f", "rawvideo", "pipe:1",
         ])
@@ -687,7 +687,14 @@ impl EventState {
         // thumbnail in the background, from the open segment when the peak is still in it
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let (db, hub, ffmpeg, thumb_dir, bus, cam_id) = (ctx.db.clone(), ctx.hub.clone(), ctx.ffmpeg.clone(), ctx.thumb_dir.clone(), ctx.bus.clone(), cam.id);
-            rt.spawn(async move { thumbnail_task(&db, Some(&hub), &ffmpeg, &thumb_dir, &bus, cam_id, id, peak_dts).await });
+            let classify = ctx.objects.clone().filter(|_| cam.objects).map(|d| (d, cam.clone()));
+            rt.spawn(async move {
+                if let Some(jpeg) = thumbnail_task(&db, Some(&hub), &ffmpeg, &thumb_dir, &bus, cam_id, id, peak_dts).await {
+                    if let Some((det, cam)) = classify {
+                        classify_task(&det, &db, &bus, &cam, id, jpeg).await;
+                    }
+                }
+            });
         }
         Ok(())
     }
@@ -758,14 +765,32 @@ impl EventState {
 /// Make the thumbnail of a closed event, then tell everyone: the JPEG bytes
 /// for MQTT, and an `event_update` whose `thumb` URL is now set (the
 /// `event_end` went out before the picture existed).
+/// Returns the JPEG so the caller can classify it.
 #[allow(clippy::too_many_arguments)]
-pub async fn thumbnail_task(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_dir: &std::path::Path, bus: &crate::notify::Bus, cam_id: i64, event_id: i64, peak_dts: i64) {
+pub async fn thumbnail_task(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_dir: &std::path::Path, bus: &crate::notify::Bus, cam_id: i64, event_id: i64, peak_dts: i64) -> Option<Vec<u8>> {
     match make_thumbnail(db, hub, ffmpeg, thumb_dir, cam_id, event_id, peak_dts).await {
         Ok(jpeg) => {
-            bus.publish(crate::notify::Notification::EventThumbnail { event_id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg) });
+            bus.publish(crate::notify::Notification::EventThumbnail { event_id, camera_id: cam_id, jpeg: bytes::Bytes::from(jpeg.clone()) });
+            bus.publish_event(db, event_id, crate::notify::Notification::EventUpdate);
+            Some(jpeg)
+        }
+        Err(e) => {
+            error!(camera = cam_id, event = event_id, "thumbnail: {e:#}");
+            None
+        }
+    }
+}
+
+/// Second opinion on a closed event from its full-resolution thumbnail
+/// (see [`crate::objects::classify_event`]); announces a changed kind.
+pub async fn classify_task(det: &crate::objects::ObjectDetector, db: &Db, bus: &crate::notify::Bus, cam: &Camera, event_id: i64, jpeg: Vec<u8>) {
+    match crate::objects::classify_event(det, db, cam, event_id, jpeg).await {
+        Ok(Some(kind)) => {
+            info!(camera = cam.id, event = event_id, %kind, "objects (thumbnail)");
             bus.publish_event(db, event_id, crate::notify::Notification::EventUpdate);
         }
-        Err(e) => error!(camera = cam_id, event = event_id, "thumbnail: {e:#}"),
+        Ok(None) => {}
+        Err(e) => warn!(camera = cam.id, event = event_id, "classifying thumbnail: {e:#}"),
     }
 }
 

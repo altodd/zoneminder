@@ -52,6 +52,10 @@ pub struct Config {
     pub transcode: Option<crate::transcode::TranscodeConfig>,
     /// Other zmng servers whose cameras this UI shows (`[[peers]]`).
     pub peers: Vec<crate::peers::PeerConfig>,
+    /// Offer zmNinjaNg live video as MSE through our own go2rtc-compatible
+    /// websocket (`/zm/go2rtc/ws`) instead of MJPEG. Ignored when
+    /// `go2rtc_url` is set (that go2rtc is advertised instead).
+    pub zmninja_mse: bool,
 }
 
 impl Default for Config {
@@ -76,6 +80,7 @@ impl Default for Config {
             objects: None,
             transcode: None,
             peers: Vec::new(),
+            zmninja_mse: true,
         }
     }
 }
