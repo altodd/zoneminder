@@ -20,5 +20,7 @@ Start with **`ARCHITECTURE.md`** (diagnosis, design, plan). Then:
 | `reviews/08-phase3-code-review.md` | Code review of the phase-3 work (previews, objects, transcode, PTZ, federation, audio, PWA); H1/M1–M7 and the lows fixed in-session |
 | `reviews/09-phase3-architecture-review.md` | Architecture review against ARCHITECTURE.md at 23 cameras / 17 TB; the must-fix table's items are addressed in §10.5, the rest listed there as deferred |
 | `reviews/10-coverage-audit-2.md` | Second test-coverage audit (72 % lines) after phase 3 |
+| `TEST-DEPLOY-2026-09-28.md` | The side-by-side test install on securityserver (isolation, before/after, findings) |
+| `reviews/11-field-review-2026-09-30.md` | Two days into the side-by-side test: UI/server/detection/zmNinjaNg findings, fixes deployed, production ZoneMinder findings, next steps and Review filter ideas |
 
 Code: `../zmng/` (README inside). ZoneMinder fork (reference, phase-0 patches): `../zoneminder/`.
