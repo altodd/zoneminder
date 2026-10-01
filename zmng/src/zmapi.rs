@@ -191,10 +191,38 @@ async fn users(State(_app): State<App>, user: Option<axum::Extension<AuthUser>>)
     Ok(Json(json!({"users": [{"User": {
         "Id": u.id.to_string(), "Username": u.username, "Enabled": "1",
         "System": if admin { "Edit" } else { "None" }, "Monitors": if admin { "Edit" } else { "View" },
-        "Stream": "View", "Events": "Edit", "Control": "None", "Groups": "None", "Snapshots": "View", "Devices": "None"
+        "Stream": "View", "Events": "Edit", "Control": "None", "Groups": "View", "Snapshots": "View", "Devices": "None"
     }}]}))
     .into_response())
 }
+/// Stable id for a group name (ZoneMinder groups have numeric ids; ours are
+/// the cameras' tags): FNV-1a of the lower-cased name, positive 31-bit.
+pub fn group_id(name: &str) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in name.trim().to_lowercase().bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    (h & 0x7fff_ffff).max(1)
+}
+
+/// `groups.json`: the camera groups, each with the monitors this user may see
+/// (zmNinjaNg filters its montage and event lists by them).
+async fn groups(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let mut groups: std::collections::BTreeMap<String, (String, Vec<Value>)> = Default::default();
+    for c in visible(&app, u) {
+        for t in c.tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            groups.entry(t.to_lowercase()).or_insert_with(|| (t.to_string(), Vec::new())).1.push(json!({"Id": c.id.to_string(), "Name": c.name}));
+        }
+    }
+    let rows: Vec<Value> = groups
+        .into_values()
+        .map(|(name, mons)| json!({"Group": {"Id": group_id(&name).to_string(), "Name": name, "ParentId": null}, "Monitor": mons}))
+        .collect();
+    Ok(Json(json!({"groups": rows})).into_response())
+}
+
 async fn storage_list(State(app): State<App>) -> Response {
     let rows: Vec<Value> = app
         .db
@@ -1174,7 +1202,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/servers.json", get(|| async { Json(json!({"servers": []})).into_response() }))
         .route("/zm/api/states.json", get(|| async { Json(json!({"states": []})).into_response() }))
         .route("/zm/api/states/change/{*rest}", post(saved))
-        .route("/zm/api/groups.json", get(|| async { Json(json!({"groups": []})).into_response() }))
+        .route("/zm/api/groups.json", get(groups))
         .route("/zm/api/tags.json", get(not_found))
         .route("/zm/api/tags/{*rest}", get(not_found))
         .route("/zm/api/zones.json", get(zones))

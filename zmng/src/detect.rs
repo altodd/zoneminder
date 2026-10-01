@@ -145,6 +145,61 @@ async fn run_detector(ctx: Arc<DetectCtx>, h: Arc<DetectorHandle>, mut stop: tok
 // Detector core (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// Which 8x8 cells of the analysed frame changed: lets object detection
+/// ignore things that did not move (a school bus parked in the background is
+/// a real "bus" in every frame, but never the reason for an event).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MotionCells {
+    /// frame size in pixels the grid was taken from
+    pub w: usize,
+    pub h: usize,
+    /// cells per row / column (8x8 px each, the last ones may be partial)
+    pub bw: usize,
+    pub bh: usize,
+    pub bits: Vec<bool>,
+}
+
+impl MotionCells {
+    pub fn any(&self) -> bool {
+        self.bits.iter().any(|b| *b)
+    }
+
+    /// Whether a normalized box (x0, y0, x1, y1 in 0..1) touches a changed
+    /// cell, allowing `margin` cells of slack around the box (the object may
+    /// have moved a little between the analysed frame and the detected one).
+    pub fn overlaps(&self, bbox: [f64; 4], margin: usize) -> bool {
+        let cx = |x: f64| ((x * self.w as f64) / 8.0).floor().max(0.0) as usize;
+        let cy = |y: f64| ((y * self.h as f64) / 8.0).floor().max(0.0) as usize;
+        let (x0, y0) = (cx(bbox[0]).saturating_sub(margin), cy(bbox[1]).saturating_sub(margin));
+        let (x1, y1) = ((cx(bbox[2]) + margin).min(self.bw.saturating_sub(1)), (cy(bbox[3]) + margin).min(self.bh.saturating_sub(1)));
+        (y0..=y1).any(|y| (x0..=x1).any(|x| self.bits.get(y * self.bw + x).copied().unwrap_or(false)))
+    }
+
+    /// Compact JSON for `event.meta_json`: `{"w","h","bw","bh","hex"}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut hex = String::with_capacity(self.bits.len() / 4 + 1);
+        for chunk in self.bits.chunks(4) {
+            let n = chunk.iter().enumerate().fold(0u8, |a, (i, b)| a | ((*b as u8) << (3 - i)));
+            hex.push(char::from_digit(n as u32, 16).unwrap_or('0'));
+        }
+        serde_json::json!({"w": self.w, "h": self.h, "bw": self.bw, "bh": self.bh, "hex": hex})
+    }
+
+    pub fn from_json(v: &serde_json::Value) -> Option<MotionCells> {
+        let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
+        let (w, h, bw, bh) = (g("w")?, g("h")?, g("bw")?, g("bh")?);
+        let mut bits = Vec::with_capacity(bw * bh);
+        for c in v.get("hex")?.as_str()?.chars() {
+            let n = c.to_digit(16)?;
+            for i in 0..4 {
+                bits.push(n & (1 << (3 - i)) != 0);
+            }
+        }
+        bits.truncate(bw * bh);
+        (bits.len() == bw * bh).then_some(MotionCells { w, h, bw, bh, bits })
+    }
+}
+
 pub struct MotionDetector {
     w: usize,
     h: usize,
@@ -229,6 +284,11 @@ impl MotionDetector {
         // score: percentage of zone changed, compressed: 1% -> ~40, 5% -> ~120, 20%+ -> 255
         let s = (area_pct.ln_1p() * 80.0).clamp(1.0, 255.0);
         s as u8
+    }
+
+    /// Cells of the last fed frame where at least 1/8 of the pixels changed.
+    pub fn cells(&self) -> MotionCells {
+        MotionCells { w: self.w, h: self.h, bw: self.bw, bh: self.bh, bits: self.blocks.iter().map(|b| *b >= 8).collect() }
     }
 }
 
@@ -432,9 +492,11 @@ impl DetectRun {
             }
         }
         let mut in_flight = false;
+        let cells = (score > 0).then(|| self.det.cells());
+        self.ev.frame_cells = cells.clone();
         if let Some(g) = self.gate.as_mut() {
-            if score > 0 {
-                g.maybe_send(dts, frame, self.w, self.h, self.ev.event_id);
+            if let Some(cells) = cells {
+                g.maybe_send(dts, frame, self.w, self.h, self.ev.event_id, cells);
             }
             for (d, sent_for, objs) in g.poll() {
                 self.ev.on_objects(&ctx, &cam, d, sent_for, objs)?;
@@ -614,17 +676,25 @@ struct EventState {
     /// `require_object` close postponed while a detection is in flight:
     /// the last-motion dts to close at once the answer arrives
     deferred_close: Option<i64>,
+    /// changed cells of the frame being stepped (set by `on_frame`)
+    frame_cells: Option<MotionCells>,
+    /// changed cells at the peak: where the thumbnail's objects must be
+    peak_cells: Option<MotionCells>,
 }
 
 impl EventState {
     fn meta(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut m = serde_json::json!({
             "frames": self.frames,
             "motion_frames": self.motion_frames,
             "peak": self.peak,
             "detections": self.objects.detections,
             "objects": self.objects.list(),
-        })
+        });
+        if let Some(c) = &self.peak_cells {
+            m["peak_cells"] = c.to_json();
+        }
+        m
     }
 
     /// Merge a detection result into the event it was taken for. A result
@@ -720,6 +790,7 @@ impl EventState {
                     self.start_dts = dts;
                     self.peak = score;
                     self.peak_dts = dts;
+                    self.peak_cells = self.frame_cells.take();
                     self.last_motion_dts = dts;
                     self.last_db_update = dts;
                     self.motion_frames = 1;
@@ -744,6 +815,7 @@ impl EventState {
                     if score > self.peak {
                         self.peak = score;
                         self.peak_dts = dts;
+                        self.peak_cells = self.frame_cells.take();
                     }
                     if dts - self.last_db_update > ts * 2 {
                         ctx.db.update_event_progress(id, self.peak, self.peak_dts)?;
@@ -782,14 +854,14 @@ pub async fn thumbnail_task(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_
 }
 
 /// Second opinion on a closed event from its full-resolution thumbnail
-/// (see [`crate::objects::classify_event`]); announces a changed kind.
+/// (see [`crate::objects::classify_event`]); announces changed objects.
 pub async fn classify_task(det: &crate::objects::ObjectDetector, db: &Db, bus: &crate::notify::Bus, cam: &Camera, event_id: i64, jpeg: Vec<u8>) {
-    match crate::objects::classify_event(det, db, cam, event_id, jpeg).await {
-        Ok(Some(kind)) => {
-            info!(camera = cam.id, event = event_id, %kind, "objects (thumbnail)");
+    match crate::objects::classify_event(det, db, cam, event_id, jpeg, &[]).await {
+        Ok(true) => {
+            info!(camera = cam.id, event = event_id, "objects updated from the thumbnail");
             bus.publish_event(db, event_id, crate::notify::Notification::EventUpdate);
         }
-        Ok(None) => {}
+        Ok(false) => {}
         Err(e) => warn!(camera = cam.id, event = event_id, "classifying thumbnail: {e:#}"),
     }
 }
@@ -877,6 +949,25 @@ mod tests {
         let mut det2 = MotionDetector::new(w, h, 25, 0.5, 0.2, &[], &[]);
         for _ in 0..12 { det2.feed(&base); }
         assert_eq!(det2.feed(&f), 0);
+    }
+
+    #[test]
+    fn motion_cells_mark_what_moved_and_round_trip() {
+        let (w, h) = (160usize, 90usize);
+        let mut det = MotionDetector::new(w, h, 25, 0.5, 0.2, &[], &[]);
+        let base = vec![100u8; w * h];
+        for _ in 0..12 { det.feed(&base); }
+        let mut f = base.clone();
+        for y in 20..50 { for x in 40..70 { f[y * w + x] = 250; } } // x 0.25..0.44, y 0.22..0.56
+        assert!(det.feed(&f) > 0);
+        let c = det.cells();
+        assert_eq!((c.bw, c.bh), (20, 12));
+        assert!(c.overlaps([0.3, 0.3, 0.4, 0.5], 0), "the moving block");
+        assert!(!c.overlaps([0.7, 0.1, 0.95, 0.4], 1), "a parked bus elsewhere");
+        assert!(c.overlaps([0.47, 0.3, 0.6, 0.5], 1), "next to it, within the margin");
+        let back = MotionCells::from_json(&c.to_json()).unwrap();
+        assert_eq!(back, c);
+        assert!(MotionCells::from_json(&serde_json::json!({"w": 1})).is_none());
     }
 
     #[test]

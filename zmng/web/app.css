@@ -191,3 +191,30 @@ button.pending::after { content: " •"; }
 @media (display-mode: standalone) {
   #top { padding-top: calc(10px + env(safe-area-inset-top, 0px)); }
 }
+
+/* tile grids sized to the window (fitGrid sets the columns) */
+.grid.fit { justify-content: center; }
+/* scrubbing: the moment under the dragged cursor, over the player */
+.scrubimg { position: absolute; inset: 0; width: 100% !important; height: 100% !important; object-fit: contain; background: #000; pointer-events: none; }
+/* per-camera speed in Review (shown on hover; always on touch screens) */
+.tile .tilespeed { position: absolute; right: 6px; bottom: 8px; width: auto; padding: 2px 4px; font-size: 11px; background: rgba(0,0,0,.65); border-color: transparent; opacity: 0; transition: opacity .15s; min-height: 0; }
+.tile:hover .tilespeed, .tile.unsynced .tilespeed, .tile .tilespeed:focus { opacity: 1; }
+@media (hover: none) { .tile .tilespeed { opacity: .85; } }
+.tile.unsynced { outline: 2px dashed var(--accent2); outline-offset: -2px; }
+/* saved views */
+.chip.view { gap: 2px; }
+button.linkish { background: none; border: 0; color: var(--text); padding: 0; font-weight: 600; font-size: 12px; cursor: pointer; min-height: 0; }
+button.linkish.x { color: var(--muted); margin-left: 4px; font-weight: 400; }
+button.linkish.x:hover { color: var(--motion); }
+.modal h3 { font-size: 14px; margin: 14px 0 6px; }
+.filters .filters-head { margin: 0; }
+.filters .filters-body:not([hidden]) { margin-top: 8px; }
+/* phones: the nav scrolls sideways instead of pushing "Sign out" off screen */
+@media (max-width: 640px) {
+  #top nav { overflow-x: auto; min-width: 0; flex: 1 1 auto; scrollbar-width: none; }
+  #top nav a { padding: 6px 8px; white-space: nowrap; }
+  #top .spacer { display: none; }
+  #logout { padding: 4px 8px; font-size: 12px; white-space: nowrap; min-height: 32px; }
+}
+#logout { white-space: nowrap; }
+@media (max-width: 900px) { #clock { display: none; } }

@@ -282,16 +282,34 @@ async fn events_are_classified_from_their_thumbnail() {
     let ev = fx.db.insert_event(cam_id, 1_000, "motion").unwrap();
     fx.db.close_event(ev, 2_000, None, r#"{"frames":10}"#).unwrap();
     let det = ObjectDetector::new(cfg(port)).unwrap();
-    let kind = zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg.clone()).await.unwrap();
-    assert_eq!(kind.as_deref(), Some("person"), "person outranks car in the default label order");
+    assert!(zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg.clone(), &[]).await.unwrap());
     let e = fx.db.event(ev).unwrap().unwrap();
+    assert_eq!(e.kind, "person", "person outranks car in the default label order");
     let meta: Value = serde_json::from_str(&e.meta_json).unwrap();
     assert_eq!(meta["frames"], 10, "other metadata is kept");
     assert_eq!(meta["classified"], true);
     assert_eq!(meta["objects"].as_array().unwrap().len(), 2);
     // the same answer again changes nothing
-    assert_eq!(zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg).await.unwrap(), None);
+    assert!(!zmng::objects::classify_event(&det, &fx.db, &cam, ev, jpeg.clone(), &[]).await.unwrap());
     assert_eq!(*calls.lock().unwrap(), 2);
+
+    // an event that knows where it moved: only the person (left) moved, the car (right) is parked
+    let moved = fx.db.insert_event(cam_id, 5_000, "motion").unwrap();
+    let mut bits = vec![false; 80 * 45];
+    for y in 10..40 { for x in 15..25 { bits[y * 80 + x] = true; } } // x 0.19..0.31 of a 640 px frame
+    let cells = zmng::detect::MotionCells { w: 640, h: 360, bw: 80, bh: 45, bits };
+    fx.db.close_event(moved, 6_000, None, &json!({"motion_frames": 20, "peak_cells": cells.to_json()}).to_string()).unwrap();
+    assert!(zmng::objects::classify_event(&det, &fx.db, &cam, moved, jpeg.clone(), &[]).await.unwrap());
+    let labels: Vec<String> = zmng::notify::objects_from_meta(&fx.db.event(moved).unwrap().unwrap()).into_iter().map(|o| o.label).collect();
+    assert_eq!(labels, vec!["person"], "the parked car did not move");
+    // an old event without cells: a background box (seen in many events) is dropped
+    let old = fx.db.insert_event(cam_id, 7_000, "car").unwrap();
+    fx.db.close_event(old, 8_000, None, &json!({"objects": [{"label": "car", "confidence": 0.8, "bbox": [0.47, 0.42, 0.94, 0.94]}]}).to_string()).unwrap();
+    let statics = vec![(cam_id, "car".to_string(), [0.47, 0.42, 0.94, 0.94])];
+    assert!(zmng::objects::classify_event(&det, &fx.db, &cam, old, jpeg.clone(), &statics).await.unwrap());
+    let e = fx.db.event(old).unwrap().unwrap();
+    assert_eq!(e.kind, "person");
+    assert!(zmng::notify::objects_from_meta(&e).iter().all(|o| o.label != "car"));
     assert!(det.failing(i64::MAX / 2, i64::MAX).is_none());
 
     let admin = fx.add_admin("admin", "password123");
@@ -299,12 +317,29 @@ async fn events_are_classified_from_their_thumbnail() {
     let r = fx.router();
     // kind "person", but the car inside it counts for a vehicles search
     assert_eq!(get(&r, "/api/events?kind=car,truck,bus", &tok).await.json().as_array().unwrap().len(), 1);
-    assert_eq!(get(&r, "/api/events?kind=person", &tok).await.json().as_array().unwrap().len(), 1);
+    assert_eq!(get(&r, "/api/events?kind=person", &tok).await.json().as_array().unwrap().len(), 3);
+    // seconds of motion: 20 frames at the default 5 fps = 4 s; events without the counter always pass
+    let all = get(&r, "/api/events", &tok).await.json();
+    assert!(all.as_array().unwrap().iter().any(|e| e["motion_secs"] == 4.0));
+    let long = get(&r, "/api/events?min_motion=3", &tok).await.json();
+    let short_hidden = get(&r, "/api/events?min_motion=5", &tok).await.json();
+    assert_eq!(long.as_array().unwrap().len(), short_hidden.as_array().unwrap().len() + 1);
     assert!(get(&r, "/api/events?kind=dog,cat", &tok).await.json().as_array().unwrap().is_empty());
-    // a malformed meta_json must not break the filter for everyone else
+    // a malformed meta_json must not break the filters for everyone else
     let bad = fx.db.insert_event(cam_id, 3_000, "motion").unwrap();
     fx.db.close_event(bad, 4_000, None, "not json").unwrap();
     assert_eq!(get(&r, "/api/events?kind=car", &tok).await.json().as_array().unwrap().len(), 1);
+    assert!(get(&r, "/api/events?min_motion=1", &tok).await.status.is_success());
+    // background boxes: the same parked bus in five events, people never
+    let evs: Vec<zmng::db::Event> = (0..5).map(|i| {
+        let id = fx.db.insert_event(cam_id, 10_000 + i, "bus").unwrap();
+        fx.db.close_event(id, 10_500 + i, None, &json!({"objects": [{"label": "bus", "confidence": 0.9, "bbox": [0.78, 0.33, 0.98 - i as f64 * 0.002, 0.46]}, {"label": "person", "confidence": 0.9, "bbox": [0.2, 0.3, 0.3, 0.8]}]}).to_string()).unwrap();
+        fx.db.event(id).unwrap().unwrap()
+    }).collect();
+    let st = zmng::objects::static_boxes(&evs, 5);
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].1, "bus");
+    assert!(zmng::objects::static_boxes(&evs[..4], 5).is_empty());
 
     // the re-classification endpoint needs a configured detector
     let res = call(&r, "POST", "/api/events/classify", Some(&tok), Some(json!({"days": 1}))).await;

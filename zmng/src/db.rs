@@ -146,6 +146,13 @@ CREATE TABLE IF NOT EXISTS user_camera (
   camera_id INTEGER NOT NULL REFERENCES camera(id) ON DELETE CASCADE,
   PRIMARY KEY (user_id, camera_id)
 );
+-- viewers also see every camera tagged with one of their groups (camera.tags);
+-- a camera added to a group is shared at once, like ZoneMinder's group permissions
+CREATE TABLE IF NOT EXISTS user_group (
+  user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+  name    TEXT NOT NULL COLLATE NOCASE,
+  PRIMARY KEY (user_id, name)
+);
 CREATE TABLE IF NOT EXISTS push_token (
   id           INTEGER PRIMARY KEY,
   user_id      INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -289,6 +296,21 @@ fn migrate(c: &Connection) -> Result<()> {
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// Filters for [`Db::events_q`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventQuery<'a> {
+    pub cameras: Option<&'a [i64]>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub min_score: u8,
+    pub archived_only: bool,
+    pub before_id: Option<i64>,
+    pub limit: usize,
+    pub ascending: bool,
+    pub kinds: Option<&'a [String]>,
+    pub min_motion_secs: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1115,8 +1137,24 @@ impl Db {
         ascending: bool,
         kinds: Option<&[String]>,
     ) -> Result<Vec<Event>> {
+        self.events_q(&EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs: None })
+    }
+
+    /// [`events`](Self::events) with every filter, including the minimum
+    /// seconds of actual motion (`motion_frames` at the camera's detect fps;
+    /// pre/post-roll and quiet time do not count). Events without that
+    /// counter (imported from ZoneMinder) always pass.
+    pub fn events_q(&self, q: &EventQuery) -> Result<Vec<Event>> {
+        let EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs } = *q;
         let mut sql = String::from("SELECT * FROM event WHERE end_dts IS NOT NULL AND score>=?1");
         let mut args: Vec<rusqlite::types::Value> = vec![(min_score as i64).into()];
+        if let Some(m) = min_motion_secs.filter(|m| *m > 0.0) {
+            args.push(m.into());
+            sql.push_str(&format!(
+                " AND COALESCE(json_extract(CASE WHEN json_valid(event.meta_json) THEN event.meta_json END, '$.motion_frames'), 1e9) >= ?{} * (SELECT detect_fps FROM camera WHERE camera.id = event.camera_id)",
+                args.len()
+            ));
+        }
         if let Some(ks) = kinds {
             if ks.is_empty() {
                 return Ok(Vec::new());
@@ -1351,6 +1389,110 @@ impl Db {
                 c.execute("INSERT OR IGNORE INTO user_camera(user_id,camera_id) VALUES(?1,?2)", params![user_id, cam])?;
             }
             Ok(())
+        })
+    }
+
+    pub fn set_user_groups(&self, user_id: i64, groups: &[String]) -> Result<()> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute("DELETE FROM user_group WHERE user_id=?1", params![user_id])?;
+            for g in groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+                tx.execute("INSERT OR IGNORE INTO user_group(user_id,name) VALUES(?1,?2)", params![user_id, g])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn user_groups(&self, user_id: i64) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT name FROM user_group WHERE user_id=?1 ORDER BY name")?;
+            let rows = st.query_map(params![user_id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Cameras a viewer may see: assigned one by one, or through a group.
+    pub fn viewer_cameras(&self, user_id: i64) -> Result<Vec<i64>> {
+        let mut ids = self.user_cameras(user_id)?;
+        let groups: Vec<String> = self.user_groups(user_id)?.into_iter().map(|g| g.to_lowercase()).collect();
+        if !groups.is_empty() {
+            for cam in self.cameras()? {
+                if !ids.contains(&cam.id) && cam.tags.split(',').any(|t| groups.contains(&t.trim().to_lowercase())) {
+                    ids.push(cam.id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn set_username(&self, user_id: i64, username: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE user SET username=?1 WHERE id=?2", params![username, user_id]).map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => anyhow::anyhow!("username already taken"),
+                e => e.into(),
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_password_hash(&self, user_id: i64, hash: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE user SET pass_hash=?1 WHERE id=?2", params![hash, user_id])?;
+            Ok(())
+        })
+    }
+
+    pub fn set_role(&self, user_id: i64, role: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE user SET role=?1 WHERE id=?2", params![role, user_id])?;
+            Ok(())
+        })
+    }
+
+    pub fn admin_count(&self) -> Result<i64> {
+        self.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM user WHERE role='admin'", [], |r| r.get(0))?))
+    }
+
+    /// Rename a camera group everywhere at once: every camera's tags and every
+    /// user's group grants (a rename must not silently revoke access).
+    /// `to = None` removes the group. Returns the cameras changed.
+    pub fn rename_group(&self, from: &str, to: Option<&str>) -> Result<usize> {
+        let from_l = from.trim().to_lowercase();
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let rows: Vec<(i64, String)> = {
+                let mut st = tx.prepare("SELECT id, tags FROM camera")?;
+                let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                r.collect::<std::result::Result<_, _>>()?
+            };
+            let mut n = 0;
+            for (id, tags) in rows {
+                let list: Vec<String> = tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+                if !list.iter().any(|t| t.to_lowercase() == from_l) {
+                    continue;
+                }
+                let mut out: Vec<String> = Vec::new();
+                for t in list {
+                    let t = if t.to_lowercase() == from_l { match to { Some(x) => x.trim().to_string(), None => continue } } else { t };
+                    if !out.iter().any(|o| o.eq_ignore_ascii_case(&t)) {
+                        out.push(t);
+                    }
+                }
+                tx.execute("UPDATE camera SET tags=?1 WHERE id=?2", params![out.join(", "), id])?;
+                n += 1;
+            }
+            match to {
+                Some(t) => {
+                    tx.execute("INSERT OR IGNORE INTO user_group(user_id,name) SELECT user_id, ?2 FROM user_group WHERE name=?1", params![from.trim(), t.trim()])?;
+                    tx.execute("DELETE FROM user_group WHERE name=?1 AND name<>?2", params![from.trim(), t.trim()])?;
+                }
+                None => {
+                    tx.execute("DELETE FROM user_group WHERE name=?1", params![from.trim()])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
         })
     }
 

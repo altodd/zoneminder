@@ -417,3 +417,63 @@ async fn login_locks_after_ten_failures() {
     assert_eq!(call(&r, "POST", "/api/login", None, Some(json!({"username": "admin", "password": "password123"}))).await.status, 429);
     assert_eq!(get(&r, "/api/me", &w.admin_tok).await.status, 200);
 }
+
+/// Group permissions: a viewer granted a group sees every camera tagged with
+/// it (and gains a camera as soon as it is tagged); renaming a group keeps the
+/// grant; removing it revokes it. Users can be renamed, re-passworded and
+/// re-roled, but the last admin cannot be demoted.
+#[tokio::test]
+async fn group_permissions_and_user_editing() {
+    let w = world();
+    let r = w.fx.router();
+    let a = &w.admin_tok;
+    let uid = call(&r, "POST", "/api/users", Some(a), Some(json!({"username": "cba.guest", "password": "password123", "groups": ["CBA"]}))).await.json()["id"].as_i64().unwrap();
+    let vt = w.fx.token_for(uid);
+    // nothing tagged CBA yet: fails closed
+    assert!(get(&r, "/api/cameras", &vt).await.json().as_array().unwrap().is_empty());
+    assert_eq!(call(&r, "PATCH", &format!("/api/cameras/{}", w.cam2), Some(a), Some(json!({"tags": "Outside, cba"}))).await.status, 200);
+    let cams = get(&r, "/api/cameras", &vt).await.json();
+    assert_eq!(cams.as_array().unwrap().len(), 1, "group names match case-insensitively");
+    assert_eq!(cams[0]["id"], w.cam2);
+    assert_eq!(cams[0]["main_url"], "", "still a viewer: no RTSP URLs");
+    assert_eq!(get(&r, &format!("/api/cameras/{}/timeline?start={}&end={}", w.cam, ms(T0), ms(T0 + 10)), &vt).await.status, 404);
+    let users = get(&r, "/api/users", a).await.json();
+    let u = users.as_array().unwrap().iter().find(|u| u["id"] == uid).unwrap();
+    assert_eq!(u["groups"], json!(["CBA"]));
+    assert_eq!(u["visible"], json!([w.cam2]));
+    // zmNinjaNg sees the group with only the monitors this user may see
+    let g = get(&r, "/zm/api/groups.json", &vt).await.json();
+    let names: Vec<&str> = g["groups"].as_array().unwrap().iter().map(|x| x["Group"]["Name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["cba", "Outside"]);
+    assert_eq!(g["groups"][0]["Monitor"][0]["Id"], w.cam2.to_string());
+    assert_eq!(get(&r, "/zm/api/users.json", &vt).await.json()["users"][0]["User"]["Groups"], "View");
+    // rename the group: the grant follows
+    let res = call(&r, "POST", "/api/groups/rename", Some(a), Some(json!({"from": "CBA", "to": "Charleston Bilingual"}))).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    assert_eq!(res.json()["cameras"], 1);
+    assert_eq!(get(&r, &format!("/api/cameras/{}", w.cam2), a).await.json()["tags"], "Outside, Charleston Bilingual");
+    assert_eq!(get(&r, "/api/cameras", &vt).await.json().as_array().unwrap().len(), 1);
+    assert_eq!(call(&r, "POST", "/api/groups/rename", Some(a), Some(json!({"from": "Outside", "to": "a,b"}))).await.status, 400);
+    assert_eq!(call(&r, "POST", "/api/groups/rename", Some(&vt), Some(json!({"from": "Outside", "to": "x"}))).await.status, 403);
+    // remove it: access is gone, the camera's other group stays
+    assert_eq!(call(&r, "POST", "/api/groups/rename", Some(a), Some(json!({"from": "charleston bilingual"}))).await.status, 200);
+    assert_eq!(get(&r, &format!("/api/cameras/{}", w.cam2), a).await.json()["tags"], "Outside");
+    assert!(get(&r, "/api/cameras", &vt).await.json().as_array().unwrap().is_empty());
+
+    // edit users: rename (sign-ins and tokens survive), password, role
+    let me = get(&r, "/api/me", a).await.json()["user"]["id"].as_i64().unwrap();
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{me}"), Some(a), Some(json!({"username": "bad name"}))).await.status, 400);
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{me}"), Some(a), Some(json!({"username": "cba.guest"}))).await.status, 400, "taken");
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{me}"), Some(a), Some(json!({"username": "atodd"}))).await.status, 200);
+    assert_eq!(get(&r, "/api/me", a).await.json()["user"]["username"], "atodd");
+    assert_eq!(call(&r, "POST", "/api/login", None, Some(json!({"username": "atodd", "password": "password123"}))).await.status, 200);
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{uid}"), Some(a), Some(json!({"password": "short"}))).await.status, 400);
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{uid}"), Some(a), Some(json!({"password": "a-new-password"}))).await.status, 200);
+    assert_eq!(call(&r, "POST", "/api/login", None, Some(json!({"username": "cba.guest", "password": "a-new-password"}))).await.status, 200);
+    // the last admin cannot be demoted, and nobody demotes themselves
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{me}"), Some(a), Some(json!({"role": "viewer"}))).await.status, 400);
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{uid}"), Some(a), Some(json!({"role": "admin"}))).await.status, 200);
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{me}"), Some(a), Some(json!({"role": "viewer"}))).await.status, 400, "not your own role");
+    assert_eq!(call(&r, "PATCH", &format!("/api/users/{uid}"), Some(a), Some(json!({"role": "viewer"}))).await.status, 200, "another admin can be demoted");
+    assert_eq!(call(&r, "PATCH", "/api/users/999999", Some(a), Some(json!({"role": "viewer"}))).await.status, 404);
+}

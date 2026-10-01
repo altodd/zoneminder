@@ -258,34 +258,81 @@ pub fn jpeg_size(jpeg: &[u8]) -> Result<(u32, u32)> {
     Ok(r.into_dimensions()?)
 }
 
+/// Intersection over union of two normalized boxes.
+pub fn iou(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let inter = iw * ih;
+    let area = |x: [f64; 4]| (x[2] - x[0]).max(0.0) * (x[3] - x[1]).max(0.0);
+    let u = area(a) + area(b) - inter;
+    if u <= 0.0 { 0.0 } else { inter / u }
+}
+
+/// Boxes that are background: the same non-person label in (nearly) the
+/// same place in at least `min_events` different events of one camera (a
+/// parked bus, a car in its usual spot). Used for events recorded before
+/// motion cells were kept; newer events are filtered by what moved instead.
+pub fn static_boxes(events: &[crate::db::Event], min_events: usize) -> Vec<(i64, String, [f64; 4])> {
+    let mut seen: Vec<(i64, String, [f64; 4], std::collections::HashSet<i64>)> = Vec::new();
+    for e in events {
+        for o in crate::notify::objects_from_meta(e).into_iter().filter(|o| o.label != "person") {
+            match seen.iter_mut().find(|(c, l, b, _)| *c == e.camera_id && *l == o.label && iou(*b, o.bbox) >= 0.6) {
+                Some(s) => {
+                    s.3.insert(e.id);
+                }
+                None => seen.push((e.camera_id, o.label.clone(), o.bbox, [e.id].into_iter().collect())),
+            }
+        }
+    }
+    seen.into_iter().filter(|s| s.3.len() >= min_events).map(|(c, l, b, _)| (c, l, b)).collect()
+}
+
+fn is_static(o: &DetectedObject, cam: i64, statics: &[(i64, String, [f64; 4])]) -> bool {
+    statics.iter().any(|(c, l, b)| *c == cam && *l == o.label && iou(*b, o.bbox) >= 0.6)
+}
+
 /// Run the detector on a finished event's picture (its thumbnail: the
 /// main-stream keyframe at the motion peak, 640 px wide, so small or distant
-/// objects the 320 px motion frames miss are still found) and merge what it
-/// finds into the event: the best box per label is kept, the kind becomes
-/// the highest-priority label. Returns the new kind when it changed.
-pub async fn classify_event(det: &ObjectDetector, db: &crate::db::Db, cam: &crate::db::Camera, event_id: i64, jpeg: Vec<u8>) -> Result<Option<String>> {
+/// objects the 320 px motion frames miss are still found) and rebuild the
+/// event's objects: what the live pass saw plus what the picture shows,
+/// keeping only objects where something moved at the peak (`peak_cells` in
+/// the event) — or, for older events without cells, dropping the `statics`
+/// (background boxes, see [`static_boxes`]). The kind becomes the
+/// highest-priority label left. Returns whether the objects or kind changed.
+pub async fn classify_event(det: &ObjectDetector, db: &crate::db::Db, cam: &crate::db::Camera, event_id: i64, jpeg: Vec<u8>, statics: &[(i64, String, [f64; 4])]) -> Result<bool> {
     let (w, h) = jpeg_size(&jpeg)?;
     let found = det.detect_patiently(jpeg, w, h).await?;
     let labels = camera_labels(&det.cfg, cam);
     let found = filter(found, &labels, det.cfg.min_confidence, &crate::detect::parse_polys(&cam.zones_json), &crate::detect::parse_polys(&cam.masks_json));
-    let Some(e) = db.event(event_id)? else { return Ok(None) };
-    let mut objs = EventObjects::default();
-    objs.merge(&crate::notify::objects_from_meta(&e));
-    let changed = objs.merge(&found);
+    let Some(e) = db.event(event_id)? else { return Ok(false) };
     let mut meta: serde_json::Value = serde_json::from_str(&e.meta_json).unwrap_or_else(|_| serde_json::json!({}));
     if !meta.is_object() {
         meta = serde_json::json!({});
     }
-    meta["classified"] = serde_json::json!(true);
-    if !changed {
-        db.update_event_objects(event_id, &e.kind, &meta.to_string())?;
-        return Ok(None);
-    }
+    let cells = meta.get("peak_cells").and_then(crate::detect::MotionCells::from_json).filter(|c| c.any());
+    let before = crate::notify::objects_from_meta(&e);
+    // live-pass objects were already checked against the cells of their own frame
+    let kept: Vec<DetectedObject> = before.iter().filter(|o| cells.is_some() || !is_static(o, cam.id, statics)).cloned().collect();
+    let found: Vec<DetectedObject> = found
+        .into_iter()
+        .filter(|o| match &cells {
+            Some(c) => c.overlaps(o.bbox, 2),
+            None => !is_static(o, cam.id, statics),
+        })
+        .collect();
+    let mut objs = EventObjects::default();
+    objs.merge(&kept);
+    objs.merge(&found);
+    let list = objs.list();
     let kind = objs.kind(&labels);
-    meta["objects"] = serde_json::to_value(objs.list())?;
+    let changed = kind != e.kind || list.len() != before.len() || list.iter().any(|o| !before.iter().any(|b| b.label == o.label && (b.confidence - o.confidence).abs() < 1e-9));
+    meta["classified"] = serde_json::json!(true);
+    meta["objects"] = serde_json::to_value(&list)?;
     db.update_event_objects(event_id, &kind, &meta.to_string())?;
-    debug!(event = event_id, %kind, "event classified from its thumbnail");
-    Ok((kind != e.kind).then_some(kind))
+    if changed {
+        debug!(event = event_id, %kind, "event objects rebuilt from its thumbnail");
+    }
+    Ok(changed)
 }
 
 /// Per-camera gate: decides when to send a frame and carries results back
@@ -298,9 +345,12 @@ pub struct ObjectGate {
     interval: i64,
     last_sent: i64,
     in_flight: bool,
-    tx: tokio::sync::mpsc::UnboundedSender<(i64, Option<i64>, Result<Vec<DetectedObject>>)>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<(i64, Option<i64>, Result<Vec<DetectedObject>>)>,
+    tx: tokio::sync::mpsc::UnboundedSender<GateResult>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<GateResult>,
 }
+
+/// (frame dts, event it was sent for, what moved in it, detector answer)
+type GateResult = (i64, Option<i64>, crate::detect::MotionCells, Result<Vec<DetectedObject>>);
 
 impl ObjectGate {
     pub fn new(det: Arc<ObjectDetector>, cam: &crate::db::Camera) -> ObjectGate {
@@ -327,10 +377,11 @@ impl ObjectGate {
         self.in_flight
     }
 
-    /// Called with every motion-positive frame (yuv420p at `w`x`h`); sends a
-    /// detection when the interval allows and none is in flight. `event_id`
-    /// is the event open at send time so the result can be attributed.
-    pub fn maybe_send(&mut self, dts: i64, yuv: &[u8], w: usize, h: usize, event_id: Option<i64>) -> bool {
+    /// Called with every motion-positive frame (yuv420p at `w`x`h`) and the
+    /// cells that changed in it; sends a detection when the interval allows
+    /// and none is in flight. `event_id` is the event open at send time so
+    /// the result can be attributed; only objects overlapping `cells` count.
+    pub fn maybe_send(&mut self, dts: i64, yuv: &[u8], w: usize, h: usize, event_id: Option<i64>, cells: crate::detect::MotionCells) -> bool {
         if self.in_flight || dts - self.last_sent < self.interval {
             return false;
         }
@@ -342,7 +393,7 @@ impl ObjectGate {
         let (w, h) = (w as u32, h as u32);
         tokio::spawn(async move {
             let r = det.detect(jpeg, w, h).await;
-            let _ = tx.send((dts, event_id, r));
+            let _ = tx.send((dts, event_id, cells, r));
         });
         true
     }
@@ -351,10 +402,13 @@ impl ObjectGate {
     /// (frame dts, event the frame was sent for, objects).
     pub fn poll(&mut self) -> Vec<(i64, Option<i64>, Vec<DetectedObject>)> {
         let mut out = Vec::new();
-        while let Ok((dts, sent_for, r)) = self.rx.try_recv() {
+        while let Ok((dts, sent_for, cells, r)) = self.rx.try_recv() {
             self.in_flight = false;
             match r {
-                Ok(objs) => out.push((dts, sent_for, filter(objs, &self.labels, self.det.cfg.min_confidence, &self.zones, &self.masks))),
+                Ok(objs) => {
+                    let moving = filter(objs, &self.labels, self.det.cfg.min_confidence, &self.zones, &self.masks).into_iter().filter(|o| !cells.any() || cells.overlaps(o.bbox, 1)).collect();
+                    out.push((dts, sent_for, moving))
+                }
                 Err(e) => warn!("object detection: {e:#}"),
             }
         }

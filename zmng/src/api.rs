@@ -261,7 +261,8 @@ fn visible_cameras(app: &App, u: &User) -> Vec<i64> {
     if u.role == "admin" {
         app.db.cameras().map(|cs| cs.iter().map(|c| c.id).collect()).unwrap_or_default()
     } else {
-        app.db.user_cameras(u.id).unwrap_or_default()
+        // cameras assigned one by one plus every camera in the user's groups (fails closed)
+        app.db.viewer_cameras(u.id).unwrap_or_default()
     }
 }
 
@@ -505,11 +506,23 @@ struct EventOut {
     archived: bool,
     notes: Option<String>,
     objects: Vec<crate::notify::DetectedObject>,
+    /// seconds of actual motion (not counting pre/post-roll); None for imported events
+    motion_secs: Option<f64>,
 }
 
-fn event_out(e: crate::db::Event) -> EventOut {
+/// Detect fps per camera, to turn an event's motion frame count into seconds.
+fn fps_map(app: &App) -> std::collections::HashMap<i64, f64> {
+    app.db.cameras().map(|cs| cs.into_iter().map(|c| (c.id, c.detect_fps)).collect()).unwrap_or_default()
+}
+
+fn event_out(e: crate::db::Event, fps: &std::collections::HashMap<i64, f64>) -> EventOut {
     let objects = crate::notify::objects_from_meta(&e);
+    let motion_secs = serde_json::from_str::<serde_json::Value>(&e.meta_json)
+        .ok()
+        .and_then(|m| m.get("motion_frames").and_then(|f| f.as_f64()))
+        .and_then(|f| fps.get(&e.camera_id).filter(|r| **r > 0.0).map(|r| (f / r * 10.0).round() / 10.0));
     EventOut {
+        motion_secs,
         objects,
         id: e.id,
         camera_id: e.camera_id,
@@ -563,7 +576,8 @@ async fn timeline(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<R
             }
         }
     }
-    let events = app.db.events_in_range(id, s, e).map_err(err500)?.into_iter().map(event_out).collect();
+    let fps = fps_map(&app);
+    let events = app.db.events_in_range(id, s, e).map_err(err500)?.into_iter().map(|e| event_out(e, &fps)).collect();
     Ok(Json(TimelineOut { coverage, bucket_ms, motion, events }).into_response())
 }
 
@@ -579,6 +593,8 @@ struct EventsQ {
     order: Option<String>,
     /// comma separated event kinds (motion, person, car, ...)
     kind: Option<String>,
+    /// minimum seconds of actual motion (hides blips)
+    min_motion: Option<f64>,
 }
 
 async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -591,19 +607,21 @@ async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<a
     let kinds: Option<Vec<String>> = q.kind.as_ref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
     let list = app
         .db
-        .events(
-            Some(&cams),
-            q.start.map(video::ms_to_dts),
-            q.end.map(video::ms_to_dts),
-            q.min_score.unwrap_or(0),
-            q.archived.unwrap_or(false),
-            q.before,
-            q.limit.unwrap_or(50).min(500),
-            q.order.as_deref() == Some("asc"),
-            kinds.as_deref(),
-        )
+        .events_q(&crate::db::EventQuery {
+            cameras: Some(&cams),
+            start: q.start.map(video::ms_to_dts),
+            end: q.end.map(video::ms_to_dts),
+            min_score: q.min_score.unwrap_or(0),
+            archived_only: q.archived.unwrap_or(false),
+            before_id: q.before,
+            limit: q.limit.unwrap_or(50).min(500),
+            ascending: q.order.as_deref() == Some("asc"),
+            kinds: kinds.as_deref(),
+            min_motion_secs: q.min_motion,
+        })
         .map_err(err500)?;
-    let out: Vec<EventOut> = list.into_iter().map(event_out).collect();
+    let fps = fps_map(&app);
+    let out: Vec<EventOut> = list.into_iter().map(|e| event_out(e, &fps)).collect();
     Ok(Json(out).into_response())
 }
 
@@ -611,7 +629,7 @@ async fn event_get(State(app): State<App>, Path(id): Path<i64>, user: Option<axu
     let u = require(user.as_ref().map(|e| &e.0))?;
     let e = app.db.event(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such event").into_response())?;
     can_see(&app, u, e.camera_id)?;
-    Ok(Json(event_out(e)).into_response())
+    Ok(Json(event_out(e, &fps_map(&app))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -656,13 +674,10 @@ async fn events_classify(State(app): State<App>, user: Option<axum::Extension<Au
     let cams: std::collections::HashMap<i64, crate::db::Camera> =
         app.db.cameras().map_err(err500)?.into_iter().filter(|c| c.objects && q.camera.is_none_or(|id| id == c.id)).map(|c| (c.id, c)).collect();
     let ids: Vec<i64> = cams.keys().copied().collect();
-    let events: Vec<crate::db::Event> = app
-        .db
-        .events(Some(&ids), Some(since), None, 0, false, None, 5000, false, None)
-        .map_err(err500)?
-        .into_iter()
-        .filter(|e| e.thumb_path.is_some() && (q.again || !e.meta_json.contains("\"classified\"")))
-        .collect();
+    let all = app.db.events(Some(&ids), Some(since), None, 0, false, None, 5000, false, None).map_err(err500)?;
+    // background boxes (parked vehicles) for events that predate motion cells
+    let statics = crate::objects::static_boxes(&all, 5);
+    let events: Vec<crate::db::Event> = all.into_iter().filter(|e| e.thumb_path.is_some() && (q.again || !e.meta_json.contains("\"classified\""))).collect();
     if app.classify_running.swap(true, Ordering::SeqCst) {
         return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "a classification pass is already running"}))).into_response());
     }
@@ -673,19 +688,19 @@ async fn events_classify(State(app): State<App>, user: Option<axum::Extension<Au
         for e in events {
             let Some(cam) = cams.get(&e.camera_id) else { continue };
             let Ok(jpeg) = tokio::fs::read(app2.cfg.thumb_dir.join(e.thumb_path.as_deref().unwrap_or_default())).await else { continue };
-            match crate::objects::classify_event(&det, &app2.db, cam, e.id, jpeg).await {
-                Ok(Some(_)) => {
+            match crate::objects::classify_event(&det, &app2.db, cam, e.id, jpeg, &statics).await {
+                Ok(true) => {
                     changed += 1;
                     app2.bus.publish_event(&app2.db, e.id, crate::notify::Notification::EventUpdate);
                 }
-                Ok(None) => {}
+                Ok(false) => {}
                 Err(err) => {
                     failed += 1;
                     tracing::warn!(event = e.id, "classify: {err:#}");
                 }
             }
         }
-        info!(queued, changed, failed, "event classification pass done");
+        info!(queued, changed, failed, background_boxes = statics.len(), "event classification pass done");
         app2.classify_running.store(false, Ordering::SeqCst);
     });
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"queued": queued}))).into_response())
@@ -1153,7 +1168,7 @@ async fn users(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
     let list = app.db.users().map_err(err500)?;
     let out: Vec<serde_json::Value> = list
         .into_iter()
-        .map(|u| serde_json::json!({"id": u.id, "username": u.username, "role": u.role, "cameras": app.db.user_cameras(u.id).unwrap_or_default()}))
+        .map(|u| serde_json::json!({"id": u.id, "username": u.username, "role": u.role, "cameras": app.db.user_cameras(u.id).unwrap_or_default(), "groups": app.db.user_groups(u.id).unwrap_or_default(), "visible": if u.role == "admin" { Vec::new() } else { app.db.viewer_cameras(u.id).unwrap_or_default() }}))
         .collect();
     Ok(Json(out).into_response())
 }
@@ -1164,6 +1179,16 @@ struct UserCreate {
     password: String,
     role: Option<String>,
     cameras: Option<Vec<i64>>,
+    groups: Option<Vec<String>>,
+}
+
+/// Usernames: what ZoneMinder clients accept (letters, digits, . _ @ -).
+fn valid_username(name: &str) -> Result<&str, Response> {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 64 || !n.chars().all(|c| c.is_ascii_alphanumeric() || "._@-".contains(c)) {
+        return Err(bad("username: 1-64 letters, digits, . _ @ or -"));
+    }
+    Ok(n)
 }
 
 async fn user_create(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<UserCreate>) -> ApiResult {
@@ -1175,10 +1200,17 @@ async fn user_create(State(app): State<App>, user: Option<axum::Extension<AuthUs
     if role != "admin" && role != "viewer" {
         return Err(bad("role must be admin or viewer"));
     }
+    let name = valid_username(&req.username)?;
+    if app.db.user_by_name(name).map_err(err500)?.is_some() {
+        return Err(bad("username already taken"));
+    }
     let hash = hash_password(&req.password).map_err(err500)?;
-    let id = app.db.add_user(req.username.trim(), &hash, &role).map_err(bad)?;
+    let id = app.db.add_user(name, &hash, &role).map_err(bad)?;
     if let Some(cs) = req.cameras {
         app.db.set_user_cameras(id, &cs).map_err(err500)?;
+    }
+    if let Some(gs) = req.groups {
+        app.db.set_user_groups(id, &gs).map_err(err500)?;
     }
     Ok(Json(serde_json::json!({"id": id})).into_response())
 }
@@ -1186,14 +1218,79 @@ async fn user_create(State(app): State<App>, user: Option<axum::Extension<AuthUs
 #[derive(Deserialize)]
 struct UserPatch {
     cameras: Option<Vec<i64>>,
+    groups: Option<Vec<String>>,
+    username: Option<String>,
+    password: Option<String>,
+    role: Option<String>,
 }
 
+/// Edit a user: name, password, role, and what a viewer may see (cameras
+/// and/or groups). Existing sign-ins and API tokens stay valid. The last
+/// admin cannot be demoted, and nobody can demote themselves.
 async fn user_update(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(p): Json<UserPatch>) -> ApiResult {
-    require_admin(user.as_ref().map(|e| &e.0))?;
+    let me = require_admin(user.as_ref().map(|e| &e.0))?.clone();
+    let target = app.db.session_user_by_id(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such user").into_response())?;
+    // validate everything before changing anything
+    let name = p.username.as_deref().map(valid_username).transpose()?;
+    if let Some(n) = name {
+        if n != target.username && app.db.user_by_name(n).map_err(err500)?.is_some() {
+            return Err(bad("username already taken"));
+        }
+    }
+    if p.password.as_ref().is_some_and(|pw| pw.len() < 8) {
+        return Err(bad("password >= 8 chars"));
+    }
+    if let Some(r) = &p.role {
+        if r != "admin" && r != "viewer" {
+            return Err(bad("role must be admin or viewer"));
+        }
+        if r != "admin" && target.role == "admin" {
+            if me.id == id {
+                return Err(bad("you cannot remove your own admin role"));
+            }
+            if app.db.admin_count().map_err(err500)? <= 1 {
+                return Err(bad("this is the last admin"));
+            }
+        }
+    }
+    if let Some(n) = name {
+        if n != target.username {
+            app.db.set_username(id, n).map_err(bad)?;
+            info!(user = id, from = %target.username, to = %n, "user renamed");
+        }
+    }
+    if let Some(pw) = &p.password {
+        app.db.set_password_hash(id, &hash_password(pw).map_err(err500)?).map_err(err500)?;
+        info!(user = id, "password changed");
+    }
+    if let Some(r) = &p.role {
+        app.db.set_role(id, r).map_err(err500)?;
+    }
     if let Some(cs) = p.cameras {
         app.db.set_user_cameras(id, &cs).map_err(err500)?;
     }
+    if let Some(gs) = p.groups {
+        app.db.set_user_groups(id, &gs).map_err(err500)?;
+    }
     Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+#[derive(Deserialize)]
+struct GroupRename {
+    from: String,
+    /// absent or null = remove the group (cameras and users keep everything else)
+    to: Option<String>,
+}
+
+/// Rename or remove a camera group on every camera and every user grant.
+async fn group_rename(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, Json(g): Json<GroupRename>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let to = g.to.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    if g.from.trim().is_empty() || to.is_some_and(|t| t.contains(',') || t.len() > 64) {
+        return Err(bad("group names: 1-64 characters, no commas"));
+    }
+    let n = app.db.rename_group(&g.from, to).map_err(err500)?;
+    Ok(Json(serde_json::json!({"ok": true, "cameras": n})).into_response())
 }
 
 async fn user_delete(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -1499,6 +1596,7 @@ pub fn router(app: App) -> Router {
         .route("/api/tokens", post(create_token))
         .route("/api/users", get(users).post(user_create))
         .route("/api/users/{id}", axum::routing::patch(user_update).delete(user_delete))
+        .route("/api/groups/rename", post(group_rename))
         .route("/api/storages", get(storages).post(storage_create))
         .route("/api/storages/{id}", axum::routing::patch(storage_update))
         .route("/api/stats", get(stats))

@@ -157,7 +157,10 @@ class MsePlayer {
 // Timeline widget: coverage + motion + events per camera row, hover/drag
 // scrubbing with snapshot previews (substream keyframes, cached), wheel zoom.
 // ---------------------------------------------------------------------------
-function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, tall = false }) {
+// `onScrub(t)` is called while the cursor is dragged (once per frame) so the
+// page can show that moment at once; `onSeek(t)` when it is let go.
+// `highlight(ev)` decides which events are drawn at full strength.
+function makeTimeline({ rows, range, onSeek, onScrub, onScrubStart, onRangeChange, fixedRange = false, tall = false, highlight = () => true }) {
   const canvas = h('canvas');
   const cursor = h('div', { class: 'cursor' });
   const hover = h('div', { class: 'hover' });
@@ -185,7 +188,8 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
       if (tl) {
         const bw = Math.max(1, W / ((range.end - range.start) / tl.bucket_ms));
         for (let k = 0; k < tl.motion.length; k++) { const m = tl.motion[k]; if (!m) continue; const hh = rows.length === 1 ? (rowH - 1) * m / 255 : rowH - 1; ctx.fillStyle = m > 120 ? '#ff5a5f' : '#f9b84f'; ctx.fillRect(xOf(range.start + k * tl.bucket_ms), y + (rowH - 1 - hh), bw, hh); }
-        for (const ev of tl.events) { const k = kindClass(ev); ctx.fillStyle = KIND_COLOR[k]; ctx.fillRect(xOf(ev.start), y, Math.max(2, xOf(ev.end || ev.start) - xOf(ev.start)), k === 'motion' ? 3 : 5); }
+        for (const ev of tl.events) { const k = kindClass(ev); ctx.globalAlpha = highlight(ev) ? 1 : 0.25; ctx.fillStyle = KIND_COLOR[k]; ctx.fillRect(xOf(ev.start), y, Math.max(2, xOf(ev.end || ev.start) - xOf(ev.start)), k === 'motion' ? 3 : 5); }
+        ctx.globalAlpha = 1;
       }
       if (rows.length > 1) { ctx.fillStyle = '#c8ced8'; ctx.font = '10px system-ui'; ctx.fillText(row.name, 3, y + Math.min(rowH - 2, 11)); }
     });
@@ -227,10 +231,18 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
       } catch {}
     }, dragging ? 60 : 120);
   }
-  el.addEventListener('pointermove', (ev) => { showPreview(ev); if (dragging) { playhead = msAt(ev); cursor.style.left = `${xOf(playhead)}px`; } });
+  // while dragging, the page shows the moment itself (tiles follow the cursor); the popup is for hovering
+  let scrubT = null, scrubTimer = 0;
+  const scrub = (t) => { if (!onScrub) return; scrubT = t; if (!scrubTimer) scrubTimer = setTimeout(() => { scrubTimer = 0; onScrub(scrubT); }, 30); };
+  el.addEventListener('pointermove', (ev) => {
+    if (dragging) { playhead = msAt(ev); cursor.style.left = `${xOf(playhead)}px`; tip.style.left = cursor.style.left; tip.textContent = fmtDT(playhead); if (onScrub) { preview.hidden = true; scrub(playhead); return; } }
+    showPreview(ev);
+  });
   el.addEventListener('pointerleave', () => { if (!dragging) { preview.hidden = true; tip.textContent = ''; } });
-  el.addEventListener('pointerdown', (ev) => { dragging = true; el.setPointerCapture(ev.pointerId); showPreview(ev); });
-  el.addEventListener('pointerup', (ev) => { if (!dragging) return; dragging = false; preview.hidden = true; onSeek(msAt(ev), rowAt(ev)); });
+  el.addEventListener('pointerdown', (ev) => { dragging = true; el.setPointerCapture(ev.pointerId); playhead = msAt(ev); cursor.style.left = `${xOf(playhead)}px`; onScrubStart?.(); if (onScrub) scrub(playhead); else showPreview(ev); });
+  const release = (ev) => { if (!dragging) return; dragging = false; preview.hidden = true; tip.textContent = ''; onSeek(msAt(ev), rowAt(ev)); };
+  el.addEventListener('pointerup', release);
+  el.addEventListener('pointercancel', release);
   el.addEventListener('wheel', (ev) => {
     if (fixedRange) return; ev.preventDefault();
     const t = msAt(ev); const f = ev.deltaY > 0 ? 1.25 : 0.8; let span = Math.min(7 * 86400000, Math.max(300000, (range.end - range.start) * f));
@@ -242,11 +254,87 @@ function makeTimeline({ rows, range, onSeek, onRangeChange, fixedRange = false, 
   return {
     el, load, draw,
     events() { return [...data.values()].flatMap((tl) => tl?.events || []).sort((a, b) => a.start - b.start); },
-    setPlayhead(ms) { playhead = ms; cursor.style.left = `${xOf(ms)}px`; },
+    // playback must not pull the cursor away from a drag in progress
+    setPlayhead(ms) { if (dragging) return; playhead = ms; cursor.style.left = `${xOf(ms)}px`; },
+    get dragging() { return dragging; },
     setRange(s, e) { range.start = s; range.end = e; return load(); },
     get range() { return range; },
     destroy() { window.removeEventListener('resize', draw); for (const u of cache.values()) URL.revokeObjectURL(u); cache.clear(); },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Scrubbing: show a moment on a player while the timeline is dragged. Inside
+// the chunk already loaded that is a plain seek (a real frame, instant);
+// outside it a preview tile (no decode), sharpened to the substream keyframe
+// once the cursor rests.
+// ---------------------------------------------------------------------------
+function makeScrubber() {
+  const cache = new Map();
+  let rest = null;
+  const fetchImg = async (url) => {
+    if (cache.has(url)) return cache.get(url);
+    const r = await fetch(url); if (!r.ok) return null;
+    const u = URL.createObjectURL(await r.blob());
+    cache.set(url, u); if (cache.size > 300) { const k = cache.keys().next().value; URL.revokeObjectURL(cache.get(k)); cache.delete(k); }
+    return u;
+  };
+  const overlay = (p) => { if (!p.scrubImg) { p.scrubImg = h('img', { class: 'scrubimg', alt: '' }); p.video.after(p.scrubImg); } return p.scrubImg; };
+  const hide = (p) => { if (p.scrubImg) p.scrubImg.hidden = true; };
+  function inBuffer(p, t) {
+    if (p.mse.baseSec === null) return null;
+    const off = t / 1000 - p.mse.baseSec; const b = p.video.buffered;
+    for (let i = 0; i < b.length; i++) if (off >= b.start(i) && off <= b.end(i) - 0.05) return off;
+    return null;
+  }
+  return {
+    show(players, t) {
+      clearTimeout(rest);
+      for (const p of players) {
+        const off = inBuffer(p, t);
+        if (off !== null) { p.video.currentTime = off; hide(p); continue; }
+        const img = overlay(p); img.hidden = false; img.dataset.t = t;
+        const bucket = Math.round(t / 2000) * 2000;
+        fetchImg(`${camApi(p.cam)}/preview.jpg?t=${bucket}`).then((u) => { if (u && img.dataset.t == t && !img.dataset.sharp) img.src = u; }).catch(() => {});
+        img.dataset.sharp = '';
+      }
+      rest = setTimeout(() => players.forEach((p) => {
+        const img = p.scrubImg; if (!img || img.hidden) return;
+        fetchImg(`${camApi(p.cam)}/frame.jpg?t=${Math.round(t)}&width=640&stream=sub`).then((u) => { if (u && img.dataset.t == t) { img.src = u; img.dataset.sharp = '1'; } }).catch(() => {});
+      }), 250);
+    },
+    hide(p) { hide(p); },
+    destroy() { clearTimeout(rest); for (const u of cache.values()) URL.revokeObjectURL(u); cache.clear(); },
+  };
+}
+
+// Size a tile grid so its tiles fill the space left in the window: two
+// cameras get two big tiles, twenty get a wall (scrolling only below
+// `min` px per tile). `below()` is the height of what follows the grid.
+function fitGrid(grid, count, { aspect = 16 / 9, below = () => 0, min = 260 } = {}) {
+  const gap = 8;
+  const fit = () => {
+    const n = Math.max(1, count());
+    const W = grid.clientWidth; if (!W) return;
+    const top = grid.getBoundingClientRect().top + window.scrollY;
+    const H = Math.max(220, window.innerHeight - top - below() - 12);
+    let best = { w: 0, cols: 1 };
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const w = Math.min((W - (cols - 1) * gap) / cols, ((H - (rows - 1) * gap) / rows) * aspect);
+      if (w > best.w + 0.5) best = { w, cols };
+    }
+    let { w, cols } = best;
+    if (w < min) { cols = Math.max(1, Math.floor((W + gap) / (min + gap))); w = (W - (cols - 1) * gap) / cols; }
+    grid.style.gridTemplateColumns = `repeat(${cols}, ${Math.floor(w)}px)`;
+  };
+  const ro = new ResizeObserver(() => fit());
+  ro.observe(grid);
+  window.addEventListener('resize', fit);
+  fit(); // reads layout synchronously; again once the page has settled
+  requestAnimationFrame(fit);
+  setTimeout(fit, 300);
+  return { fit, destroy() { ro.disconnect(); window.removeEventListener('resize', fit); } };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +353,9 @@ async function viewLive(main) {
       h('option', { value: 'snapshot', selected: mode === 'snapshot' }, 'Snapshots every 2 s'),
       h('option', { value: 'sub', selected: mode === 'sub' }, 'Substream video (MSE)'),
       h('option', { value: 'webrtc', selected: mode === 'webrtc', disabled: !state.me.go2rtc_url }, 'go2rtc WebRTC (low latency)'))));
-  const grid = h('div', { class: 'grid' });
+  const grid = h('div', { class: 'grid fit' });
   main.replaceChildren(toolbar, grid);
+  const sizer = fitGrid(grid, () => shown.length, { aspect: aspectOf(shown) });
   const players = [];
   for (const c of shown) {
     const tile = h('div', { class: 'tile', onclick: () => { location.hash = `#/camera/${keyOf(c)}`; } },
@@ -293,8 +382,10 @@ async function viewLive(main) {
       }
     } catch {}
   }, 3000);
-  state.cleanup = () => { clearInterval(poll); players.forEach((p) => p.stop()); grid.querySelectorAll('img[data-snap]').forEach((i) => clearInterval(i._t)); };
+  state.cleanup = () => { clearInterval(poll); sizer.destroy(); players.forEach((p) => p.stop()); grid.querySelectorAll('img[data-snap]').forEach((i) => clearInterval(i._t)); };
 }
+// the cameras' picture shape (most are 16:9; a 4:3 or 32:9 camera changes it)
+const aspectOf = (cams) => { const c = cams.find((x) => x.status?.width && x.status?.height); return c ? c.status.width / c.status.height : 16 / 9; };
 function statusText(c) {
   if (!c.status?.connected) return 'offline';
   const s = c.status;
@@ -339,23 +430,36 @@ async function viewCamera(main, camId, atMs) {
   const head = h('div', { class: 'toolbar' },
     h('a', { href: '#/live', class: 'muted' }, '◀ all cameras'), h('h2', { style: 'margin:0' }, camLabel(cam)),
     h('span', { class: 'pill ' + (cam.status?.connected ? 'ok' : 'bad') }, statusText(cam)), h('span', { class: 'grow' }), timeLabel, liveBtn);
-  const tl = makeTimeline({ rows: [{ id: cam.id, key: keyOf(cam), name: cam.name, api: camApi(cam) }], range, onSeek: (t) => play(t), onRangeChange: () => {} });
-  const controls = h('div', { class: 'controls' }, winSel,
+  const scrubber = makeScrubber();
+  const pl = { cam, video, mse: null };
+  let wasPaused = false;
+  const tl = makeTimeline({ rows: [{ id: cam.id, key: keyOf(cam), name: cam.name, api: camApi(cam) }], range,
+    onScrubStart: () => { wasPaused = video.paused; video.pause(); },
+    onScrub: (t) => { timeLabel.textContent = fmtDT(t); scrubber.show([pl], t); },
+    onSeek: (t) => play(t, { resume: !wasPaused || mode === 'live' }), onRangeChange: () => {} });
+  // playback speed for recorded video (live always plays in real time)
+  const SPEEDS = [0.5, 1, 2, 4, 8, 16];
+  const speed = () => Number(speedSel.value) || 1;
+  const applySpeed = () => { const r = mode === 'playback' ? speed() : 1; video.defaultPlaybackRate = r; video.playbackRate = r; };
+  const speedSel = h('select', { title: 'playback speed (recorded video)', onchange: () => { localStorage.setItem('camSpeed', speedSel.value); applySpeed(); } },
+    ...SPEEDS.map((r) => h('option', { value: r, selected: r === (Number(localStorage.getItem('camSpeed')) || 1) }, `${r}×`)));
+  const controls = h('div', { class: 'controls' }, winSel, speedSel,
     h('button', { class: 'ghost', onclick: () => shift(-windowMs / 2) }, '◀'), h('button', { class: 'ghost', onclick: () => shift(windowMs / 2) }, '▶'),
     h('button', { class: 'ghost', onclick: () => play(playhead - 10000) }, '−10 s'), h('button', { class: 'ghost', onclick: () => play(playhead + 10000) }, '+10 s'),
     h('span', { class: 'grow' }),
     h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/video.mp4?start=${Math.round(playhead - 30000)}&end=${Math.round(playhead + 30000)}`) }, 'Export ±30 s'),
     h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/frame.jpg?t=${Math.round(playhead)}&width=3840`) }, 'Full-res frame'),
     h('button', { class: 'ghost', onclick: () => { location.hash = '#/events'; localStorage.setItem('evCam', keyOf(cam)); } }, 'Events'),
-    h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s'));
+    h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s · [ ] speed'));
   main.replaceChildren(head, player, tl.el, controls);
   if (cam.ptz && state.me.user.role === 'admin' && !cam.peer) player.append(ptzPad(cam));
 
   const mse = new MsePlayer(video);
+  pl.mse = mse;
   let playRange = null;
   function shift(d) { range.end = Math.min(Date.now(), range.end + d); range.start = range.end - windowMs; tl.load(); }
   async function goLive() {
-    mode = 'live'; liveBadge.hidden = false; liveBtn.disabled = true; overlay.textContent = 'connecting…';
+    mode = 'live'; liveBadge.hidden = false; liveBtn.disabled = true; overlay.textContent = 'connecting…'; speedSel.disabled = true; applySpeed(); scrubber.hide(pl);
     const mq = mainQuery(cam);
     const url = mq !== null ? `${camApi(cam)}/live.mp4?${mq.slice(1)}` : (support.h264Mse && cam.sub_status ? `${camApi(cam)}/live.mp4?stream=sub` : null);
     if (!url) { overlay.textContent = 'browser cannot decode this stream — snapshots'; snapshots(); return; }
@@ -365,8 +469,8 @@ async function viewCamera(main, camId, atMs) {
   }
   let snapTimer = null;
   function snapshots() { const img = h('img', { style: 'width:100%;display:block' }); video.replaceWith(img); const load = () => { img.src = `${camApi(cam)}/snapshot.jpg?width=1920&t=${Date.now()}`; }; load(); snapTimer = setInterval(load, 1000); }
-  async function play(ms) {
-    mode = 'playback'; liveBadge.hidden = true; liveBtn.disabled = false; mse.onLiveEnded = null;
+  async function play(ms, { resume = true } = {}) {
+    mode = 'playback'; liveBadge.hidden = true; liveBtn.disabled = false; mse.onLiveEnded = null; speedSel.disabled = false;
     playhead = Math.min(ms, Date.now() - 3000); tl.setPlayhead(playhead);
     const s = Math.max(playhead - 1500, 0), e = Math.min(Date.now(), s + CHUNK); playRange = [s, e];
     overlay.textContent = 'loading…';
@@ -375,7 +479,10 @@ async function viewCamera(main, camId, atMs) {
       const url = mq !== null ? `${camApi(cam)}/video.mp4?start=${Math.round(s)}&end=${Math.round(e)}${mq}` : `${camApi(cam)}/video.mp4?stream=sub&start=${Math.round(s)}&end=${Math.round(e)}`;
       if (support.mse) await mse.play(url, { startMs: s });
       else if (support.nativeHls) { video.src = `${camApi(cam)}/playlist.m3u8?start=${Math.round(s)}&end=${Math.round(e)}`; video.play(); }
-    } catch (err) { overlay.textContent = err.message; }
+      applySpeed();
+      if (!resume) video.pause();
+      video.addEventListener('loadeddata', () => scrubber.hide(pl), { once: true });
+    } catch (err) { overlay.textContent = err.message; scrubber.hide(pl); }
   }
   video.addEventListener('timeupdate', () => {
     if (mode !== 'playback') return;
@@ -389,6 +496,7 @@ async function viewCamera(main, camId, atMs) {
     if (e.key === ' ') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
     if (e.key === 'ArrowRight') play(playhead + (e.shiftKey ? 60000 : 10000));
     if (e.key === 'ArrowLeft') play(playhead - (e.shiftKey ? 60000 : 10000));
+    if (e.key === ']' || e.key === '[') { const i = SPEEDS.indexOf(speed()) + (e.key === ']' ? 1 : -1); if (i >= 0 && i < SPEEDS.length) { speedSel.value = SPEEDS[i]; speedSel.dispatchEvent(new Event('change')); } }
   };
   document.addEventListener('keydown', keys);
   await tl.load();
@@ -397,7 +505,7 @@ async function viewCamera(main, camId, atMs) {
     if (mode === 'live') { playhead = Date.now(); tl.setPlayhead(playhead); timeLabel.textContent = fmtDT(playhead); }
     if (range.end >= Date.now() - 20000) { range.end = Date.now(); range.start = range.end - windowMs; tl.load(); }
   }, 15000);
-  state.cleanup = () => { clearInterval(tick); clearInterval(snapTimer); mse.stop(); tl.destroy(); document.removeEventListener('keydown', keys); };
+  state.cleanup = () => { clearInterval(tick); clearInterval(snapTimer); mse.stop(); tl.destroy(); scrubber.destroy(); document.removeEventListener('keydown', keys); };
 }
 
 // PTZ pad: hold an arrow to move, release to stop; zoom; presets; home.
@@ -418,28 +526,57 @@ function ptzPad(cam) {
 // ---------------------------------------------------------------------------
 // Review: filters (date range, groups, cameras, what to show) + synchronized
 // multi-camera playback of the substreams on a shared timeline.
-// Picking cameras or groups updates the view at once (keeping the playhead);
-// dates and the "Show" filter wait for Apply so the page does not reload
-// while they are being edited.
+// Picking cameras, groups or a saved view updates the view at once (keeping
+// the playhead); dates, "Show" and "Length" wait for Apply so the page does
+// not reload while they are being edited.
 // ---------------------------------------------------------------------------
+
+// Named time ranges, relative to now (local time).
+function presetRange(key, now = Date.now()) {
+  const at = (d, h, m = 0) => { const x = new Date(d); x.setHours(h, m, 0, 0); return x.getTime(); };
+  const day = 86400000;
+  switch (key) {
+    case 'night': { let end = at(now, 6); if (end > now) end -= day; return [end - 8 * 3600000, end]; } // 10 PM – 6 AM
+    case 'morning': { let s0 = at(now, 6); if (s0 > now) s0 -= day; return [s0, Math.min(now, s0 + 6 * 3600000)]; }
+    case 'today': return [at(now, 0), now];
+    case 'yesterday': { const s0 = at(now, 0) - day; return [s0, s0 + day]; }
+    case 'sunday': { // the latest Sunday 7 AM – 1 PM that has started
+      const d = new Date(now); d.setDate(d.getDate() - d.getDay());
+      let s0 = at(d, 7); if (s0 > now) s0 -= 7 * day;
+      return [s0, Math.min(now, s0 + 6 * 3600000)];
+    }
+    default: { const m = Number(key); return m ? [now - m, now] : null; }
+  }
+}
+const RANGES = [['900000', 'Last 15 min'], ['3600000', 'Last hour'], ['21600000', 'Last 6 h'], ['86400000', 'Last 24 h'], ['604800000', 'Last 7 days'],
+  ['night', 'Last night (10 PM–6 AM)'], ['morning', 'This morning (6 AM–noon)'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['sunday', 'Sunday services (7 AM–1 PM)']];
+const LENGTHS = [[0, 'Any length'], [3, '3 s+ of motion'], [10, '10 s+ of motion'], [30, '30 s+ of motion']];
+
+// Which events count for a "Show" choice and minimum motion length.
+function eventFilter(show, minMotion) {
+  const kinds = KINDS.find(([k]) => k === show)?.[2].split(',') || null;
+  return (ev) => (!kinds || matchesKinds(ev, kinds)) && (show !== 'starred' || ev.archived) && (!minMotion || ev.motion_secs == null || ev.motion_secs >= minMotion);
+}
+
 async function viewReview(main, atMs) {
   const cams = state.cameras.filter((c) => c.sub_status || c.status?.connected);
   const now = Date.now();
   const saved = JSON.parse(localStorage.getItem('reviewFilter') || '{}');
-  const f = { from: saved.from || now - 3600000, to: saved.to || now, groups: saved.groups || [], cameras: saved.cameras || [], show: saved.show ?? (saved.motionOnly ? 'motion' : '') };
+  const f = { from: saved.from || now - 3600000, to: saved.to || now, groups: saved.groups || [], cameras: saved.cameras || [], show: saved.show ?? (saved.motionOnly ? 'motion' : ''), minMotion: saved.minMotion || 0 };
   if (f.to > now) f.to = now;
   if (atMs) { f.from = atMs - 1800000; f.to = Math.min(now, atMs + 1800000); }
-  const SHOW = [['', 'All selected cameras'], ['motion', 'Cameras with motion'], ...(state.me.objects ? KINDS.map(([k, l]) => [k, `Cameras with ${l.toLowerCase()}`]) : [])];
+  const SHOW = [['', 'All selected cameras'], ['motion', 'Cameras with motion'], ...(state.me.objects ? KINDS.map(([k, l]) => [k, `Cameras with ${l.toLowerCase()}`]) : []), ['starred', 'Cameras with starred events']];
   if (!SHOW.some(([v]) => v === f.show)) f.show = '';
-  const applied = { from: f.from, to: f.to, show: f.show };
+  const applied = { from: f.from, to: f.to, show: f.show, minMotion: f.minMotion };
 
   const applyBtn = h('button', { onclick: () => apply() }, 'Apply');
   const dirty = () => applyBtn.classList.add('pending');
   const fromIn = h('input', { type: 'datetime-local', value: toLocalInput(f.from), oninput: dirty });
   const toIn = h('input', { type: 'datetime-local', value: toLocalInput(f.to), oninput: dirty });
-  const quick = h('select', { onchange: (e) => { const m = Number(e.target.value); e.target.value = 0; if (!m) return; toIn.value = toLocalInput(Date.now()); fromIn.value = toLocalInput(Date.now() - m); dirty(); } },
-    h('option', { value: 0 }, 'Quick range…'), ...[[900000, 'last 15 min'], [3600000, 'last hour'], [6 * 3600000, 'last 6 h'], [86400000, 'last 24 h'], [7 * 86400000, 'last 7 days']].map(([v, l]) => h('option', { value: v }, l)));
+  const quick = h('select', { onchange: (e) => { const r = presetRange(e.target.value); e.target.value = ''; if (!r) return; fromIn.value = toLocalInput(r[0]); toIn.value = toLocalInput(r[1]); dirty(); } },
+    h('option', { value: '' }, 'Pick a range…'), ...RANGES.map(([v, l]) => h('option', { value: v }, l)));
   const showSel = h('select', { onchange: dirty }, ...SHOW.map(([v, l]) => h('option', { value: v, selected: v === f.show }, l)));
+  const lenSel = h('select', { onchange: dirty, title: 'hide short blips (headlights, leaves): seconds of actual motion' }, ...LENGTHS.map(([v, l]) => h('option', { value: v, selected: v === f.minMotion }, l)));
   const soon = debounce(() => apply({ camerasOnly: true }), 350);
   const groupBoxes = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: f.groups.includes(g), onchange: () => { syncCamsFromGroups(); soon(); } }), g));
   const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: keyOf(c), checked: f.cameras.length ? f.cameras.includes(keyOf(c)) : true, onchange: soon }), camLabel(c)));
@@ -449,94 +586,169 @@ async function viewReview(main, atMs) {
     // no group ticked: every camera again
     camBoxes.forEach((b) => { const c = camById($('input', b).value); $('input', b).checked = !gs.length || groupsOf(c).some((g) => gs.includes(g)); });
   }
+  // saved views: a named set of cameras/groups + Show + Length (this browser)
+  const loadViews = () => { try { return JSON.parse(localStorage.getItem('reviewViews') || '[]'); } catch { return []; } };
+  const viewsRow = h('div', { class: 'row' });
+  const current = () => ({ groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: camBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), show: showSel.value, minMotion: Number(lenSel.value) });
+  function useView(v) {
+    groupBoxes.forEach((b) => { $('input', b).checked = v.groups.includes($('input', b).value); });
+    camBoxes.forEach((b) => { $('input', b).checked = v.cameras.includes($('input', b).value); });
+    showSel.value = SHOW.some(([x]) => x === v.show) ? v.show : ''; lenSel.value = v.minMotion || 0;
+    apply({ keepPlayhead: true });
+  }
+  function drawViews() {
+    const views = loadViews();
+    fill(viewsRow, h('span', { class: 'muted' }, 'Views:'),
+      ...views.map((v, i) => h('span', { class: 'chip view' }, h('button', { class: 'linkish', onclick: () => useView(v), title: 'show these cameras with these filters' }, v.name),
+        h('button', { class: 'linkish x', title: `forget "${v.name}"`, onclick: () => { const all = loadViews(); all.splice(i, 1); localStorage.setItem('reviewViews', JSON.stringify(all)); drawViews(); } }, '✕'))),
+      h('button', { class: 'ghost small', onclick: () => {
+        const name = (prompt('Name this view (cameras, groups, Show and Length are saved; dates are not):', '') || '').trim();
+        if (!name) return;
+        const all = loadViews().filter((v) => v.name !== name); all.push({ name, ...current() });
+        localStorage.setItem('reviewViews', JSON.stringify(all)); drawViews();
+      } }, views.length ? '+ save view' : '+ save these cameras and filters as a view'));
+  }
+  drawViews();
   const manage = state.me.user.role === 'admin' ? h('a', { href: '#/admin', class: 'small', onclick: () => sessionStorage.setItem('adminFocus', 'groups') }, groupBoxes.length ? 'manage groups' : '+ create camera groups') : null;
-  const filters = h('div', { class: 'card filters' },
-    h('div', { class: 'row' }, h('label', {}, 'From', fromIn), h('label', {}, 'To', toIn), h('label', {}, 'Range', quick), h('label', {}, 'Show', showSel),
+  // the filters fold to one line (phones start folded): more room for the tiles
+  const body = h('div', { class: 'filters-body' },
+    h('div', { class: 'row' }, h('label', {}, 'From', fromIn), h('label', {}, 'To', toIn), h('label', {}, 'Range', quick), h('label', {}, 'Show', showSel), h('label', {}, 'Length', lenSel),
       h('span', { class: 'grow' }), applyBtn),
+    viewsRow,
     groupBoxes.length || manage ? h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Groups:'), ...groupBoxes, manage) : null,
     h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Cameras:'), h('button', { class: 'ghost small', onclick: () => setAll(true) }, 'all'), h('button', { class: 'ghost small', onclick: () => setAll(false) }, 'none'), ...camBoxes));
+  const summaryText = h('span', { class: 'muted small' });
+  const foldBtn = h('button', { class: 'ghost small', onclick: () => setFolded(!body.hidden) });
+  const setFolded = (on) => { body.hidden = on; foldBtn.textContent = on ? 'Filters ▾' : 'Hide filters ▴'; try { localStorage.setItem('reviewFolded', on ? '1' : '0'); } catch {} session?.fit?.(); };
+  const filters = h('div', { class: 'card filters' }, h('div', { class: 'row filters-head' }, summaryText, h('span', { class: 'grow' }), foldBtn), body);
   const stage = h('div');
   fill(main, filters, stage);
   let session = null;
   let gen = 0;
-  async function apply({ camerasOnly = false } = {}) {
+  setFolded((localStorage.getItem('reviewFolded') ?? (window.innerWidth < 700 ? '1' : '0')) === '1');
+  async function apply({ camerasOnly = false, keepPlayhead = camerasOnly } = {}) {
     if (!camerasOnly) {
       const from = new Date(fromIn.value).getTime(), to = new Date(toIn.value).getTime();
       if (!(from < to)) { toast('"From" must be before "To"', { kind: 'bad' }); return; }
-      Object.assign(applied, { from, to, show: showSel.value });
+      Object.assign(applied, { from, to, show: showSel.value, minMotion: Number(lenSel.value) });
       applyBtn.classList.remove('pending');
     }
     const my = ++gen;
     let chosen = camBoxes.filter((b) => $('input', b).checked).map((b) => camById($('input', b).value)).filter(Boolean);
-    localStorage.setItem('reviewFilter', JSON.stringify({ from: applied.from, to: applied.to, show: applied.show, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map(keyOf) }));
+    localStorage.setItem('reviewFilter', JSON.stringify({ from: applied.from, to: applied.to, show: applied.show, minMotion: applied.minMotion, groups: groupBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value), cameras: chosen.map(keyOf) }));
     const range = { start: applied.from, end: Math.min(applied.to, Date.now()) };
-    const kinds = KINDS.find(([k]) => k === applied.show)?.[2].split(',') || null;
+    const counts = eventFilter(applied.show, applied.minMotion);
     if (applied.show && chosen.length) {
       const res = await Promise.all(chosen.map((c) => api.get(`${camApi(c)}/timeline?start=${Math.round(range.start)}&end=${Math.round(range.end)}`).catch(() => null)));
       if (my !== gen) return;
-      chosen = chosen.filter((c, i) => res[i] && (kinds ? res[i].events.some((ev) => matchesKinds(ev, kinds)) : res[i].events.length || res[i].motion.some((m) => m > 0)));
+      chosen = chosen.filter((c, i) => res[i] && (applied.show === 'motion' ? res[i].events.some(counts) || (!applied.minMotion && res[i].motion.some((m) => m > 0)) : res[i].events.some(counts)));
     }
     // a camera change keeps watching the same moment
-    const keep = camerasOnly && session?.playhead ? session.playhead() : null;
+    const keep = keepPlayhead && session?.playhead ? session.playhead() : null;
     const startAt = keep ?? (atMs && atMs > range.start && atMs < range.end ? atMs : range.start);
     session?.destroy();
-    session = reviewSession(stage, chosen, range, startAt, { kinds, empty: applied.show ? `No selected camera has ${SHOW.find(([v]) => v === applied.show)[1].replace('Cameras with ', '')} in this range.` : 'No cameras selected.' });
+    const what = SHOW.find(([v]) => v === applied.show)?.[1].replace('Cameras with ', '');
+    summaryText.textContent = `${fmtDT(range.start)} → ${fmtDT(range.end)} · ${SHOW.find(([v]) => v === applied.show)?.[1]}${applied.minMotion ? ` · ${applied.minMotion} s+ motion` : ''} · ${chosen.length} camera${chosen.length === 1 ? '' : 's'}`;
+    session = reviewSession(stage, chosen, range, startAt, { counts, empty: applied.show ? `No selected camera has ${what} in this range.` : 'No cameras selected.' });
     atMs = null;
   }
   await apply();
   state.cleanup = () => session?.destroy();
 }
 
-function reviewSession(stage, cams, range, startAt, { kinds = null, empty = 'No cameras selected.' } = {}) {
+function reviewSession(stage, cams, range, startAt, { counts = () => true, empty = 'No cameras selected.' } = {}) {
   if (!cams.length) { fill(stage, h('p', { class: 'muted' }, empty)); return { destroy() {} }; }
   const CHUNK = 2 * 60 * 1000;
-  let playhead = startAt, paused = false;
-  const grid = h('div', { class: 'grid montage' });
+  let playhead = startAt, paused = false, wasPaused = false;
+  const grid = h('div', { class: 'grid montage fit' });
+  const TILE_SPEEDS = [0.5, 1, 2, 4, 8, 16];
   const players = cams.map((c) => {
     const v = h('video', { muted: true, playsinline: true });
     const open = () => { location.hash = `#/camera/${keyOf(c)}/${Math.round(playhead)}`; };
-    const tile = h('div', { class: 'tile', ondblclick: open }, v, h('div', { class: 'label', onclick: open, title: 'open this camera at this moment' }, camLabel(c), ' ⤢'), h('div', { class: 'stat' }, ''));
+    // per-camera speed: this tile leaves the group sync until set back to "sync"
+    const own = h('select', { class: 'tilespeed', title: 'speed of this camera only', onclick: (e) => e.stopPropagation(), ondblclick: (e) => e.stopPropagation(),
+      onchange: (e) => { const r = Number(e.target.value); p.own = r || null; tile.classList.toggle('unsynced', !!p.own); if (p.own) { p.video.playbackRate = p.own; if (!paused) p.video.play().catch(() => {}); } else resync(p); } },
+      h('option', { value: '' }, 'sync'), ...TILE_SPEEDS.map((r) => h('option', { value: r }, `${r}×`)));
+    const tile = h('div', { class: 'tile', ondblclick: open }, v, h('div', { class: 'label', onclick: open, title: 'open this camera at this moment' }, camLabel(c), ' ⤢'), h('div', { class: 'stat' }, ''), own);
     grid.append(tile);
-    return { cam: c, video: v, mse: new MsePlayer(v), stat: $('.stat', tile) };
+    const p = { cam: c, video: v, mse: new MsePlayer(v), stat: $('.stat', tile), own: null, tile };
+    return p;
   });
-  const tl = makeTimeline({ rows: cams.map((c) => ({ id: c.id, key: keyOf(c), name: camLabel(c), api: camApi(c) })), range, fixedRange: true, tall: cams.length > 3, onSeek: (t) => seekAll(t) });
+  const synced = () => players.filter((p) => !p.own);
+  const scrubber = makeScrubber();
+  const tl = makeTimeline({ rows: cams.map((c) => ({ id: c.id, key: keyOf(c), name: camLabel(c), api: camApi(c) })), range, fixedRange: true, tall: cams.length > 3, highlight: counts,
+    onScrubStart: () => { wasPaused = paused; players.forEach((p) => p.video.pause()); },
+    onScrub: (t) => { timeLabel.textContent = fmtDT(t); scrubber.show(players, t); },
+    onSeek: (t) => seekAll(t, { resume: !wasPaused }) });
   const timeLabel = h('span', { class: 'time' });
   const togglePause = () => { paused = !paused; playBtn.textContent = paused ? '▶' : '⏸'; players.forEach((p) => paused ? p.video.pause() : p.video.play().catch(() => {})); };
   const playBtn = h('button', { class: 'ghost', title: 'play / pause (space)', onclick: togglePause }, '⏸');
-  const speedSel = h('select', { onchange: (e) => players.forEach((p) => { p.video.playbackRate = Number(e.target.value); }) }, ...[1, 2, 4, 8].map((r) => h('option', { value: r }, `${r}×`)));
-  // previous / next event of the shown cameras (of the chosen kind when "Show" asks for one)
-  const events = () => tl.events().filter((ev) => matchesKinds(ev, kinds));
+  const rate = () => Number(speedSel.value);
+  const speedSel = h('select', { title: 'speed of all synced cameras', onchange: () => synced().forEach((p) => { p.video.playbackRate = rate(); }) }, ...[1, 2, 4, 8, 16].map((r) => h('option', { value: r }, `${r}×`)));
+  // quiet time: what to do between the events that count (Show / Length)
+  const quietSel = h('select', { title: 'between events: play normally, play fast, or jump to the next event', onchange: () => localStorage.setItem('reviewQuiet', quietSel.value) },
+    ...[['play', 'Quiet: normal'], ['fast', 'Quiet: fast (8×)'], ['skip', 'Quiet: skip']].map(([v, l]) => h('option', { value: v, selected: v === (localStorage.getItem('reviewQuiet') || 'play') }, l)));
+  // previous / next event that counts for the current Show / Length
+  const events = () => tl.events().filter(counts);
   const jump = (dir) => {
     const evs = events();
     const ev = dir > 0 ? evs.find((e) => e.start - 2000 > playhead + 1000) : [...evs].reverse().find((e) => e.start - 2000 < playhead - 3000);
     if (ev) seekAll(ev.start - 2000); else toast(dir > 0 ? 'No later event in this range' : 'No earlier event in this range');
   };
   const legend = state.me.objects ? h('span', { class: 'legend small' }, ...['motion', 'person', 'vehicle', 'animal'].map((k) => h('span', {}, h('i', { style: `background:${KIND_COLOR[k]}` }), k))) : null;
-  const controls = h('div', { class: 'controls' }, playBtn, speedSel,
+  const quietBadge = h('span', { class: 'pill', hidden: true }, '⏩ quiet');
+  const controls = h('div', { class: 'controls' }, playBtn, speedSel, quietSel,
     h('button', { class: 'ghost', title: 'previous event (P)', onclick: () => jump(-1) }, '⏮ event'), h('button', { class: 'ghost', title: 'next event (N)', onclick: () => jump(1) }, 'event ⏭'),
     h('button', { class: 'ghost', onclick: () => seekAll(playhead - 60000) }, '−1 min'), h('button', { class: 'ghost', onclick: () => seekAll(playhead + 60000) }, '+1 min'),
-    timeLabel, h('span', { class: 'grow' }), legend,
-    h('span', { class: 'muted small' }, `${cams.length} camera${cams.length === 1 ? '' : 's'} · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag to scrub · N/P next/previous event · click a camera name for full resolution`));
+    timeLabel, quietBadge, h('span', { class: 'grow' }), legend,
+    h('span', { class: 'muted small' }, `${cams.length} camera${cams.length === 1 ? '' : 's'} · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag the timeline to scrub · N/P events · each tile has its own speed`));
   fill(stage, grid, tl.el, controls);
-  async function seekAll(ms) {
-    playhead = Math.max(range.start, Math.min(ms, range.end - 1000)); tl.setPlayhead(playhead); timeLabel.textContent = fmtDT(playhead);
-    const s = playhead, e = Math.min(range.end, s + CHUNK);
-    await Promise.all(players.map(async (p) => {
-      p.stat.textContent = '…';
-      try {
-        const stream = p.cam.sub_status ? 'sub' : 'main';
-        await p.mse.play(`${camApi(p.cam)}/video.mp4?stream=${stream}&start=${Math.round(s)}&end=${Math.round(e)}`, { startMs: s });
-        p.stat.textContent = ''; p.video.playbackRate = Number(speedSel.value); if (paused) p.video.pause();
-      } catch { p.stat.textContent = 'no recording'; }
-    }));
+  const sizer = fitGrid(grid, () => players.length, { aspect: aspectOf(cams), below: () => tl.el.offsetHeight + controls.offsetHeight + 26, min: 240 });
+  async function load(p, s, e, resume) {
+    p.stat.textContent = '…';
+    try {
+      const stream = p.cam.sub_status ? 'sub' : 'main';
+      await p.mse.play(`${camApi(p.cam)}/video.mp4?stream=${stream}&start=${Math.round(s)}&end=${Math.round(e)}`, { startMs: s });
+      p.stat.textContent = ''; p.video.playbackRate = p.own || rate(); if (paused || !resume) p.video.pause();
+      p.video.addEventListener('loadeddata', () => scrubber.hide(p), { once: true });
+    } catch { p.stat.textContent = 'no recording'; scrubber.hide(p); }
   }
+  async function seekAll(ms, { resume = true } = {}) {
+    playhead = Math.max(range.start, Math.min(ms, range.end - 1000)); tl.setPlayhead(playhead); timeLabel.textContent = fmtDT(playhead);
+    if (!resume && !paused) togglePause();
+    const s = playhead, e = Math.min(range.end, s + CHUNK);
+    await Promise.all(players.map((p) => load(p, s, e, resume)));
+  }
+  // back into the group: load at the shared playhead
+  const resync = (p) => load(p, playhead, Math.min(range.end, playhead + CHUNK), !paused);
+  let skipHold = 0; // no second skip while the first one loads
   const sync = setInterval(() => {
-    const lead = players.find((p) => p.mse.wallMs() !== null && !p.video.paused && p.video.readyState >= 2);
+    if (tl.dragging) return;
+    // not paused by the user, so nothing should sit paused (a first play() lost
+    // while the tab was in the background, a stall after a seek)
+    if (!paused) for (const p of players) { if (p.video.paused && p.video.readyState >= 2 && !p.video.ended) p.video.play().catch(() => {}); }
+    const group = synced();
+    const lead = group.find((p) => p.mse.wallMs() !== null && !p.video.paused && p.video.readyState >= 2);
     if (!lead) return;
     const t = lead.mse.wallMs(); playhead = t; timeLabel.textContent = fmtDT(t); tl.setPlayhead(t);
-    for (const p of players) { if (p === lead) continue; const w = p.mse.wallMs(); if (w === null) continue; const d = (t - w) / 1000; if (Math.abs(d) > 0.3) p.video.currentTime += d; }
-  }, 1000);
-  players[0].video.addEventListener('ended', () => { if (playhead + 2000 < range.end) seekAll(playhead + 500); });
+    // quiet time: no counted event here. A jump lands on the keyframe at or
+    // before its 2 s lead-in, so up to 4 s before an event already counts as in it.
+    const quiet = quietSel.value !== 'play' && Date.now() > skipHold && !events().some((ev) => ev.start - 4000 <= t && t <= (ev.end || ev.start) + 1000);
+    quietBadge.hidden = !quiet;
+    if (quiet && quietSel.value === 'skip') {
+      const next = events().find((ev) => ev.start - 4000 > t);
+      if (next) { skipHold = Date.now() + 4000; seekAll(next.start - 2000); return; }
+    }
+    const want = quiet && quietSel.value === 'fast' ? Math.max(8, rate()) : rate();
+    for (const p of group) { if (p.video.playbackRate !== want) p.video.playbackRate = want; }
+    for (const p of group) { if (p === lead) continue; const w = p.mse.wallMs(); if (w === null) continue; const d = (t - w) / 1000; if (Math.abs(d) > 0.3 * Math.max(1, want / 2)) p.video.currentTime += d; }
+  }, 500);
+  // the next chunk when the group runs out (a camera playing at its own speed loads its own)
+  players.forEach((p) => p.video.addEventListener('ended', () => {
+    const w = p.mse.wallMs() ?? playhead;
+    if (p.own) { if (w + 1000 < range.end) load(p, w, Math.min(range.end, w + CHUNK), true); return; }
+    if (p === synced()[0] && playhead + 2000 < range.end) seekAll(playhead + 500);
+  }));
   const keys = (e) => {
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.metaKey || e.ctrlKey) return;
     if (e.key === ' ') { e.preventDefault(); togglePause(); }
@@ -547,7 +759,7 @@ function reviewSession(stage, cams, range, startAt, { kinds = null, empty = 'No 
   };
   document.addEventListener('keydown', keys);
   tl.load().then(() => seekAll(startAt));
-  return { playhead: () => playhead, destroy() { clearInterval(sync); document.removeEventListener('keydown', keys); players.forEach((p) => p.mse.stop()); tl.destroy(); } };
+  return { playhead: () => playhead, fit: () => requestAnimationFrame(sizer.fit), destroy() { clearInterval(sync); sizer.destroy(); scrubber.destroy(); document.removeEventListener('keydown', keys); players.forEach((p) => p.mse.stop()); tl.destroy(); } };
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +767,7 @@ function reviewSession(stage, cams, range, startAt, { kinds = null, empty = 'No 
 // ---------------------------------------------------------------------------
 async function viewEvents(main) {
   const cams = state.cameras;
-  const q = { camera: localStorage.getItem('evCam') || '', min_score: Number(localStorage.getItem('evMin') || 0), archived: false, range: localStorage.getItem('evRange') || '7d', kind: localStorage.getItem('evKind') || '' };
+  const q = { camera: localStorage.getItem('evCam') || '', min_score: Number(localStorage.getItem('evMin') || 0), archived: false, range: localStorage.getItem('evRange') || '7d', kind: localStorage.getItem('evKind') || '', min_motion: Number(localStorage.getItem('evLen') || 0) };
   // without a detector every event is "motion": an object filter would only ever come back empty
   if (!state.me.objects) q.kind = '';
   const list = h('div', { class: 'events' });
@@ -567,10 +779,12 @@ async function viewEvents(main) {
     ...[[0, 'Any motion'], [60, 'Moderate+'], [120, 'Strong+'], [200, 'Very strong']].map(([v, l]) => h('option', { value: v, selected: v === q.min_score }, l)));
   const rangeSel = h('select', { onchange: (e) => { q.range = e.target.value; localStorage.setItem('evRange', q.range); load(true); } },
     ...[['1d', 'Last 24 h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['all', 'All']].map(([v, l]) => h('option', { value: v, selected: v === q.range }, l)));
+  const lenSel = h('select', { title: 'hide short blips: seconds of actual motion', onchange: (e) => { q.min_motion = Number(e.target.value); localStorage.setItem('evLen', q.min_motion); load(true); } },
+    ...LENGTHS.map(([v, l]) => h('option', { value: v, selected: v === q.min_motion }, l)));
   const arch = h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', onchange: (e) => { q.archived = e.target.checked; load(true); } }), ' Archived only');
   const kindSel = state.me.objects ? h('select', { onchange: (e) => { q.kind = e.target.value; localStorage.setItem('evKind', q.kind); load(true); } },
     ...[['', 'Anything'], ...KINDS.map(([, l, v]) => [v, l]), ['motion', 'Motion only (no object)']].map(([v, l]) => h('option', { value: v, selected: v === q.kind }, l))) : null;
-  fill(main, h('div', { class: 'toolbar' }, camSel, kindSel, minSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
+  fill(main, h('div', { class: 'toolbar' }, camSel, kindSel, minSel, lenSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
   let before = null, total = 0;
   async function load(reset) {
     if (reset) { list.replaceChildren(); before = null; total = 0; }
@@ -588,6 +802,7 @@ async function viewEvents(main) {
       if (q.min_score) p.set('min_score', q.min_score);
       if (q.kind) p.set('kind', q.kind);
       if (q.archived) p.set('archived', 'true');
+      if (q.min_motion) p.set('min_motion', q.min_motion);
       if (days) p.set('start', Date.now() - days * 86400000);
       if (before && !pr) p.set('before', before);
       const evs = await api.get(`${apiBase(pr)}/events?${p}`).catch(() => []);
@@ -608,7 +823,7 @@ function eventCard(ev) {
   return h('div', { class: 'event' + (ev.archived ? ' archived' : ''), onclick: () => openEvent(ev) },
     h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`),
       kindClass(ev) !== 'motion' ? h('span', { class: 'kind', style: `background:${KIND_COLOR[kindClass(ev)]}` }, ev.kind) : null),
-    h('div', { class: 'meta' }, h('b', {}, cam ? camLabel(cam) : `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}`,
+    h('div', { class: 'meta' }, h('b', {}, cam ? camLabel(cam) : `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}${ev.motion_secs != null ? ` · ${ev.motion_secs < 1 ? '<1' : Math.round(ev.motion_secs)} s motion` : ''}`,
       ev.objects?.length ? h('div', { class: 'labels' }, ...ev.objects.map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`))) : null,
       ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
 }
@@ -696,10 +911,22 @@ async function viewAdmin(main) {
   const addCam = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); try { await api.post('/api/cameras', { name: f.get('name'), main_url: f.get('main_url'), sub_url: f.get('sub_url') || null, storage_id: Number(f.get('storage_id')) }); toast(`Added ${f.get('name')}; recording starts within ~30 s`, { kind: 'ok' }); route(); } catch (err) { toast(err.message, { kind: 'bad' }); } } },
     h('input', { name: 'name', placeholder: 'Name', required: true, style: 'width:160px' }), h('input', { name: 'main_url', placeholder: 'main rtsp://user:pass@ip/Streaming/Channels/101', required: true, style: 'flex:2;min-width:240px' }), h('input', { name: 'sub_url', placeholder: 'substream rtsp://…/102 (recommended)', style: 'flex:2;min-width:240px' }),
     h('select', { name: 'storage_id', style: 'width:auto', title: 'where new recordings go' }, ...storages.filter((st) => !st.read_only).map((st) => h('option', { value: st.id, selected: st === primary }, `→ ${storageName(storages, st.id)}`))), h('button', {}, 'Add camera'));
-  const userTable = h('table', {}, h('tr', {}, h('th', {}, 'User'), h('th', {}, 'Role'), h('th', {}, 'Cameras'), h('th', {}, '')),
-    ...users.map((u) => h('tr', {}, h('td', {}, u.username), h('td', {}, u.role), h('td', {}, u.role === 'admin' ? 'all' : u.cameras.map((id) => cams.find((c) => c.id === id)?.name || id).join(', ') || h('span', { class: 'err' }, 'none')),
-      h('td', { class: 'actions' }, u.role === 'admin' ? null : h('button', { class: 'ghost small', onclick: () => editUserCams(u, cams) }, 'Cameras'), u.id === state.me.user.id ? null : h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete user ${u.username}?`)) { await api.del(`/api/users/${u.id}`); route(); } } }, 'Delete')))));
-  const addUser = h('form', { class: 'row', onsubmit: async (e) => { e.preventDefault(); const f = new FormData(e.target); try { await api.post('/api/users', { username: f.get('username'), password: f.get('password'), role: f.get('role') }); route(); } catch (err) { toast(err.message, { kind: 'bad' }); } } },
+  const camName = (id) => cams.find((c) => c.id === id)?.name || `#${id}`;
+  const access = (u) => u.role === 'admin' ? h('span', { class: 'muted' }, 'all cameras')
+    : (u.groups.length || u.cameras.length) ? h('span', {}, ...u.groups.map((g) => h('span', { class: 'pill' }, `group: ${g}`)), ...u.cameras.map((id) => h('span', { class: 'pill' }, camName(id))), h('div', { class: 'muted small' }, `sees ${u.visible.length} camera${u.visible.length === 1 ? '' : 's'}`))
+      : h('span', { class: 'err' }, 'nothing yet');
+  const userTable = h('table', {}, h('tr', {}, h('th', {}, 'User'), h('th', {}, 'Role'), h('th', {}, 'Can see'), h('th', {}, '')),
+    ...users.map((u) => h('tr', {}, h('td', {}, h('b', {}, u.username), u.id === state.me.user.id ? h('span', { class: 'muted small' }, ' (you)') : null), h('td', {}, u.role), h('td', {}, access(u)),
+      h('td', { class: 'actions' }, h('button', { class: 'ghost small', onclick: () => editUser(u, cams, users) }, 'Edit'), u.id === state.me.user.id ? null : h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete user ${u.username}?`)) { await api.del(`/api/users/${u.id}`); route(); } } }, 'Delete')))));
+  const addUser = h('form', { class: 'row', onsubmit: async (e) => {
+    e.preventDefault(); const f = new FormData(e.target);
+    try {
+      const r = await api.post('/api/users', { username: f.get('username'), password: f.get('password'), role: f.get('role') });
+      const fresh = await api.get('/api/users');
+      const u = fresh.find((x) => x.id === r.id);
+      if (u && u.role !== 'admin') { toast(`Created ${u.username}: now choose what they can see`, { kind: 'ok' }); editUser(u, cams, fresh); } else route();
+    } catch (err) { toast(err.message, { kind: 'bad' }); }
+  } },
     h('input', { name: 'username', placeholder: 'username', required: true, style: 'width:150px' }), h('input', { name: 'password', type: 'password', placeholder: 'password (8+)', required: true, style: 'width:160px' }), h('select', { name: 'role', style: 'width:auto' }, h('option', { value: 'viewer' }, 'viewer'), h('option', { value: 'admin' }, 'admin')), h('button', {}, 'Add user'));
   const stor = h('table', {}, h('tr', {}, h('th', {}, 'Volume'), h('th', {}, 'Used'), h('th', {}, 'Free'), h('th', {}, 'Cap'), h('th', {}, 'Keep free'), h('th', {}, 'Tiering'), h('th', {}, '')),
     ...storages.map((st) => h('tr', {}, h('td', {}, h('b', {}, storageName(storages, st.id)), h('div', {}, h('code', {}, st.path)), st.available ? null : h('span', { class: 'pill bad' }, 'not mounted')), h('td', {}, gb(st.used_bytes)), h('td', {}, gb(st.free_bytes)), h('td', {}, st.max_bytes ? gb(st.max_bytes) : '—'), h('td', {}, gb(st.reserve_bytes)),
@@ -711,12 +938,12 @@ async function viewAdmin(main) {
       h('div', { class: 'row' }, h('button', { class: 'ghost small', onclick: async (e) => { e.target.disabled = true; try { const r = await api.post('/api/events/classify', { days: 7 }); toast(`Checking ${r.queued} events from the last 7 days in the background`, { kind: 'ok' }); } catch (err) { toast(err.message, { kind: 'bad' }); } } }, 'Label the last 7 days of events'), h('span', { class: 'muted small' }, 'for events recorded before the detector was set up')))
     : h('p', {}, h('span', { class: 'pill' }, 'not configured'), ' Only motion is detected, so events cannot be filtered by people or vehicles. Add an ', h('code', {}, '[objects]'), ' section to zmng.toml pointing at a detection server (see deploy/detector).');
   const focus = sessionStorage.getItem('adminFocus'); sessionStorage.removeItem('adminFocus');
-  const groupsCard = h('div', { class: 'card', id: 'groups' }, h('h2', {}, 'Camera groups'), groupsEditor(cams));
+  const groupsCard = h('div', { class: 'card', id: 'groups' }, h('h2', {}, 'Camera groups'), groupsEditor(cams, users));
   fill(main,
     h('div', { class: 'card' }, h('h2', {}, 'Cameras'), h('div', { class: 'tablewrap' }, camTable), h('div', { style: 'margin-top:10px' }, addCam), h('p', { class: 'muted small' }, 'Camera changes take effect within about 30 seconds.')),
     groupsCard,
     h('div', { class: 'two' },
-      h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see only the cameras assigned to them (nothing until you assign some).'), tokenBtn),
+      h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see the cameras in their groups plus any assigned one by one — nothing until you choose. A camera added to a group is shared with that group\'s users at once.'), tokenBtn),
       h('div', { class: 'card' }, h('h2', {}, 'Object detection'), objects)),
     h('div', { class: 'card' }, h('h2', {}, 'Storage'), h('div', { class: 'tablewrap' }, stor), h('p', { class: 'muted small' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
     h('details', { class: 'card' }, h('summary', {}, 'Diagnostics'), h('p', {}, `This browser — MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL. Live video plays as MSE (H.264 substream) through the app\'s go2rtc player.')));
@@ -727,7 +954,7 @@ const storageName = (all, id) => { const st = all.find((x) => x.id === id); if (
 
 // Groups are the cameras' comma-separated tags: one matrix of checkboxes
 // (cameras × groups), saved as you click.
-function groupsEditor(cams) {
+function groupsEditor(cams, users = []) {
   const groups = [...new Set(cams.flatMap(groupsOf))].sort((a, b) => a.localeCompare(b));
   const save = async (c, tags) => {
     const t = [...new Set(tags)];
@@ -735,19 +962,23 @@ function groupsEditor(cams) {
     c.tags = t.join(', ');
     const sc = state.cameras.find((x) => !x.peer && x.id === c.id); if (sc) sc.tags = c.tags;
   };
-  const redraw = () => { const card = $('#groups'); if (card) fill(card, h('h2', {}, 'Camera groups'), groupsEditor(cams)); };
+  const redraw = () => { const card = $('#groups'); if (card) fill(card, h('h2', {}, 'Camera groups'), groupsEditor(cams, users)); };
+  const sharedWith = (g) => users.filter((u) => u.role !== 'admin' && u.groups.some((x) => x.toLowerCase() === g.toLowerCase())).map((u) => u.username);
+  // rename/remove on the server: camera tags and users' group grants change together
   const renameGroup = async (g) => {
     const n = (prompt(`Rename group "${g}" to:`, g) || '').trim();
     if (!n || n === g) return;
-    if (n.includes(',')) { toast('Group names cannot contain commas', { kind: 'bad' }); return; }
-    for (const c of cams.filter((x) => groupsOf(x).includes(g))) await save(c, groupsOf(c).map((x) => (x === g ? n : x)));
-    toast(`Renamed "${g}" to "${n}"`, { kind: 'ok' }); redraw();
+    try { await api.post('/api/groups/rename', { from: g, to: n }); } catch (err) { toast(err.message, { kind: 'bad' }); return; }
+    toast(`Renamed "${g}" to "${n}"`, { kind: 'ok' }); refresh();
   };
   const deleteGroup = async (g) => {
-    if (!confirm(`Remove group "${g}"? The cameras themselves are not changed.`)) return;
-    for (const c of cams.filter((x) => groupsOf(x).includes(g))) await save(c, groupsOf(c).filter((x) => x !== g));
-    toast(`Removed group "${g}"`, { kind: 'ok' }); redraw();
+    const who = sharedWith(g);
+    if (!confirm(`Remove group "${g}"? The cameras are not changed${who.length ? `, but ${who.join(', ')} will no longer see them through this group` : ''}.`)) return;
+    try { await api.post('/api/groups/rename', { from: g, to: null }); } catch (err) { toast(err.message, { kind: 'bad' }); return; }
+    toast(`Removed group "${g}"`, { kind: 'ok' }); refresh();
   };
+  // users' grants change with a rename/removal: redraw the whole page, back at the groups
+  const refresh = () => { sessionStorage.setItem('adminFocus', 'groups'); route(); };
   const newName = h('input', { placeholder: 'New group name, e.g. Outside', style: 'width:220px' });
   const newBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id }), c.name));
   const create = async (e) => {
@@ -764,11 +995,12 @@ function groupsEditor(cams) {
     h('tr', {}, h('th', {}, 'Camera'), ...groups.map((g) => h('th', {}, h('span', {}, g), ' ', h('button', { class: 'ghost small', title: `rename ${g}`, onclick: () => renameGroup(g) }, '✎'), h('button', { class: 'ghost small', title: `remove ${g}`, onclick: () => deleteGroup(g) }, '✕')))),
     ...cams.map((c) => h('tr', {}, h('td', {}, c.name), ...groups.map((g) => h('td', {}, h('input', { type: 'checkbox', checked: groupsOf(c).includes(g), 'aria-label': `${c.name} in ${g}`,
       onchange: async (e) => { try { await save(c, e.target.checked ? [...groupsOf(c), g] : groupsOf(c).filter((x) => x !== g)); redraw(); } catch (err) { e.target.checked = !e.target.checked; toast(err.message, { kind: 'bad' }); } } }))))),
-    h('tr', {}, h('td', { class: 'muted small' }, 'cameras'), ...groups.map((g) => h('td', { class: 'muted small' }, String(cams.filter((c) => groupsOf(c).includes(g)).length))))))
+    h('tr', {}, h('td', { class: 'muted small' }, 'cameras'), ...groups.map((g) => h('td', { class: 'muted small' }, String(cams.filter((c) => groupsOf(c).includes(g)).length)))),
+    h('tr', {}, h('td', { class: 'muted small' }, 'shared with'), ...groups.map((g) => h('td', { class: 'muted small' }, sharedWith(g).join(', ') || '—')))))
     : h('p', { class: 'muted' }, 'No groups yet. Groups let you pick a set of cameras with one click on the Live and Review pages (e.g. Outside, Doors, CBA).');
   return h('div', {}, matrix,
     h('form', { class: 'newgroup', onsubmit: create }, h('div', { class: 'row' }, newName, h('button', {}, 'Create group')), h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'with:'), ...newBoxes)),
-    h('p', { class: 'muted small' }, 'Ticks save immediately. A camera can be in several groups.'));
+    h('p', { class: 'muted small' }, 'Ticks save immediately. A camera can be in several groups. Share a group with viewers in Users → Edit; zmNinjaNg shows these groups too.'));
 }
 
 function closeOnEscape(modal, close) {
@@ -842,11 +1074,56 @@ function editStorage(s, all) {
   closeOnEscape(modal, () => modal.remove());
   document.body.append(modal);
 }
-function editUserCams(u, cams) {
-  const boxes = cams.map((c) => h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', value: c.id, checked: u.cameras.includes(c.id) }), ` ${c.name}`));
-  const modal = h('div', { class: 'modal' }, h('div', { class: 'card' }, h('h2', {}, `Cameras for ${u.username}`), ...boxes,
-    h('div', { class: 'row' }, h('button', { onclick: async () => { const ids = boxes.map((b) => $('input', b)).filter((i) => i.checked).map((i) => Number(i.value)); await api.patch(`/api/users/${u.id}`, { cameras: ids }); modal.remove(); route(); } }, 'Save'), h('button', { class: 'ghost', onclick: () => modal.remove() }, 'Cancel'))));
-  closeOnEscape(modal, () => modal.remove());
+// Edit a user: name, password, role, and — for viewers — what they may see:
+// whole groups (cameras added to the group later are included) and/or
+// individual cameras.
+function editUser(u, cams, users) {
+  const isMe = u.id === state.me.user.id;
+  const name = h('input', { value: u.username, autocomplete: 'off' });
+  const pw = h('input', { type: 'password', placeholder: 'leave blank to keep', autocomplete: 'new-password' });
+  const role = h('select', { disabled: isMe, title: isMe ? 'you cannot change your own role' : '' }, ...['viewer', 'admin'].map((r) => h('option', { value: r, selected: r === u.role }, r)));
+  const groups = [...new Set([...allGroups(), ...u.groups])].sort((a, b) => a.localeCompare(b));
+  const gBoxes = groups.map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: u.groups.some((x) => x.toLowerCase() === g.toLowerCase()), onchange: preview }), g, h('span', { class: 'muted small' }, ` (${cams.filter((c) => groupsOf(c).some((x) => x.toLowerCase() === g.toLowerCase())).length})`)));
+  const cBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id, checked: u.cameras.includes(c.id), onchange: preview }), c.name));
+  const sees = h('p', { class: 'muted small' });
+  const accessBox = h('div', {}, h('h3', {}, 'Can see'),
+    groups.length ? h('div', {}, h('div', { class: 'muted small' }, 'Groups (cameras added to a group later are included automatically)'), h('div', { class: 'row' }, ...gBoxes)) : h('p', { class: 'muted small' }, 'No camera groups yet — create them under Camera groups to share sets of cameras.'),
+    h('div', { class: 'muted small', style: 'margin-top:8px' }, 'Individual cameras'), h('div', { class: 'row' }, ...cBoxes), sees);
+  function preview() {
+    const gs = gBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value.toLowerCase());
+    const ids = new Set(cBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value)));
+    cams.forEach((c) => { if (groupsOf(c).some((g) => gs.includes(g.toLowerCase()))) ids.add(c.id); });
+    sees.textContent = ids.size ? `Will see ${ids.size}: ${cams.filter((c) => ids.has(c.id)).map((c) => c.name).join(', ')}` : 'Will see nothing (fails closed).';
+  }
+  const showAccess = () => { accessBox.hidden = role.value === 'admin'; };
+  role.addEventListener('change', showAccess);
+  const errEl = h('p', { class: 'err' });
+  const save = async (e) => {
+    e.preventDefault();
+    const patch = {};
+    if (name.value.trim() !== u.username) patch.username = name.value.trim();
+    if (pw.value) patch.password = pw.value;
+    if (!isMe && role.value !== u.role) patch.role = role.value;
+    if (role.value !== 'admin') {
+      patch.groups = gBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value);
+      patch.cameras = cBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value));
+    }
+    try {
+      await api.patch(`/api/users/${u.id}`, patch);
+      close();
+      if (isMe && patch.username) { state.me.user.username = patch.username; toast(`You are now "${patch.username}" (use it next time you sign in, also in zmNinjaNg)`, { kind: 'ok', ttl: 12000 }); } else toast(`Saved ${patch.username || u.username}`, { kind: 'ok' });
+      route();
+    } catch (err) { errEl.textContent = err.message; }
+  };
+  const modal = h('div', { class: 'modal' }, h('form', { class: 'card wide-modal', onsubmit: save },
+    h('div', { class: 'row' }, h('h2', {}, `User ${u.username}`), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
+    h('div', { class: 'fgrid' }, h('label', {}, 'Username', name), h('label', {}, 'New password (8+)', pw), h('label', {}, 'Role', role)),
+    h('p', { class: 'muted small' }, 'Renaming keeps this user\'s sign-ins and API tokens working; the new name is needed at the next sign-in.'),
+    accessBox, errEl,
+    h('div', { class: 'row sticky-actions' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Cancel'))));
+  const close = () => modal.remove();
+  closeOnEscape(modal, close);
+  showAccess(); preview();
   document.body.append(modal);
 }
 
