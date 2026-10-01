@@ -22,5 +22,6 @@ Start with **`ARCHITECTURE.md`** (diagnosis, design, plan). Then:
 | `reviews/10-coverage-audit-2.md` | Second test-coverage audit (72 % lines) after phase 3 |
 | `TEST-DEPLOY-2026-09-28.md` | The side-by-side test install on securityserver (isolation, before/after, findings) |
 | `reviews/11-field-review-2026-09-30.md` | Two days into the side-by-side test: UI/server/detection/zmNinjaNg findings, fixes deployed, production ZoneMinder findings, next steps and Review filter ideas |
+| `reviews/12-feature-parity-review.md` | zmng against ZoneMinder 1.39 and zmNinjaNg 2.6 feature by feature: where it is ahead, ranked gaps (zone editor/tuning, export, notification rules/push, zmNinjaNg stubs, roles/tokens), what is left out on purpose, suggested order |
 
 Code: `../zmng/` (README inside). ZoneMinder fork (reference, phase-0 patches): `../zoneminder/`.
