@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(e.decide(&mixed, &cams(), true, at(12, 0, 1), 0, &Notification::EventStart(ev(30, 1, &[], &[]))).len(), 1);
         assert_eq!(e.decide(&mixed, &cams(), true, at(12, 1, 1), 60_000, &Notification::CameraDown { camera_id: 1, name: "x".into() }).len(), 1);
         // two volumes running low are two alerts
-        let st = vec![rule(8, &["storage_low"])];
+        let st = [rule(8, &["storage_low"])];
         let low = |id| Notification::StorageLow { storage_id: id, path: format!("/v{id}"), free_bytes: 1, reserve_bytes: 0 };
         let st = vec![Rule { min_interval_secs: 3600, ..st[0].clone() }];
         assert_eq!(e.decide(&st, &cams(), true, at(12, 0, 1), 0, &low(1)).len(), 1);

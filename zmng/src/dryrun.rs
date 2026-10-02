@@ -313,7 +313,7 @@ async fn run(db: &crate::db::Db, ffmpeg: &str, cam: &Camera, stream: &str, start
             continue; // not a frame we can place on the timeline
         }
         sim.feed(dts, &frame[..w * h]);
-        if sim.frames % 25 == 0 {
+        if sim.frames.is_multiple_of(25) {
             let mut v = job.view.write();
             v.frames = sim.frames;
             v.progress = ((dts - start) as f64 / (end - start) as f64).clamp(0.0, 0.99);

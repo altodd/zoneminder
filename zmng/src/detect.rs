@@ -405,7 +405,7 @@ impl MotionDetector {
     /// for a camera without zones).
     pub fn fired_zones(&self) -> Vec<String> {
         let mut f = self.fired.clone();
-        f.sort_by(|a, b| b.1.cmp(&a.1));
+        f.sort_by_key(|z| std::cmp::Reverse(z.1));
         f.into_iter().map(|(z, _)| self.zones[z].name.clone()).filter(|n| !n.is_empty()).collect()
     }
 
