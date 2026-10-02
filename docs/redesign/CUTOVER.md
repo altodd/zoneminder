@@ -137,3 +137,11 @@ sudo -u zmng zmng -c /etc/zmng/zmng.toml doctor        # config, ffmpeg, storage
 systemctl start zmng && journalctl -u zmng -f          # "index opened", reindex count, recorders up
 ```
 Downgrade: stop, put the old binary and web files back, `restore` the backup taken above (`--stopped`), start. Recording gaps are the stop/start window only; segments written by the newer build are re-adopted by the older one as long as the file format did not change (it has not since phase 1).
+
+### Behaviour changes in the feature-parity build (October 2026)
+
+- **Zones stored as bare polygons** (`[[[x,y],…],…]`, the form before named zones) are now separate zones, "Zone 1", "Zone 2", …, each scored on its own pixels against the camera's thresholds. Before, all polygons were scored as one area. A small polygon reaches the camera's minimum changed area with fewer pixels than the union did, so such a camera can fire on smaller movements. Open the camera's **Zones** editor, check the sensitivity per zone with a dry run over last night, and save.
+- **At most 16 zones per camera.** Saving more is refused. A camera stored with more keeps working on its first 16 (the detector logs a warning) until its zones are saved again.
+- **Long-lived tokens from older builds** (10-year sessions) are moved once, at the first start, to Admin → **API tokens** as "token from an earlier version (date)". They keep working and can now be revoked there.
+- **Your own password** is changed under **Account**, which asks for the current one; `PATCH /api/users/{your id}` no longer accepts a password.
+- **Exports** of a range in which a camera's codec settings changed (a resolution change on the camera) contain one file per stretch, "… part 1 of 2.mp4", instead of one fragmented file.
