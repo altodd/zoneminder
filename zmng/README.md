@@ -172,6 +172,24 @@ While the motion detector scores a camera, at most every `interval_secs` the cur
 
 Servers that work: CodeProject.AI (`/v1/vision/detection`, YOLO on CUDA), DeepStack, and `deploy/detector/server.py` — a ~150-line ONNX Runtime server (YOLOv8/YOLO11 ONNX export, CUDA execution provider when present; the Quadro P2200 runs YOLOv8n at ~25 ms) with the same API. On the CPU it is fine for a few cameras (YOLO11s ~0.4 s per frame on the church box at nice 19; see `deploy/detector/README.md`). Object detection failing or absent never affects recording or motion events.
 
+## Alerts to phones (rules, arming, ntfy)
+
+Everything below under *Notifications* is a feed of every event. **Alerts** are the selective part, set up in Admin → Alerts (admins): a rule says
+
+* **when**: people, vehicles, animals (these need the object detector), any motion, a camera that stops recording, storage running low;
+* **where**: all cameras, or chosen cameras and camera groups; optionally only events in which one of the named zones fired;
+* **schedule**: always, or chosen days with a time window (a window that ends before it starts runs past midnight: "nights 10 PM–6 AM", "Sunday services 7 AM–1 PM");
+* **only while armed** (default on) and **at most one alert per camera every** N seconds;
+* **send to**: an **ntfy** topic URL (`https://ntfy.sh/<unguessable-topic>` or your own ntfy server, with an optional access token) — a phone push titled "Front Door: person", with the live picture attached (640 px, from the substream) and, when `public_url` is set in `zmng.toml`, a tap that opens that moment in zmng — or a **webhook** (JSON POST with the rule, title, message, event, link and the picture as base64; optional bearer token).
+
+Each event alerts a rule at most once, on the first notification that matches (an event becomes a "person" event when the detector answers, a second or two after it started). Delivery is retried once after 5 s; the last result shows in the rules table, and **Test** sends a sample through the rule now. Tokens are never sent back to the browser.
+
+**Armed / disarmed** is one switch for the whole system: the header button (admins), `GET/POST /api/arm {"armed": bool}` (admin token for scripts), and an MQTT switch for Home Assistant (`zmng/armed`, commands on `zmng/armed/set`, discovered as *Armed* on the *ZoneMinder NG* device), so the church's alarm panel can arm and disarm it. Changes are announced on the bus (`{"event": "armed", "armed": false, "by": "admin"}`).
+
+API (admins): `GET /api/alerts` (armed state, rules with `token_set`, `last_sent_ms`, `last_error`), `POST /api/alerts/rules`, `PATCH /api/alerts/rules/{id}` (an empty `target_token` keeps the stored one; `"clear_token": true` removes it), `DELETE /api/alerts/rules/{id}`, `POST /api/alerts/rules/{id}/test`.
+
+zmNinjaNg push still needs its FCM relay; ntfy is the phone route until then.
+
 ## Notifications (Home Assistant, ntfy, the UI, zmNinjaNg)
 
 Every event start/end, camera outage/recovery, storage warning and service start is published on an in-process bus and delivered by whichever sinks are configured:

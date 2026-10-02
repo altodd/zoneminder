@@ -3,7 +3,15 @@
 # 1. MQTT (nothing to declare): with [mqtt] configured in zmng.toml every camera is
 #    discovered as a device with binary_sensor.<name>_motion, binary_sensor.<name>_recording,
 #    sensor.<name>_last_event (attributes = the latest event JSON: id, score, kind, objects; thumb once the thumbnail exists)
-#    and camera.<name>_last_event_thumbnail.
+#    and camera.<name>_last_event_thumbnail; plus one switch, switch.zoneminder_ng_armed
+#    (topic zmng/armed, set on zmng/armed/set): alert rules marked "only when armed" send
+#    while it is on. Example: follow the alarm panel.
+# automation:
+#   - alias: zmng armed with the alarm panel
+#     trigger: { platform: state, entity_id: alarm_control_panel.church }
+#     action:
+#       - service: "switch.turn_{{ 'on' if trigger.to_state.state.startswith('armed') else 'off' }}"
+#         target: { entity_id: switch.zoneminder_ng_armed }
 #
 # 2. Pictures. The MQTT camera entity (camera.<name>_last_event_thumbnail) needs no token
 #    and shows the latest event. For live stills the generic camera platform cannot send an

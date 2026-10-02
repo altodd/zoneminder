@@ -1391,6 +1391,7 @@ async function viewAdmin(main) {
     h('div', { class: 'two' },
       h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see the cameras in their groups plus any assigned one by one — nothing until you choose. A camera added to a group is shared with that group\'s users at once.')),
       h('div', { class: 'card' }, h('h2', {}, 'Object detection'), objects)),
+    alertsCard(cams),
     tokensCard(users),
     h('div', { class: 'card' }, h('h2', {}, 'Storage'), h('div', { class: 'tablewrap' }, stor), h('p', { class: 'muted small' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
     h('details', { class: 'card' }, h('summary', {}, 'Diagnostics'), h('p', {}, `This browser — MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL. Live video plays as MSE (H.264 substream) through the app\'s go2rtc player.')));
@@ -1399,6 +1400,114 @@ async function viewAdmin(main) {
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
 const fmtDay = (secs) => (secs ? new Date(secs * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : '—');
 const fmtAgo = (secs) => (secs ? `${fmtDur(Date.now() - secs * 1000)} ago` : 'never');
+
+// Alerts: rules that send pushes to phones (ntfy) or webhooks.
+const TRIGGER_LABELS = [['person', 'People'], ['vehicle', 'Vehicles'], ['animal', 'Animals'], ['motion', 'Any motion'], ['camera_down', 'Camera stops recording'], ['storage_low', 'Storage low']];
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const SCHEDULE_PRESETS = [['Nights 10 PM–6 AM', [0, 1, 2, 3, 4, 5, 6], '22:00', '06:00'], ['Evenings and weekends', [0, 1, 2, 3, 4, 5, 6], '18:00', '07:00'], ['Sunday services 7 AM–1 PM', [0], '07:00', '13:00']];
+const describeSchedule = (s) => (!s ? 'always' : `${s.days.length === 7 ? 'every day' : s.days.map((d) => DAY_NAMES[d]).join(' ')} ${s.from}–${s.to}`);
+const fmtInterval = (s) => (!s ? 'every event' : s < 60 ? `${s} s apart` : s < 3600 ? `${s / 60} min apart` : `${s / 3600} h apart`);
+
+function alertsCard(cams) {
+  const card = h('div', { class: 'card', id: 'alerts' });
+  const draw = async () => {
+    let a;
+    try { a = await api.get('/api/alerts'); } catch (err) { fill(card, h('h2', {}, 'Alerts'), h('p', { class: 'err' }, err.message)); return; }
+    const camNames = (r) => (!r.cameras.length && !r.groups.length ? 'all cameras' : [...r.groups.map((g) => `group ${g}`), ...r.cameras.map((id) => cams.find((c) => c.id === id)?.name || `#${id}`)].join(', '));
+    const rows = a.rules.map((r) => h('tr', { class: r.enabled ? '' : 'muted' },
+      h('td', {}, h('b', {}, r.name), r.enabled ? null : h('span', { class: 'pill' }, 'off')),
+      h('td', {}, r.triggers.map((t) => TRIGGER_LABELS.find(([k]) => k === t)?.[1] || t).join(', '), r.zones.length ? h('div', { class: 'muted small' }, `zones: ${r.zones.join(', ')}`) : null),
+      h('td', {}, camNames(r)), h('td', {}, describeSchedule(r.schedule), r.only_when_armed ? h('div', { class: 'muted small' }, 'when armed') : null),
+      h('td', {}, `${r.target_kind}`, h('div', { class: 'muted small' }, r.target_url.replace(/^https?:\/\//, ''))),
+      h('td', {}, r.last_error ? h('span', { class: 'pill bad', title: r.last_error }, 'failed') : r.last_sent_ms ? fmtAgo(r.last_sent_ms / 1000) : 'never'),
+      h('td', { class: 'actions' },
+        h('button', { class: 'ghost small', onclick: async (e) => { e.target.disabled = true; try { await api.post(`/api/alerts/rules/${r.id}/test`); toast(`Test sent through "${r.name}"`, { kind: 'ok' }); } catch (err) { toast(`Test failed: ${err.message}`, { kind: 'bad', ttl: 15000 }); } e.target.disabled = false; draw(); } }, 'Test'),
+        h('button', { class: 'ghost small', onclick: () => editRule(r, cams, draw) }, 'Edit'),
+        h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete the alert rule "${r.name}"?`)) { await api.del(`/api/alerts/rules/${r.id}`); draw(); } } }, 'Delete'))));
+    fill(card,
+      h('div', { class: 'row' }, h('h2', {}, 'Alerts'), h('span', { class: 'grow' }),
+        h('span', { class: 'pill ' + (a.armed ? 'ok' : '') }, a.armed ? 'armed' : 'disarmed'), h('button', { class: 'ghost small', onclick: async () => { await setArmed(!a.armed); draw(); } }, a.armed ? 'Disarm' : 'Arm')),
+      a.rules.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('tr', {}, h('th', {}, 'Rule'), h('th', {}, 'When'), h('th', {}, 'Cameras'), h('th', {}, 'Schedule'), h('th', {}, 'Send to'), h('th', {}, 'Last sent'), h('th', {}, '')), ...rows))
+        : h('p', { class: 'muted' }, 'No alert rules yet. Every event still goes to MQTT/Home Assistant and the webhook; rules pick what reaches people\'s phones.'),
+      h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { onclick: () => editRule(null, cams, draw) }, '+ Alert rule')),
+      a.public_url ? null : h('p', { class: 'muted small' }, 'Set public_url in zmng.toml (the address people open zmng at) so tapping an alert opens the moment.'),
+      h('p', { class: 'muted small' }, 'Phones: install the ntfy app and subscribe to the rule\'s topic (an unguessable name on ntfy.sh, or your own ntfy server with an access token). Home Assistant: a webhook rule, or arm and disarm with the MQTT "Armed" switch.'));
+  };
+  draw();
+  return card;
+}
+
+function editRule(r, cams, onSaved) {
+  const rule = r ? JSON.parse(JSON.stringify(r)) : { name: '', enabled: true, triggers: ['person'], cameras: [], groups: [], zones: [], schedule: null, only_when_armed: true, min_interval_secs: 60, target_kind: 'ntfy', target_url: '', picture: true, token_set: false };
+  const name = h('input', { value: rule.name, maxlength: 80, placeholder: 'e.g. People at the doors at night' });
+  const enabled = h('input', { type: 'checkbox', checked: rule.enabled });
+  const trig = TRIGGER_LABELS.map(([k, l]) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: k, checked: rule.triggers.includes(k) }), l));
+  const groups = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: rule.groups.some((x) => x.toLowerCase() === g.toLowerCase()), onchange: () => drawZones() }), `group ${g}`));
+  const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id, checked: rule.cameras.includes(c.id), onchange: () => drawZones() }), c.name));
+  const zoneBox = h('div', { class: 'row' });
+  const picked = () => {
+    const gs = groups.filter((b) => $('input', b).checked).map((b) => $('input', b).value.toLowerCase());
+    const ids = camBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value));
+    return !gs.length && !ids.length ? cams : cams.filter((c) => ids.includes(c.id) || groupsOf(c).some((g) => gs.includes(g.toLowerCase())));
+  };
+  let zoneChecks = [];
+  function drawZones() {
+    const kept = new Set([...rule.zones, ...zoneChecks.filter((b) => $('input', b).checked).map((b) => $('input', b).value)].map((z) => z.toLowerCase()));
+    const names = [...new Set(picked().flatMap((c) => parseZonesJson(c.zones_json, 'Zone').map((z) => z.name)))];
+    zoneChecks = names.map((n) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: n, checked: kept.has(n.toLowerCase()) }), n));
+    rule.zones = [];
+    fill(zoneBox, h('span', { class: 'muted small' }, 'Only in zones:'), ...(zoneChecks.length ? zoneChecks : [h('span', { class: 'muted small' }, 'the picked cameras have no named zones (anywhere counts)')]));
+  }
+  drawZones();
+  const sched = rule.schedule || { days: [0, 1, 2, 3, 4, 5, 6], from: '22:00', to: '06:00' };
+  const always = h('input', { type: 'checkbox', checked: !rule.schedule, onchange: () => { schedRow.hidden = always.checked; } });
+  const days = DAY_NAMES.map((d, i) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: i, checked: sched.days.includes(i) }), d));
+  const from = h('input', { type: 'time', value: sched.from, style: 'width:auto' });
+  const to = h('input', { type: 'time', value: sched.to, style: 'width:auto' });
+  const presets = h('select', { style: 'width:auto', onchange: (e) => { const p = SCHEDULE_PRESETS[Number(e.target.value)]; if (!p) return; days.forEach((b, i) => { $('input', b).checked = p[1].includes(i); }); from.value = p[2]; to.value = p[3]; e.target.value = ''; } },
+    h('option', { value: '' }, 'Preset…'), ...SCHEDULE_PRESETS.map(([l], i) => h('option', { value: i }, l)));
+  const schedRow = h('div', { hidden: !!always.checked }, h('div', { class: 'row' }, ...days), h('div', { class: 'row' }, h('label', { class: 'mini' }, 'from', from), h('label', { class: 'mini' }, 'to', to), presets, h('span', { class: 'muted small' }, 'a window that ends before it starts runs past midnight')));
+  const armed = h('input', { type: 'checkbox', checked: rule.only_when_armed });
+  const interval = h('select', { style: 'width:auto' }, ...[0, 30, 60, 300, 900, 3600].map((v) => h('option', { value: v, selected: v === rule.min_interval_secs }, v ? `at most one per camera every ${fmtInterval(v).replace(' apart', '')}` : 'every event')));
+  const kind = h('select', { style: 'width:auto' }, h('option', { value: 'ntfy', selected: rule.target_kind === 'ntfy' }, 'ntfy (phone push)'), h('option', { value: 'webhook', selected: rule.target_kind === 'webhook' }, 'webhook (JSON POST)'));
+  const url = h('input', { value: rule.target_url, placeholder: 'https://ntfy.sh/church-cameras-7f3a', style: 'flex:1;min-width:260px' });
+  const token = h('input', { type: 'password', autocomplete: 'off', placeholder: rule.token_set ? 'set (leave blank to keep)' : 'optional: ntfy access token or bearer token', style: 'width:260px' });
+  const clearTok = rule.token_set ? h('label', { class: 'row check' }, h('input', { type: 'checkbox' }), 'remove the token') : null;
+  const picture = h('input', { type: 'checkbox', checked: rule.picture });
+  const errEl = h('p', { class: 'err' });
+  const save = async () => {
+    errEl.textContent = '';
+    const body = {
+      name: name.value.trim(), enabled: enabled.checked,
+      triggers: trig.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
+      groups: groups.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
+      cameras: camBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value)),
+      zones: zoneChecks.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
+      schedule: always.checked ? null : { days: days.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value)), from: from.value, to: to.value },
+      only_when_armed: armed.checked, min_interval_secs: Number(interval.value),
+      target_kind: kind.value, target_url: url.value.trim(), target_token: token.value, picture: picture.checked, clear_token: !!clearTok && $('input', clearTok).checked,
+    };
+    try {
+      if (r) await api.patch(`/api/alerts/rules/${r.id}`, body); else await api.post('/api/alerts/rules', body);
+      close(); toast(`Saved "${body.name}". Use Test to check it reaches the phones.`, { kind: 'ok' }); onSaved();
+    } catch (err) { errEl.textContent = err.message; }
+  };
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card wide-modal' },
+    h('div', { class: 'row' }, h('h2', {}, r ? `Alert rule: ${r.name}` : 'New alert rule'), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
+    h('fieldset', {}, h('legend', {}, 'Rule'), h('div', { class: 'row' }, name, h('label', { class: 'row check' }, enabled, 'on'))),
+    h('fieldset', {}, h('legend', {}, 'When'), h('div', { class: 'row' }, ...trig),
+      state.me.objects ? null : h('p', { class: 'muted small' }, 'People, vehicles and animals need an object detector ([objects] in zmng.toml); without one only "Any motion" and the system alerts can fire.')),
+    h('fieldset', {}, h('legend', {}, 'Where'), h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'Cameras (none ticked = all):'), ...groups, ...camBoxes), zoneBox),
+    h('fieldset', {}, h('legend', {}, 'Schedule'), h('label', { class: 'row check' }, always, 'Always'), schedRow,
+      h('label', { class: 'row check' }, armed, 'Only while armed (the header\'s Armed switch, or Home Assistant)'), h('div', { class: 'row' }, interval)),
+    h('fieldset', {}, h('legend', {}, 'Send to'), h('div', { class: 'row' }, kind, url), h('div', { class: 'row' }, token, clearTok, h('label', { class: 'row check' }, picture, 'attach the live picture'))),
+    errEl,
+    h('div', { class: 'row sticky-actions' }, h('button', { onclick: save }, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Cancel'))));
+  const close = () => modal.remove();
+  closeOnEscape(modal, close);
+  document.body.append(modal);
+  setTimeout(() => name.focus(), 50);
+}
 
 // API tokens: a table (with revoke) of `list`; `onChange` redraws after a revoke.
 function tokenTable(list, onChange, { showUser = true } = {}) {
@@ -1694,6 +1803,15 @@ $('#login-form').addEventListener('submit', async (e) => {
 });
 $('#logout').addEventListener('click', async () => { await api.post('/api/logout'); location.reload(); });
 $('#account').addEventListener('click', () => { if (state.me?.user) showAccount(); });
+// Armed / disarmed: alert rules marked "only when armed" send while armed
+const drawArmed = () => { const b = $('#armed'); b.textContent = state.me?.armed ? '● Armed' : '○ Disarmed'; b.classList.toggle('armed', !!state.me?.armed); };
+async function setArmed(on) {
+  try { const r = await api.post('/api/arm', { armed: on }); state.me.armed = r.armed; drawArmed(); toast(on ? 'Armed: "only when armed" alerts are on' : 'Disarmed: "only when armed" alerts are off', { kind: 'ok' }); } catch (err) { toast(err.message, { kind: 'bad' }); }
+}
+$('#armed').addEventListener('click', () => {
+  const on = !state.me.armed;
+  if (confirm(on ? 'Arm? Alert rules marked "only when armed" will send alerts.' : 'Disarm? Alert rules marked "only when armed" stop sending until someone arms again.')) setArmed(on);
+});
 setInterval(() => { $('#clock').textContent = new Date().toLocaleString(); }, 1000);
 
 // ---------------------------------------------------------------------------
@@ -1718,6 +1836,7 @@ function listen() {
   sse.addEventListener('camera_down', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: not recording`, { kind: 'bad', ttl: 30000 }); });
   sse.addEventListener('camera_up', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: recording again`, { kind: 'ok' }); });
   sse.addEventListener('storage_low', (m) => { const e = JSON.parse(m.data); toast(`Storage ${e.path} low: ${gb(e.free_bytes)} free`, { kind: 'bad', ttl: 30000 }); });
+  sse.addEventListener('armed', (m) => { const e = JSON.parse(m.data); if (state.me) { state.me.armed = e.armed; drawArmed(); } if (e.by !== state.me?.user?.username) toast(`${e.armed ? 'Armed' : 'Disarmed'} by ${e.by}`); });
 }
 
 async function boot() {
@@ -1729,6 +1848,7 @@ async function boot() {
   }
   document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = state.me.user.role !== 'admin'; });
   $('#account').textContent = state.me.user.username;
+  drawArmed();
   listen();
   route();
 }

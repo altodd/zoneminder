@@ -87,6 +87,8 @@ pub enum Notification {
     #[serde(skip)]
     EventThumbnail { event_id: i64, camera_id: i64, jpeg: Bytes },
     StorageLow { storage_id: i64, path: String, free_bytes: u64, reserve_bytes: u64 },
+    /// The system was armed or disarmed (alert rules marked "only when armed").
+    Armed { armed: bool, by: String },
 }
 
 impl Notification {
@@ -95,7 +97,7 @@ impl Notification {
             Notification::CameraDown { camera_id, .. } | Notification::CameraUp { camera_id, .. } => Some(*camera_id),
             Notification::EventStart(e) | Notification::EventUpdate(e) | Notification::EventEnd(e) => Some(e.camera_id),
             Notification::EventThumbnail { camera_id, .. } => Some(*camera_id),
-            Notification::ServiceStarted { .. } | Notification::StorageLow { .. } => None,
+            Notification::ServiceStarted { .. } | Notification::StorageLow { .. } | Notification::Armed { .. } => None,
         }
     }
     /// Short snake_case name of the variant (the `event` key).
@@ -109,6 +111,7 @@ impl Notification {
             Notification::EventEnd(_) => "event_end",
             Notification::EventThumbnail { .. } => "event_thumbnail",
             Notification::StorageLow { .. } => "storage_low",
+            Notification::Armed { .. } => "armed",
         }
     }
     /// True for notifications that carry a JSON body worth delivering
@@ -247,6 +250,28 @@ impl<'a> MqttTopics<'a> {
     pub fn camera(&self, id: i64, leaf: &str) -> String {
         format!("{}/camera/{id}/{leaf}", self.cfg.topic_prefix)
     }
+    /// Armed state (retained ON/OFF) and the topic Home Assistant sets it on.
+    pub fn armed(&self) -> String {
+        format!("{}/armed", self.cfg.topic_prefix)
+    }
+    pub fn armed_set(&self) -> String {
+        format!("{}/armed/set", self.cfg.topic_prefix)
+    }
+    /// Discovery for the system-wide "Armed" switch (one device: the server).
+    pub fn discovery_armed(&self) -> Option<(String, serde_json::Value)> {
+        if self.cfg.discovery_prefix.is_empty() {
+            return None;
+        }
+        Some((
+            format!("{}/switch/zmng_armed/config", self.cfg.discovery_prefix),
+            serde_json::json!({
+                "name": "Armed", "unique_id": "zmng_armed", "icon": "mdi:shield-home",
+                "state_topic": self.armed(), "command_topic": self.armed_set(), "payload_on": "ON", "payload_off": "OFF",
+                "availability": [{"topic": self.status()}],
+                "device": {"identifiers": ["zmng_server"], "name": "ZoneMinder NG", "manufacturer": "ZoneMinder NG", "model": "server"},
+            }),
+        ))
+    }
     /// Home Assistant discovery messages for one camera: (topic, retained JSON).
     pub fn discovery(&self, cam: &Camera) -> Vec<(String, serde_json::Value)> {
         if self.cfg.discovery_prefix.is_empty() {
@@ -318,6 +343,7 @@ pub fn mqtt_messages(cfg: &MqttConfig, n: &Notification) -> Vec<(String, bool, V
         ],
         Notification::EventThumbnail { camera_id, jpeg, .. } => vec![(t.camera(*camera_id, "thumbnail"), true, jpeg.to_vec())],
         Notification::StorageLow { .. } => vec![(format!("{}/storage", cfg.topic_prefix), false, json(n))],
+        Notification::Armed { armed, .. } => vec![(t.armed(), true, if *armed { b"ON".to_vec() } else { b"OFF".to_vec() })],
     }
 }
 
@@ -336,7 +362,7 @@ const MQTT_QUEUE: usize = 4096;
 /// and is dropped with a warning when the queue is full; while disconnected
 /// nothing is queued at all, because state topics are republished from the
 /// database and the recorders on the next ConnAck anyway.
-pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: MqttConfig, hub: Arc<crate::recorder::LiveHub>) {
+pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: MqttConfig, hub: Arc<crate::recorder::LiveHub>, bus: Arc<Bus>) {
     use rumqttc::{AsyncClient, Event as MEvent, Incoming, LastWill, MqttOptions, QoS};
     let t = MqttTopics { cfg: &cfg };
     let client_id = if cfg.client_id.trim().is_empty() { "zmng".to_string() } else { cfg.client_id.trim().to_string() };
@@ -361,7 +387,14 @@ pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: M
                 Ok(MEvent::Incoming(Incoming::ConnAck(_))) => {
                     connected = true;
                     info!(host = %cfg.host, port = cfg.port, "mqtt connected");
+                    if let Err(e) = client.try_subscribe(t.armed_set(), QoS::AtLeastOnce) {
+                        warn!("mqtt subscribe {}: {e}", t.armed_set());
+                    }
                     let mut msgs = vec![(t.status(), true, b"online".to_vec())];
+                    if let Some((topic, v)) = t.discovery_armed() {
+                        msgs.push((topic, true, serde_json::to_vec(&v).unwrap_or_default()));
+                    }
+                    msgs.push((t.armed(), true, if db.armed().unwrap_or(true) { b"ON".to_vec() } else { b"OFF".to_vec() }));
                     for cam in db.cameras().unwrap_or_default().into_iter().filter(|c| c.enabled) {
                         for (topic, v) in t.discovery(&cam) {
                             msgs.push((topic, true, serde_json::to_vec(&v).unwrap_or_default()));
@@ -371,6 +404,24 @@ pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: M
                         msgs.push((t.camera(cam.id, "motion"), true, b"OFF".to_vec()));
                     }
                     publish(&client, msgs);
+                }
+                // Home Assistant's "Armed" switch
+                Ok(MEvent::Incoming(Incoming::Publish(p))) if p.topic == t.armed_set() => {
+                    let want = match p.payload.as_ref() {
+                        b"ON" | b"on" | b"1" | b"true" => Some(true),
+                        b"OFF" | b"off" | b"0" | b"false" => Some(false),
+                        _ => None,
+                    };
+                    match want {
+                        Some(armed) => match db.set_armed(armed) {
+                            Ok(()) => {
+                                info!(armed, "armed state set over MQTT");
+                                bus.publish(Notification::Armed { armed, by: "mqtt".into() });
+                            }
+                            Err(e) => warn!("mqtt armed: {e:#}"),
+                        },
+                        None => warn!(payload = ?p.payload, "mqtt armed/set: expected ON or OFF"),
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {

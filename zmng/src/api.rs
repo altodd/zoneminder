@@ -368,6 +368,7 @@ async fn me(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> 
         "transcode": app.transcoder.is_some(),
         "objects": app.hub.objects.read().is_some(),
         "peers": app.cfg.peers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        "armed": app.db.armed().unwrap_or(true),
     }))
     .into_response())
 }
@@ -885,6 +886,104 @@ async fn dryrun_cancel(State(app): State<App>, Path(job): Path<String>, user: Op
         *j.finished_ms.write() = Some(crate::db::now_dts() / 90);
     }
     Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// alerts and arming (see alerts.rs)
+// ---------------------------------------------------------------------------
+
+/// A rule as the browser sees it: the token is never sent back.
+fn rule_json(r: &crate::alerts::Rule, sent: Option<i64>, err: Option<String>) -> serde_json::Value {
+    let mut v = serde_json::to_value(r).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("target_token");
+        o.insert("token_set".into(), serde_json::json!(!r.target_token.trim().is_empty()));
+        o.insert("last_sent_ms".into(), serde_json::json!(sent));
+        o.insert("last_error".into(), serde_json::json!(err));
+    }
+    v
+}
+
+async fn alerts_list(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let rules: Vec<serde_json::Value> = app.db.alert_rules().map_err(err500)?.into_iter().map(|(r, s, e)| rule_json(&r, s, e)).collect();
+    Ok(Json(serde_json::json!({"armed": app.db.armed().map_err(err500)?, "public_url": app.cfg.public_url, "triggers": crate::alerts::TRIGGERS, "rules": rules})).into_response())
+}
+
+#[derive(Deserialize)]
+struct RuleReq {
+    #[serde(flatten)]
+    rule: crate::alerts::Rule,
+    /// remove the stored token (an empty `target_token` keeps it)
+    #[serde(default)]
+    clear_token: bool,
+}
+
+async fn alert_rule_create(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<RuleReq>) -> ApiResult {
+    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+    let mut rule = req.rule;
+    rule.id = 0;
+    rule.validate().map_err(bad)?;
+    let id = app.db.save_alert_rule(&rule).map_err(err500)?;
+    rule.id = id;
+    info!(by = %u.username, rule = %rule.name, "alert rule created");
+    Ok(Json(rule_json(&rule, None, None)).into_response())
+}
+
+async fn alert_rule_update(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<RuleReq>) -> ApiResult {
+    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+    let old = app.db.alert_rule(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such rule").into_response())?;
+    let mut rule = req.rule;
+    rule.id = id;
+    if rule.target_token.trim().is_empty() && !req.clear_token {
+        rule.target_token = old.target_token;
+    }
+    rule.validate().map_err(bad)?;
+    app.db.save_alert_rule(&rule).map_err(err500)?;
+    info!(by = %u.username, rule = %rule.name, "alert rule changed");
+    Ok(Json(rule_json(&rule, None, None)).into_response())
+}
+
+async fn alert_rule_delete(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    if !app.db.delete_alert_rule(id).map_err(err500)? {
+        return Err((StatusCode::NOT_FOUND, "no such rule").into_response());
+    }
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+/// Send a test alert through a rule's destination now (picture included).
+async fn alert_rule_test(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let rule = app.db.alert_rule(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such rule").into_response())?;
+    let cams = app.db.cameras().map_err(err500)?;
+    let cam = cams.iter().find(|c| rule.cameras.contains(&c.id) || c.tags.split(',').map(str::trim).any(|t| rule.groups.iter().any(|g| g.eq_ignore_ascii_case(t)))).or(cams.first());
+    let a = crate::alerts::Alert {
+        rule_id: id, trigger: "test".into(), title: format!("Test: {}", rule.name),
+        message: format!("This is how \"{}\" alerts arrive{}.", rule.name, cam.map(|c| format!(" (picture: {})", c.name)).unwrap_or_default()),
+        tags: vec!["white_check_mark".into()], priority: 3, camera_id: cam.map(|c| c.id), event_id: None, open: Some("#/live".into()), event: None,
+    };
+    crate::alerts::deliver(&app, &rule, &a).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("{e:#}")}))).into_response())?;
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+#[derive(Deserialize)]
+struct ArmReq {
+    armed: bool,
+}
+
+async fn arm_get(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require(user.as_ref().map(|e| &e.0))?;
+    Ok(Json(serde_json::json!({"armed": app.db.armed().map_err(err500)?})).into_response())
+}
+
+/// Arm or disarm (admins; Home Assistant uses an admin token or the MQTT switch).
+async fn arm_set(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<ArmReq>) -> ApiResult {
+    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+    app.db.set_armed(req.armed).map_err(err500)?;
+    info!(armed = req.armed, by = %u.username, "armed state changed");
+    app.bus.publish(crate::notify::Notification::Armed { armed: req.armed, by: u.username.clone() });
+    Ok(Json(serde_json::json!({"armed": req.armed})).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1865,6 +1964,11 @@ pub fn router(app: App) -> Router {
         .route("/api/cameras/{id}/analysis", get(analysis_stream))
         .route("/api/cameras/{id}/dryrun", post(dryrun_start))
         .route("/api/dryrun/{job}", get(dryrun_get).delete(dryrun_cancel))
+        .route("/api/alerts", get(alerts_list))
+        .route("/api/alerts/rules", post(alert_rule_create))
+        .route("/api/alerts/rules/{id}", axum::routing::patch(alert_rule_update).delete(alert_rule_delete))
+        .route("/api/alerts/rules/{id}/test", post(alert_rule_test))
+        .route("/api/arm", get(arm_get).post(arm_set))
         .route("/api/export.json", get(export_preview))
         .route("/api/export.zip", get(export_zip))
         .route("/api/cameras/{id}/video.mp4", get(video_range))
@@ -1909,6 +2013,7 @@ pub fn router(app: App) -> Router {
 pub async fn serve(cfg: Config, db: Db, hub: Arc<LiveHub>, bus: Arc<crate::notify::Bus>) -> Result<()> {
     let listen = cfg.listen.clone();
     let app = App::new(cfg, db, hub, bus);
+    tokio::spawn(crate::alerts::run(app.clone(), app.bus.subscribe()));
     if app.db.user_count()? == 0 {
         info!("no users yet: open the UI and create the first admin with setup token {}", app.setup_token);
     }

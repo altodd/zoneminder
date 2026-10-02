@@ -172,6 +172,14 @@ CREATE TABLE IF NOT EXISTS session (
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+-- alert rules (see alerts.rs): the rule as JSON, and the last delivery
+CREATE TABLE IF NOT EXISTS alert_rule (
+  id           INTEGER PRIMARY KEY,
+  rule_json    TEXT NOT NULL,
+  last_sent_ms INTEGER,
+  last_error   TEXT,
+  created_at   INTEGER NOT NULL
+);
 -- long-lived credentials for Home Assistant, federation peers and scripts;
 -- the token is shown once and only its SHA-256 is kept
 CREATE TABLE IF NOT EXISTS api_token (
@@ -1671,6 +1679,65 @@ impl Db {
                 Ok(ApiToken { id: r.get(0)?, user_id: r.get(1)?, username: r.get(2)?, name: r.get(3)?, hint: r.get(4)?, created_at: r.get(5)?, created_by: r.get(6)?, expires_at: r.get(7)?, last_used_at: r.get(8)? })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    // ----- alerts --------------------------------------------------------------
+
+    /// Alert rules with their last delivery time (ms) and error.
+    pub fn alert_rules(&self) -> Result<Vec<(crate::alerts::Rule, Option<i64>, Option<String>)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id, rule_json, last_sent_ms, last_error FROM alert_rule ORDER BY id")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<String>>(3)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, json, sent, err) = row?;
+                let mut rule: crate::alerts::Rule = serde_json::from_str(&json).unwrap_or_default();
+                rule.id = id;
+                out.push((rule, sent, err));
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn alert_rule(&self, id: i64) -> Result<Option<crate::alerts::Rule>> {
+        Ok(self.alert_rules()?.into_iter().map(|(r, _, _)| r).find(|r| r.id == id))
+    }
+
+    /// Insert (id 0) or replace a rule; returns its id.
+    pub fn save_alert_rule(&self, rule: &crate::alerts::Rule) -> Result<i64> {
+        let json = serde_json::to_string(rule)?;
+        self.with(|c| {
+            if rule.id == 0 {
+                c.execute("INSERT INTO alert_rule(rule_json, created_at) VALUES(?1, ?2)", params![json, now_secs()])?;
+                Ok(c.last_insert_rowid())
+            } else {
+                anyhow::ensure!(c.execute("UPDATE alert_rule SET rule_json=?1 WHERE id=?2", params![json, rule.id])? == 1, "no such rule");
+                Ok(rule.id)
+            }
+        })
+    }
+
+    pub fn delete_alert_rule(&self, id: i64) -> Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM alert_rule WHERE id=?1", params![id])? > 0))
+    }
+
+    pub fn set_alert_result(&self, id: i64, sent_ms: i64, error: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE alert_rule SET last_sent_ms=?1, last_error=?2 WHERE id=?3", params![sent_ms, error, id])?;
+            Ok(())
+        })
+    }
+
+    /// Armed: rules marked "only when armed" send alerts. Default armed.
+    pub fn armed(&self) -> Result<bool> {
+        self.with(|c| Ok(c.query_row("SELECT value FROM meta WHERE key='armed'", [], |r| r.get::<_, String>(0)).optional()?.is_none_or(|v| v != "0")))
+    }
+
+    pub fn set_armed(&self, armed: bool) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT INTO meta(key,value) VALUES('armed', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![if armed { "1" } else { "0" }])?;
+            Ok(())
         })
     }
 

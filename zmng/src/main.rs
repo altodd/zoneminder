@@ -267,7 +267,7 @@ fn run(cfg: config::Config) -> Result<()> {
             tokio::spawn(notify::webhook_sink(bus.subscribe(), url));
         }
         if let Some(m) = cfg.mqtt.clone() {
-            tokio::spawn(notify::mqtt_sink(bus.subscribe(), db.clone(), m, hub.clone()));
+            tokio::spawn(notify::mqtt_sink(bus.subscribe(), db.clone(), m, hub.clone(), bus.clone()));
         }
         bus.publish(notify::Notification::ServiceStarted { version: env!("CARGO_PKG_VERSION").into() });
         let rctx = Arc::new(recorder::RecorderCtx {

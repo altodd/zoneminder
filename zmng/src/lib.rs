@@ -2,6 +2,7 @@
 //! these modules; integration tests in `tests/` use them directly.
 #![recursion_limit = "512"]
 
+pub mod alerts;
 pub mod api;
 pub mod config;
 pub mod db;

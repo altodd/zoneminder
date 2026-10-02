@@ -967,6 +967,8 @@ impl EventState {
                     self.frames = 1;
                     h.status.write().in_event = Some(id);
                     ctx.db.update_event_progress(id, score, dts)?;
+                    // the zones that fired are known now: alert rules for a zone can act on the start
+                    ctx.db.update_event_objects(id, "motion", &self.meta().to_string())?;
                     self.announced = !cam.require_object;
                     if self.announced {
                         ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventStart);

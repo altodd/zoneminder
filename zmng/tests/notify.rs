@@ -103,7 +103,7 @@ async fn mqtt_sink_publishes_discovery_and_motion_state() {
     let fx = Fixture::new();
     let cam = fx.add_camera("front");
     let cfg = zmng::notify::MqttConfig { host: "127.0.0.1".into(), port: broker.port, ..Default::default() };
-    tokio::spawn(zmng::notify::mqtt_sink(fx.bus.subscribe(), fx.db.clone(), cfg, fx.hub.clone()));
+    tokio::spawn(zmng::notify::mqtt_sink(fx.bus.subscribe(), fx.db.clone(), cfg, fx.hub.clone(), fx.bus.clone()));
     let st = broker.wait_for("zmng/status", 5).await;
     assert_eq!(st.payload, b"online");
     assert!(st.retain);
@@ -143,7 +143,7 @@ async fn mqtt_sink_survives_a_large_fleet_and_a_broker_outage() {
     let port = l.local_addr().unwrap().port();
     drop(l);
     let cfg = zmng::notify::MqttConfig { host: "127.0.0.1".into(), port, client_id: " ".into(), ..Default::default() };
-    let sink = tokio::spawn(zmng::notify::mqtt_sink(fx.bus.subscribe(), fx.db.clone(), cfg, fx.hub.clone()));
+    let sink = tokio::spawn(zmng::notify::mqtt_sink(fx.bus.subscribe(), fx.db.clone(), cfg, fx.hub.clone(), fx.bus.clone()));
     // broker down: flood the sink far past any queue size
     for i in 0..300 {
         fx.bus.publish(Notification::CameraDown { camera_id: cams[i % 25], name: "x".into() });

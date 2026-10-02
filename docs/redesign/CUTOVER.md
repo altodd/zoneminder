@@ -31,7 +31,8 @@ web_dir   = "/usr/local/share/zmng"
 thumb_dir = "/media/zmoverflow/zmng-thumbs"   # see the sizing note below
 backup_dir = "/media/zmoverflow/zmng-backups"   # daily VACUUM INTO on the *other* volume
 secure_cookies = true                    # behind HTTPS
-alert_webhook = "https://ntfy.sh/…"      # or Home Assistant's /api/webhook/<id>
+public_url = "https://security.church.example"   # alerts link to the moment with it
+alert_webhook = "https://ha.local:8123/api/webhook/<id>"   # optional raw feed of every event (automations), not for phones
 [mqtt]
 host = "10.10.100.5"
 username = "zmng"
@@ -91,6 +92,8 @@ The files are not touched; each event becomes a legacy segment (timestamps shift
 * MQTT discovery creates one device per camera (Motion, Recording, Last event, Last event thumbnail) as soon as `[mqtt]` is configured; nothing to add in HA.
 * Live images: `camera: platform: generic` on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<token>` with a token from `Admin → API tokens` that acts as a viewer limited to those cameras (revocable there). HA's generic camera cannot send a bearer header, so the token goes in the query string (the URL lives in HA's config only; the snapshot is decoded from the substream unless `stream=main` is added).
 * Automations: trigger on `binary_sensor.<camera>_motion` or the `zmng/camera/<id>/event` topic (payload = the event JSON); or point `alert_webhook` at an HA webhook trigger.
+* Phones: alert rules (Admin → Alerts), not `alert_webhook`. Typical set: *People at the doors at night* (People, group Doors, nights, only when armed, ntfy with picture), *Camera stops recording* and *Storage low* (always, to the volunteers who look after the server). Each phone installs the ntfy app and subscribes to the topic. Press **Test** on each rule before relying on it.
+* Arming: the header's Armed switch, `POST /api/arm {"armed": false}` with an admin token, or the MQTT switch `switch.zoneminder_ng_armed` (e.g. disarm with the alarm panel when the building is open, arm when it is locked).
 * Health: `sensor` on `/api/status` or scrape `/api/metrics` with Prometheus/Grafana.
 
 ## 6. Parallel run checklist (one week, all 23 cameras)

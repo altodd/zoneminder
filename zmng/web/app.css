@@ -267,3 +267,7 @@ label.mini { font-size: 11px; color: var(--muted); display: inline-flex; gap: 4p
 .dryrun progress { width: 180px; }
 .dryevents { max-height: 220px; overflow: auto; }
 button.ghost.on { color: var(--text); border-color: var(--accent); }
+
+/* alerts */
+#armed.armed { color: var(--ok); border-color: var(--ok); }
+tr.muted td { color: var(--muted); }
