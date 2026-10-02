@@ -12,6 +12,21 @@
 
 **Weighting.** Each gap is weighted by what this site uses: 23 fixed Hikvision RTSP cameras, the CBA guest group over Tailscale, Home Assistant, and volunteers rather than staff admins. That is why the ranking differs from a plain feature count.
 
+## Status (2026-10-02)
+
+Built on `redesign` after this review, with Aaron's decisions (CBA guests keep access to recordings, so no live-only role; tokens and self-service passwords pulled forward from P2):
+
+| Item | Done in |
+|---|---|
+| P1 #6 zmNinjaNg calls that answered "OK" but did nothing | `fix(zmng): zmNinjaNg alarm state, zones and detection picture; refuse what zmng cannot do` |
+| P2 #12 tokens per user, listed, revocable, expiring; P2 #13 own password | `feat(zmng): per-user API tokens with list and revoke; users change their own password` |
+| P1 #3 export of a range and several cameras with a manifest | `feat(zmng): export a range of several cameras as a ZIP with a manifest and checksums` |
+| P1 #1 zone editor, per-zone sensitivity, zone names on events | `feat(zmng): zone editor, per-zone sensitivity and zone names on events` |
+| P1 #2 live detector view and dry runs over recorded video | `feat(zmng): live motion view and dry runs of zone settings over recorded video` (also fixed the live detector's timestamps) |
+| P1 #4 push route (ntfy), P1 #5 rules, schedules, arming | `feat(zmng): alert rules with schedules and arming, ntfy push with the live picture` |
+
+Still open from this review: the rest of P2 (manual events, digital zoom, stream quality choice, event list workflow, operator role, retention by kind and offsite copy, live wall extras, recording-gap report) and P3.
+
 ## Verdict
 
 The core NVR is at parity with ZoneMinder or ahead of it: recording, playback, multi-camera review, events, storage and retention, health, groups and permissions, several servers, object detection, and Home Assistant. Most of what ZoneMinder has that zmng does not is either not used here or replaced on purpose (listed at the end).

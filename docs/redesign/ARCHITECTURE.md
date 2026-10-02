@@ -278,3 +278,17 @@ The three reports in `reviews/08–10` were run on the finished phase-3 tree. Ev
 
 **Deferred (design decisions for the VM week, not code fixes):** imported ZoneMinder events longer than 4 h are not split at import (the bounded range queries assume `MAX_SPAN`; `import.rs` should split or refuse them); per-user peer ACLs / `operator` role (today: one ACL per site, the peer token should be a viewer); preview store byte budget (documented sizing instead); transcode `-hwaccel cuda` and a doctor encoder check (needs the P2200); supervisor split with `WatchdogSec`/`sd_notify`; per-IP login limiter; streamed `segment_file`; module splits (`auth.rs`, `ffmpeg.rs`, `supervisor.rs`); HLS `EXT-X-MAP` per segment; PNG PWA icons; the fake RTSP server for recorder tests.
 
+## 11. Feature parity round (2026-10-01/02)
+
+`reviews/12-feature-parity-review.md` compared zmng with ZoneMinder 1.39 and zmNinjaNg 2.6. Its P1 items, plus per-user tokens and self-service passwords, were built the next day; each landed as one commit with tests (suite 106 → 141 tests) and was exercised on a local stack (mediamtx publishing two synthetic RTSP cameras, zmng recording them, Playwright driving the UI).
+
+| Area | What changed | Where |
+|---|---|---|
+| zmNinjaNg honesty | Alarm state from the detector (Live Activity works), forced alarms and run states refused in ZoneMinder's error shapes, monitor settings mapped (Enabled/Capturing/Function None-Mocord) or refused by name, zones served, `objdetect` picture with boxes, admins get `Control` | `zmapi.rs`, `objects::draw_boxes` |
+| Tokens and passwords | `api_token` table (named, per user, optional expiry, last use, stored as SHA-256, `zmng_` prefix), legacy 10-year sessions migrated, list/revoke; `POST /api/me/password`; a password reset ends that user's sign-ins | `db.rs`, `api.rs` |
+| Export | One ZIP per request: progressive MP4 per camera built from the fragments' `moof`s (no re-encode; gaps held), fragmented fallback, `manifest.json`, `SHA256SUMS`, README; streaming ZIP64 writer whose dry run gives the exact `Content-Length` | `export.rs`, `mp4::progressive_head` |
+| Zones | Named zones with per-zone minimum area and object size; the detector scores each zone on its own pixels (bit per zone per pixel); events record the zones that fired; editor over the camera picture; `?zone=` filter | `zones.rs`, `detect.rs` |
+| Tuning | Live analysis over SSE (changed cells, per-zone meters) only while watched; dry runs replay up to 12 h of recorded substream through unsaved settings with the live event rules | `detect.rs`, `dryrun.rs` |
+| Detector timestamps | The recorder-fed detector never had absolute frame times (ffmpeg rebased to 0 and `pts_time` has six significant digits); now `-copyts` and the integer `pts` with the time base: scores line up with the fragments | `detect::ShowinfoClock` |
+| Alerts | Rules (triggers incl. camera down / storage low, cameras/groups, zones, schedule across midnight, only-when-armed, per-camera interval) to ntfy (live picture, tap opens the moment via `public_url`) or webhooks; system-wide arming (header, `/api/arm`, MQTT switch for HA) | `alerts.rs`, `notify.rs` |
+
