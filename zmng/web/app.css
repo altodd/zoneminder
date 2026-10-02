@@ -226,3 +226,23 @@ a.button { display: inline-block; padding: 7px 12px; border-radius: 6px; backgro
 a.button.disabled { opacity: .45; pointer-events: none; }
 .export-summary { margin: 8px 0; }
 .export-summary table td { white-space: nowrap; }
+
+/* zone editor */
+.modal .card.zone-modal { width: min(1280px, 100%); }
+.zeditor { display: grid; grid-template-columns: minmax(0, 3fr) minmax(260px, 1fr); gap: 12px; margin-top: 10px; align-items: start; }
+@media (max-width: 860px) { .zeditor { grid-template-columns: 1fr; } }
+.zstage { position: relative; background: #000; border-radius: 6px; overflow: hidden; touch-action: none; user-select: none; }
+.zstage .zimg { display: block; width: 100%; }
+.zstage .zsvg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.zstage.drawing .zsvg { cursor: crosshair; }
+.zsvg .zone polygon { cursor: move; }
+.zsvg .zvert { fill: #fff; stroke: #0b1220; stroke-width: 3; cursor: grab; }
+.zsvg .zvert.first { fill: #f9b84f; }
+.zsvg .zmid { fill: rgba(255,255,255,.55); stroke: #0b1220; stroke-width: 2; cursor: copy; }
+.zlist { display: grid; gap: 6px; align-content: start; }
+.zrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.zrow.sel { border-color: var(--accent); }
+.zrow .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.zrow input[type=number] { width: 70px; }
+label.mini { font-size: 11px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; margin: 0; }
+.pill.zonepill { color: var(--accent); }

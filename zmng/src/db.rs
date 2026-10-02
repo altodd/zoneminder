@@ -239,7 +239,7 @@ fn validate_camera_field(k: &str, v: &serde_json::Value) -> Result<()> {
         "pre_secs" | "post_secs" | "cooldown_secs" => num(0.0, 600.0)?,
         "zones_json" | "masks_json" => {
             let s = v.as_str().ok_or_else(|| anyhow::anyhow!("{k} must be a JSON string"))?;
-            serde_json::from_str::<Vec<Vec<(f64, f64)>>>(s).map_err(|e| anyhow::anyhow!("{k}: {e}"))?;
+            crate::zones::validate(s, if k == "zones_json" { "zones" } else { "masks" })?;
         }
         _ => {}
     }
@@ -366,6 +366,8 @@ pub struct EventQuery<'a> {
     pub ascending: bool,
     pub kinds: Option<&'a [String]>,
     pub min_motion_secs: Option<f64>,
+    /// events in which one of these zones fired (names, case-insensitive)
+    pub zones: Option<&'a [String]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1192,7 +1194,7 @@ impl Db {
         ascending: bool,
         kinds: Option<&[String]>,
     ) -> Result<Vec<Event>> {
-        self.events_q(&EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs: None })
+        self.events_q(&EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs: None, zones: None })
     }
 
     /// [`events`](Self::events) with every filter, including the minimum
@@ -1200,7 +1202,7 @@ impl Db {
     /// pre/post-roll and quiet time do not count). Events without that
     /// counter (imported from ZoneMinder) always pass.
     pub fn events_q(&self, q: &EventQuery) -> Result<Vec<Event>> {
-        let EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs } = *q;
+        let EventQuery { cameras, start, end, min_score, archived_only, before_id, limit, ascending, kinds, min_motion_secs, zones } = *q;
         let mut sql = String::from("SELECT * FROM event WHERE end_dts IS NOT NULL AND score>=?1");
         let mut args: Vec<rusqlite::types::Value> = vec![(min_score as i64).into()];
         if let Some(m) = min_motion_secs.filter(|m| *m > 0.0) {
@@ -1224,6 +1226,20 @@ impl Db {
             let ph = ph.join(",");
             sql.push_str(&format!(
                 " AND (kind IN ({ph}) OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(event.meta_json) THEN event.meta_json ELSE '{{}}' END, '$.objects') o WHERE lower(json_extract(o.value, '$.label')) IN ({ph})))"
+            ));
+        }
+        if let Some(zs) = zones {
+            if zs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut ph = Vec::new();
+            for z in zs {
+                args.push(z.trim().to_lowercase().into());
+                ph.push(format!("?{}", args.len()));
+            }
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(event.meta_json) THEN event.meta_json ELSE '{{}}' END, '$.zones') z WHERE lower(z.value) IN ({}))",
+                ph.join(",")
             ));
         }
         if let Some(cs) = cameras {

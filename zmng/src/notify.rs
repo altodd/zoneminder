@@ -48,6 +48,9 @@ pub struct EventInfo {
     pub thumb: Option<String>,
     #[serde(default)]
     pub objects: Vec<DetectedObject>,
+    /// zones that fired (cameras with named zones)
+    #[serde(default)]
+    pub zones: Vec<String>,
 }
 
 impl EventInfo {
@@ -62,6 +65,7 @@ impl EventInfo {
             kind: e.kind.clone(),
             thumb: e.thumb_path.as_ref().map(|_| format!("/api/events/{}/thumb.jpg", e.id)),
             objects: Vec::new(),
+            zones: zones_from_meta(e),
         }
     }
 }
@@ -152,6 +156,15 @@ pub fn objects_from_meta(e: &Event) -> Vec<DetectedObject> {
         .ok()
         .and_then(|m| m.get("objects").cloned())
         .and_then(|o| serde_json::from_value(o).ok())
+        .unwrap_or_default()
+}
+
+/// Zones that fired, from `event.meta_json` (`{"zones": [...]}`).
+pub fn zones_from_meta(e: &Event) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(&e.meta_json)
+        .ok()
+        .and_then(|m| m.get("zones").cloned())
+        .and_then(|z| serde_json::from_value(z).ok())
         .unwrap_or_default()
 }
 
@@ -396,7 +409,7 @@ mod tests {
         let n = Notification::CameraDown { camera_id: 3, name: "Back".into() };
         let v = serde_json::to_value(&n).unwrap();
         assert_eq!(v, serde_json::json!({"event": "camera_down", "camera_id": 3, "name": "Back"}));
-        let e = Notification::EventStart(EventInfo { id: 1, camera_id: 7, camera_name: "Front".into(), start_ms: 5, end_ms: None, score: 9, kind: "motion".into(), thumb: None, objects: vec![] });
+        let e = Notification::EventStart(EventInfo { id: 1, camera_id: 7, camera_name: "Front".into(), start_ms: 5, end_ms: None, score: 9, kind: "motion".into(), thumb: None, objects: vec![], zones: vec![] });
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["event"], "event_start");
         assert_eq!(v["camera_name"], "Front");
@@ -423,7 +436,7 @@ mod tests {
     #[test]
     fn mqtt_messages_per_notification() {
         let cfg = MqttConfig::default();
-        let info = EventInfo { id: 1, camera_id: 7, camera_name: "Front".into(), start_ms: 5, end_ms: None, score: 9, kind: "motion".into(), thumb: None, objects: vec![] };
+        let info = EventInfo { id: 1, camera_id: 7, camera_name: "Front".into(), start_ms: 5, end_ms: None, score: 9, kind: "motion".into(), thumb: None, objects: vec![], zones: vec![] };
         let m = mqtt_messages(&cfg, &Notification::EventStart(info.clone()));
         assert_eq!(m[0], ("zmng/camera/7/motion".to_string(), true, b"ON".to_vec()));
         assert_eq!(m[1].0, "zmng/camera/7/event");

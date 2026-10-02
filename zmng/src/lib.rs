@@ -22,3 +22,4 @@ pub mod tier;
 pub mod transcode;
 pub mod video;
 pub mod zmapi;
+pub mod zones;

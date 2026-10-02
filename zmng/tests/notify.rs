@@ -17,7 +17,7 @@ where
 
 fn info(fx: &Fixture, cam: i64, id: i64) -> EventInfo {
     let c = fx.db.camera(cam).unwrap().unwrap();
-    EventInfo { id, camera_id: cam, camera_name: c.name, start_ms: 1_800_000_000_000, end_ms: None, score: 120, kind: "motion".into(), thumb: None, objects: vec![] }
+    EventInfo { id, camera_id: cam, camera_name: c.name, start_ms: 1_800_000_000_000, end_ms: None, score: 120, kind: "motion".into(), thumb: None, objects: vec![], zones: vec![] }
 }
 
 /// Serve the router on a random loopback port (needed for websockets/SSE).

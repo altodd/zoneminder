@@ -443,6 +443,199 @@ function exportDialog({ cams, chosen, start, end }) {
 }
 
 // ---------------------------------------------------------------------------
+// Zone editor: named zones (each with its own sensitivity) and masks, drawn
+// over the camera's picture. Coordinates are 0..1 of the frame.
+// ---------------------------------------------------------------------------
+const SVGNS = 'http://www.w3.org/2000/svg';
+const S = (tag, attrs = {}) => { const el = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v); return el; };
+// sensitivity presets: [min changed area %, min largest object %]; "normal" = the camera's own values
+const SENS = { high: [0.3, 0.1], normal: [null, null], low: [3, 1.5] };
+const ZONE_COLORS = ['#4f9cf9', '#3ddc84', '#f9b84f', '#c38bff', '#4fd1c5', '#ff8fab', '#a3e635', '#fb923c'];
+function parseZonesJson(json, prefix) {
+  let v; try { v = JSON.parse(json || '[]'); } catch { v = []; }
+  if (!Array.isArray(v)) return [];
+  return v.map((z, i) => (Array.isArray(z)
+    ? { name: `${prefix} ${i + 1}`, points: z, min_area_pct: null, min_blob_pct: null }
+    : { name: z.name || `${prefix} ${i + 1}`, points: z.points || [], min_area_pct: z.min_area_pct ?? null, min_blob_pct: z.min_blob_pct ?? null }));
+}
+const sensOf = (z) => Object.entries(SENS).find(([, [a, b]]) => (z.min_area_pct ?? null) === a && (z.min_blob_pct ?? null) === b)?.[0] || 'custom';
+
+// Draw `items` ({name, points, mask}) into an <svg> whose viewBox is
+// 1000 x 1000*aspect; returns per-item groups so callers can add handles.
+function drawZones(svg, items, { aspect, selected = -1, labels = true } = {}) {
+  const VH = 1000 * aspect;
+  svg.setAttribute('viewBox', `0 0 1000 ${VH}`);
+  svg.replaceChildren();
+  let zi = 0;
+  return items.map((z, i) => {
+    const color = z.mask ? '#ff5a5f' : ZONE_COLORS[zi++ % ZONE_COLORS.length];
+    const g = S('g', { class: 'zone' + (i === selected ? ' sel' : '') + (z.mask ? ' mask' : '') });
+    const pts = z.points.map(([x, y]) => `${x * 1000},${y * VH}`).join(' ');
+    g.append(S('polygon', { points: pts, fill: color, 'fill-opacity': z.mask ? 0.32 : i === selected ? 0.28 : 0.16, stroke: color, 'stroke-width': i === selected ? 4 : 2.5, 'stroke-dasharray': z.mask ? '10 6' : '' }));
+    if (labels && z.points.length) {
+      const cx = z.points.reduce((a, p) => a + p[0], 0) / z.points.length * 1000, cy = z.points.reduce((a, p) => a + p[1], 0) / z.points.length * VH;
+      const t = S('text', { x: cx, y: cy, fill: '#fff', 'font-size': 26, 'text-anchor': 'middle', 'dominant-baseline': 'middle', 'paint-order': 'stroke', stroke: '#000', 'stroke-width': 4 });
+      t.textContent = z.mask ? `${z.name} (mask)` : z.name;
+      g.append(t);
+    }
+    svg.append(g);
+    return { g, color };
+  });
+}
+
+function zoneEditor(cam, { onSaved } = {}) {
+  const items = [...parseZonesJson(cam.zones_json, 'Zone').map((z) => ({ ...z, mask: false })), ...parseZonesJson(cam.masks_json, 'Mask').map((z) => ({ ...z, mask: true }))];
+  let sel = items.length ? 0 : -1;
+  let drawing = null; // {mask, points}
+  let drag = null; // {kind: 'vertex'|'move', item, index, from, orig}
+  let dirty = false;
+  let aspect = 9 / 16;
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  const img = h('img', { class: 'zimg', alt: '' });
+  const svg = S('svg', { class: 'zsvg', preserveAspectRatio: 'none' });
+  const stage = h('div', { class: 'zstage' }, img, svg);
+  const list = h('div', { class: 'zlist' });
+  const status = h('span', { class: 'muted small' });
+  const errEl = h('p', { class: 'err' });
+  const loadPicture = () => { img.src = `${camApi(cam)}/snapshot.jpg?width=1280&t=${Date.now()}`; };
+  img.addEventListener('load', () => { if (img.naturalWidth) aspect = img.naturalHeight / img.naturalWidth; render(); });
+  const toPt = (ev) => { const r = svg.getBoundingClientRect(); return [clamp((ev.clientX - r.left) / r.width), clamp((ev.clientY - r.top) / r.height)]; };
+  const near = (a, b) => { const r = svg.getBoundingClientRect(); return Math.hypot((a[0] - b[0]) * r.width, (a[1] - b[1]) * r.height) < 12; };
+  const round = (p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000];
+  const nextName = (mask) => { const base = mask ? 'Mask' : 'Zone'; let n = 1; while (items.some((z) => z.name.toLowerCase() === `${base} ${n}`.toLowerCase())) n++; return `${base} ${n}`; };
+  function startDrawing(mask) {
+    drawing = { mask, points: [] };
+    status.textContent = `Drawing a ${mask ? 'mask' : 'zone'}: click the corners, then click the first point (or press Enter) to close it. Esc cancels.`;
+    render();
+  }
+  function finishDrawing() {
+    if (!drawing) return;
+    if (drawing.points.length >= 3) {
+      items.push({ name: nextName(drawing.mask), points: drawing.points.map(round), mask: drawing.mask, min_area_pct: null, min_blob_pct: null });
+      sel = items.length - 1; dirty = true;
+    }
+    drawing = null; status.textContent = ''; render(); renderList();
+  }
+  function render() {
+    const VH = 1000 * aspect;
+    const groups = drawZones(svg, items, { aspect, selected: sel });
+    // handles on the selected polygon: corners (drag; right-click deletes) and edge midpoints (drag to add a corner)
+    if (sel >= 0 && items[sel] && !drawing) {
+      const z = items[sel];
+      const g = groups[sel].g;
+      z.points.forEach((p, k) => {
+        const q = z.points[(k + 1) % z.points.length];
+        const mid = S('circle', { cx: (p[0] + q[0]) / 2 * 1000, cy: (p[1] + q[1]) / 2 * VH, r: 7, class: 'zmid' });
+        mid.addEventListener('pointerdown', (ev) => { ev.stopPropagation(); z.points.splice(k + 1, 0, [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2]); drag = { kind: 'vertex', item: sel, index: k + 1 }; svg.setPointerCapture(ev.pointerId); dirty = true; render(); });
+        g.append(mid);
+      });
+      z.points.forEach((p, k) => {
+        const c = S('circle', { cx: p[0] * 1000, cy: p[1] * VH, r: 11, class: 'zvert' });
+        c.addEventListener('pointerdown', (ev) => { if (ev.button !== 0) return; ev.stopPropagation(); drag = { kind: 'vertex', item: sel, index: k }; svg.setPointerCapture(ev.pointerId); });
+        c.addEventListener('contextmenu', (ev) => { ev.preventDefault(); if (z.points.length > 3) { z.points.splice(k, 1); dirty = true; render(); } });
+        g.append(c);
+      });
+    }
+    groups.forEach(({ g }, i) => {
+      g.querySelector('polygon').addEventListener('pointerdown', (ev) => {
+        if (drawing || ev.button !== 0) return;
+        ev.stopPropagation();
+        if (sel !== i) { sel = i; render(); renderList(); }
+        drag = { kind: 'move', item: i, from: toPt(ev), orig: items[i].points.map((p) => [...p]) };
+        svg.setPointerCapture(ev.pointerId);
+      });
+    });
+    if (drawing) {
+      const pts = drawing.points;
+      svg.append(S('polyline', { points: pts.map(([x, y]) => `${x * 1000},${y * VH}`).join(' '), fill: 'none', stroke: drawing.mask ? '#ff5a5f' : '#4f9cf9', 'stroke-width': 3 }));
+      pts.forEach((p, k) => svg.append(S('circle', { cx: p[0] * 1000, cy: p[1] * VH, r: k === 0 ? 14 : 8, class: 'zvert' + (k === 0 ? ' first' : '') })));
+    }
+    stage.classList.toggle('drawing', !!drawing);
+  }
+  svg.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    if (drawing) {
+      const p = toPt(ev);
+      if (drawing.points.length >= 3 && near(p, drawing.points[0])) finishDrawing();
+      else { drawing.points.push(p); render(); }
+    }
+  });
+  svg.addEventListener('pointermove', (ev) => {
+    if (!drag) return;
+    const p = toPt(ev); const z = items[drag.item];
+    if (drag.kind === 'vertex') z.points[drag.index] = p;
+    else {
+      // move the whole polygon, kept inside the picture
+      let dx = p[0] - drag.from[0], dy = p[1] - drag.from[1];
+      dx = Math.min(1 - Math.max(...drag.orig.map((q) => q[0])), Math.max(-Math.min(...drag.orig.map((q) => q[0])), dx));
+      dy = Math.min(1 - Math.max(...drag.orig.map((q) => q[1])), Math.max(-Math.min(...drag.orig.map((q) => q[1])), dy));
+      z.points = drag.orig.map((q) => [q[0] + dx, q[1] + dy]);
+    }
+    dirty = true; render();
+  });
+  const endDrag = () => { if (drag) { const z = items[drag.item]; if (z) z.points = z.points.map(round); drag = null; render(); } };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
+  svg.addEventListener('contextmenu', (ev) => ev.preventDefault());
+  function renderList() {
+    const zoneRows = items.map((z, i) => {
+      const name = h('input', { value: z.name, maxlength: 40, style: 'width:140px', oninput: (e) => { z.name = e.target.value.replace(/,/g, ''); dirty = true; render(); } });
+      const custom = h('span', { class: 'row nowrap', hidden: z.mask || sensOf(z) !== 'custom' },
+        h('label', { class: 'mini' }, 'area %', h('input', { type: 'number', step: 0.1, min: 0, max: 100, value: z.min_area_pct ?? cam.min_area_pct, oninput: (e) => { z.min_area_pct = e.target.value === '' ? null : Number(e.target.value); dirty = true; } })),
+        h('label', { class: 'mini' }, 'object %', h('input', { type: 'number', step: 0.1, min: 0, max: 100, value: z.min_blob_pct ?? cam.min_blob_pct, oninput: (e) => { z.min_blob_pct = e.target.value === '' ? null : Number(e.target.value); dirty = true; } })));
+      const sens = z.mask ? h('span', { class: 'muted small' }, 'never analysed') : h('select', { style: 'width:auto', title: 'how much must move here to count as motion', onchange: (e) => {
+        const v = e.target.value; dirty = true;
+        if (v === 'custom') { z.min_area_pct = z.min_area_pct ?? cam.min_area_pct; z.min_blob_pct = z.min_blob_pct ?? cam.min_blob_pct; } else { [z.min_area_pct, z.min_blob_pct] = SENS[v]; }
+        renderList();
+      } }, ...[['high', 'High: small things count'], ['normal', 'Camera default'], ['low', 'Low: only large movement'], ['custom', 'Custom…']].map(([v, l]) => h('option', { value: v, selected: v === sensOf(z) }, l)));
+      return h('div', { class: 'zrow' + (i === sel ? ' sel' : ''), onclick: () => { if (sel !== i) { sel = i; render(); renderList(); } } },
+        h('i', { class: 'swatch', style: `background:${z.mask ? '#ff5a5f' : ZONE_COLORS[items.slice(0, i).filter((x) => !x.mask).length % ZONE_COLORS.length]}` }),
+        name, sens, custom,
+        h('button', { class: 'ghost small', title: `delete ${z.name}`, onclick: (e) => { e.stopPropagation(); items.splice(i, 1); sel = Math.min(sel, items.length - 1); dirty = true; render(); renderList(); } }, '✕'));
+    });
+    fill(list,
+      zoneRows.length ? zoneRows : h('p', { class: 'muted' }, 'No zones: the whole picture is analysed with the camera\'s settings.'),
+      h('p', { class: 'muted small' }, `Camera default: ${cam.min_area_pct}% of a zone changed, the largest moving object ≥ ${cam.min_blob_pct}% (Admin → Cameras → Edit). Events show which zone fired; the Events page can filter by zone.`));
+  }
+  const save = async () => {
+    errEl.textContent = '';
+    const names = items.map((z) => z.name.trim());
+    if (names.some((n) => !n)) { errEl.textContent = 'Every zone and mask needs a name.'; return; }
+    if (new Set(names.map((n) => n.toLowerCase())).size !== names.length) { errEl.textContent = 'Two zones or masks have the same name.'; return; }
+    const clean = (z) => { const o = { name: z.name.trim(), points: z.points.map(round) }; if (!z.mask && z.min_area_pct != null) o.min_area_pct = z.min_area_pct; if (!z.mask && z.min_blob_pct != null) o.min_blob_pct = z.min_blob_pct; return o; };
+    const patch = { zones_json: JSON.stringify(items.filter((z) => !z.mask).map(clean)), masks_json: JSON.stringify(items.filter((z) => z.mask).map(clean)) };
+    try {
+      await api.patch(`/api/cameras/${cam.id}`, patch);
+      Object.assign(cam, patch);
+      const sc = state.cameras.find((x) => !x.peer && x.id === cam.id); if (sc) Object.assign(sc, patch);
+      dirty = false; close(true);
+      toast(`Zones saved for ${cam.name}; the detector uses them within ~30 s`, { kind: 'ok' });
+      onSaved?.();
+    } catch (err) { errEl.textContent = err.message; }
+  };
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card zone-modal' },
+    h('div', { class: 'row' }, h('h2', {}, `Zones — ${cam.name}`), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
+    h('div', { class: 'row' }, h('button', { onclick: () => startDrawing(false) }, '+ Zone'), h('button', { class: 'ghost', onclick: () => startDrawing(true) }, '+ Mask'),
+      h('button', { class: 'ghost', title: 'take a fresh picture', onclick: loadPicture }, '↻ Picture'), status),
+    h('div', { class: 'zeditor' }, stage, list),
+    h('p', { class: 'muted small' }, 'Zones are where motion counts; a camera with zones ignores everything outside them. Masks are never analysed (swaying trees, a road, a screen). Drag a corner to move it, drag the edge dots to add corners, right-click a corner to delete it, drag inside a shape to move it.'),
+    errEl,
+    h('div', { class: 'row sticky-actions' }, h('button', { onclick: save }, 'Save zones'), h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Cancel'))));
+  modal.addEventListener('keydown', (e) => {
+    if (drawing && e.key === 'Escape') { e.stopPropagation(); drawing = null; status.textContent = ''; render(); }
+    else if (drawing && e.key === 'Enter') { e.preventDefault(); finishDrawing(); }
+  });
+  function close(force = false) {
+    if (!force && dirty && !confirm('Discard the changes to these zones?')) return;
+    modal.remove();
+  }
+  closeOnEscape(modal, () => close());
+  document.body.append(modal);
+  loadPicture(); renderList(); render();
+  return { modal };
+}
+
+// ---------------------------------------------------------------------------
 // Live: tile wall. Click a tile for the camera page.
 // ---------------------------------------------------------------------------
 async function viewLive(main) {
@@ -534,7 +727,8 @@ async function viewCamera(main, camId, atMs) {
   const timeLabel = h('span', { class: 'time' });
   const head = h('div', { class: 'toolbar' },
     h('a', { href: '#/live', class: 'muted' }, '◀ all cameras'), h('h2', { style: 'margin:0' }, camLabel(cam)),
-    h('span', { class: 'pill ' + (cam.status?.connected ? 'ok' : 'bad') }, statusText(cam)), h('span', { class: 'grow' }), timeLabel, liveBtn);
+    h('span', { class: 'pill ' + (cam.status?.connected ? 'ok' : 'bad') }, statusText(cam)), h('span', { class: 'grow' }), timeLabel,
+    state.me.user.role === 'admin' && !cam.peer ? h('button', { class: 'ghost', title: 'draw where motion counts, and how much', onclick: () => zoneEditor(cam) }, 'Zones') : null, liveBtn);
   const scrubber = makeScrubber();
   const pl = { cam, video, mse: null };
   let wasPaused = false;
@@ -884,7 +1078,7 @@ async function viewEvents(main) {
   const list = h('div', { class: 'events' });
   const more = h('button', { class: 'ghost' }, 'Load more');
   const count = h('span', { class: 'muted' });
-  const camSel = h('select', { onchange: (e) => { q.camera = e.target.value; localStorage.setItem('evCam', q.camera); load(true); } },
+  const camSel = h('select', { onchange: (e) => { localStorage.setItem('evCam', e.target.value); route(); } },
     h('option', { value: '' }, 'All cameras'), ...allGroups().map((g) => h('option', { value: 'g:' + g, selected: 'g:' + g === q.camera }, `Group: ${g}`)), ...cams.map((c) => h('option', { value: keyOf(c), selected: keyOf(c) === q.camera }, camLabel(c))));
   const minSel = h('select', { onchange: (e) => { q.min_score = Number(e.target.value); localStorage.setItem('evMin', q.min_score); load(true); } },
     ...[[0, 'Any motion'], [60, 'Moderate+'], [120, 'Strong+'], [200, 'Very strong']].map(([v, l]) => h('option', { value: v, selected: v === q.min_score }, l)));
@@ -893,9 +1087,15 @@ async function viewEvents(main) {
   const lenSel = h('select', { title: 'hide short blips: seconds of actual motion', onchange: (e) => { q.min_motion = Number(e.target.value); localStorage.setItem('evLen', q.min_motion); load(true); } },
     ...LENGTHS.map(([v, l]) => h('option', { value: v, selected: v === q.min_motion }, l)));
   const arch = h('label', { class: 'row' }, h('input', { type: 'checkbox', style: 'width:auto', onchange: (e) => { q.archived = e.target.checked; load(true); } }), ' Archived only');
+  // zones belong to one camera: the filter appears when a camera with named zones is picked
+  const oneCam = q.camera && !q.camera.startsWith('g:') ? camById(q.camera) : null;
+  const zoneNames = oneCam && !oneCam.peer ? parseZonesJson(oneCam.zones_json, 'Zone').map((z) => z.name) : [];
+  q.zone = zoneNames.includes(localStorage.getItem('evZone')) ? localStorage.getItem('evZone') : '';
+  const zoneSel = zoneNames.length ? h('select', { title: 'only events in which this zone fired', onchange: (e) => { q.zone = e.target.value; localStorage.setItem('evZone', q.zone); load(true); } },
+    h('option', { value: '' }, 'Any zone'), ...zoneNames.map((n) => h('option', { value: n, selected: n === q.zone }, `Zone: ${n}`))) : null;
   const kindSel = state.me.objects ? h('select', { onchange: (e) => { q.kind = e.target.value; localStorage.setItem('evKind', q.kind); load(true); } },
     ...[['', 'Anything'], ...KINDS.map(([, l, v]) => [v, l]), ['motion', 'Motion only (no object)']].map(([v, l]) => h('option', { value: v, selected: v === q.kind }, l))) : null;
-  fill(main, h('div', { class: 'toolbar' }, camSel, kindSel, minSel, lenSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
+  fill(main, h('div', { class: 'toolbar' }, camSel, zoneSel, kindSel, minSel, lenSel, rangeSel, arch, h('span', { class: 'grow' }), count), list, h('div', { class: 'row', style: 'margin-top:12px' }, more));
   let before = null, total = 0;
   async function load(reset) {
     if (reset) { list.replaceChildren(); before = null; total = 0; }
@@ -914,6 +1114,7 @@ async function viewEvents(main) {
       if (q.kind) p.set('kind', q.kind);
       if (q.archived) p.set('archived', 'true');
       if (q.min_motion) p.set('min_motion', q.min_motion);
+      if (q.zone && !pr) p.set('zone', q.zone);
       if (days) p.set('start', Date.now() - days * 86400000);
       if (before && !pr) p.set('before', before);
       const evs = await api.get(`${apiBase(pr)}/events?${p}`).catch(() => []);
@@ -935,7 +1136,7 @@ function eventCard(ev) {
     h('div', { class: 'thumb', style: ev.thumb ? `background-image:url(${ev.thumb})` : '' }, h('span', { class: 'score' + (ev.score > 120 ? ' hot' : '') }, `${ev.score}`),
       kindClass(ev) !== 'motion' ? h('span', { class: 'kind', style: `background:${KIND_COLOR[kindClass(ev)]}` }, ev.kind) : null),
     h('div', { class: 'meta' }, h('b', {}, cam ? camLabel(cam) : `camera ${ev.camera_id}`), `${fmtDT(ev.start)} · ${ev.end ? fmtDur(ev.end - ev.start) : 'in progress'}${ev.motion_secs != null ? ` · ${ev.motion_secs < 1 ? '<1' : Math.round(ev.motion_secs)} s motion` : ''}`,
-      ev.objects?.length ? h('div', { class: 'labels' }, ...ev.objects.map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`))) : null,
+      ev.objects?.length || ev.zones?.length ? h('div', { class: 'labels' }, ...(ev.objects || []).map((o) => h('span', { class: 'pill ok' }, `${o.label} ${Math.round(o.confidence * 100)}%`)), ...(ev.zones || []).map((z) => h('span', { class: 'pill zonepill', title: 'zone' }, z))) : null,
       ev.notes ? h('div', { class: 'muted' }, ev.notes) : null));
 }
 function openEvent(ev) {
@@ -951,7 +1152,7 @@ function openEvent(ev) {
         h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/camera/${cam ? keyOf(cam) : ev.camera_id}/${ev.peak || ev.start}`; } }, 'Open camera timeline'),
         h('button', { class: 'ghost', onclick: () => { close(); location.hash = `#/review/${ev.peak || ev.start}`; } }, 'Review all cameras at this time'),
         h('a', { class: 'muted', href: `${apiBase(ev.peer)}/cameras/${ev.camera_id}/video.mp4?start=${ev.start}&end=${ev.end || ev.start + 60000}`, download: `event-${ev.id}.mp4`, onclick: (e) => e.stopPropagation() }, 'Download'),
-        h('span', { class: 'muted' }, `peak ${ev.score}${ev.objects?.length ? ' · ' + ev.objects.map((o) => `${o.label} ${Math.round(o.confidence * 100)}%`).join(', ') : ''}`)),
+        h('span', { class: 'muted' }, `peak ${ev.score}${ev.objects?.length ? ' · ' + ev.objects.map((o) => `${o.label} ${Math.round(o.confidence * 100)}%`).join(', ') : ''}${ev.zones?.length ? ` · zone${ev.zones.length > 1 ? 's' : ''} ${ev.zones.join(', ')}` : ''}`)),
       h('label', {}, notes),
       h('button', { class: 'small', onclick: async () => { await api.patch(evApi(ev), { notes: notes.value }); ev.notes = notes.value; } }, 'Save notes')));
   closeOnEscape(modal, () => close());
@@ -1254,7 +1455,10 @@ function editCamera(c) {
     section('Retention', num('retention_days', 'Keep footage (days)'), num('event_retention_days', 'Keep footage with events (days, 0 = same)')),
     section('Motion detection', num('detect_fps', 'Frames per second'), num('pixel_threshold', 'Pixel threshold (0–255)', 'higher = ignores smaller brightness changes'), num('min_area_pct', 'Min changed area %'), num('min_blob_pct', 'Min blob %', 'size of the largest moving object'),
       num('pre_secs', 'Pre-roll (s)'), num('post_secs', 'Post-roll (s)'), num('cooldown_secs', 'Cooldown (s)', 'quiet time before an event ends'), num('detect_width', 'Analysis width'), num('detect_height', 'Analysis height'),
-      text('zones_json', 'Zones JSON', { wide: true, hint: '[[[x,y],…]] in 0..1; empty = whole frame' }), text('masks_json', 'Masks JSON', { wide: true, hint: 'areas to ignore, same format' })),
+      h('div', { class: 'row wide' }, h('button', { type: 'button', class: 'ghost', onclick: () => { close(); zoneEditor(c, { onSaved: () => route() }); } }, 'Edit zones on the picture…'),
+        h('span', { class: 'muted small' }, `${parseZonesJson(c.zones_json, 'Zone').length} zone(s), ${parseZonesJson(c.masks_json, 'Mask').length} mask(s)`)),
+      h('details', { class: 'wide' }, h('summary', { class: 'muted small' }, 'Zones as JSON'),
+        text('zones_json', 'Zones JSON', { wide: true, hint: '[{"name","points":[[x,y],…],"min_area_pct","min_blob_pct"}] in 0..1; empty = whole frame' }), text('masks_json', 'Masks JSON', { wide: true, hint: 'areas never analysed: [{"name","points"}]' }))),
     section('Object detection', h('div', { class: 'wide' }, check('objects', state.me.objects ? 'Detect people, vehicles and animals on motion' : 'Detect objects on motion (no detector configured yet)')), h('div', { class: 'wide' }, check('require_object', 'Only keep events with a detected object')), text('object_labels', 'Labels', { wide: true, ph: 'blank = server default (person, car, truck, bus, motorcycle, bicycle, dog, cat)' })),
     section('ONVIF / PTZ', text('onvif_url', 'ONVIF device URL', { wide: true, ph: 'blank = http://<camera host>/onvif/device_service' }), text('onvif_user', 'ONVIF user', { ph: 'blank = RTSP user' }), text('onvif_pass', 'ONVIF password', { type: 'password', ph: 'blank = keep / RTSP password' }),
       h('div', { class: 'row wide' }, h('span', { class: 'muted small' }, c.ptz ? `PTZ: ${c.ptz_url} profile ${c.ptz_profile}` : 'PTZ: not probed'), h('button', { type: 'button', class: 'ghost small', onclick: async () => { try { const r = await api.post(`/api/cameras/${c.id}/ptz/probe`); errEl.textContent = `PTZ found: ${r.ptz_url} (profile ${r.profile})`; } catch (e) { errEl.textContent = `PTZ probe: ${e.message}`; } } }, 'Probe PTZ (ONVIF)'))),

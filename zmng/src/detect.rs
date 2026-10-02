@@ -200,64 +200,124 @@ impl MotionCells {
     }
 }
 
+/// What the detector needs of one zone.
+#[derive(Clone, Debug)]
+pub struct ZoneSpec {
+    /// empty for the implicit whole-frame zone of a camera without zones
+    pub name: String,
+    pub min_area_pct: f64,
+    pub min_blob_pct: f64,
+}
+
+/// ZoneMinder-style motion detector over one or more zones. Every zone is
+/// scored on its own pixels with its own minimum changed area and minimum
+/// blob, so a doorway can be sensitive while the road behind it is not; a
+/// frame's score is the best zone's. Masks are never analysed.
 pub struct MotionDetector {
     w: usize,
     h: usize,
     reference: Vec<u8>,
-    mask: Vec<u8>, // 1 = analyse, 0 = ignore
-    mask_pixels: usize,
+    /// per pixel: bit z set = pixel belongs to zone z (masks cleared); 0 = ignored
+    zmap: Vec<u16>,
+    zones: Vec<ZoneSpec>,
+    /// pixels per zone (>= 1)
+    zone_px: Vec<usize>,
+    /// per zone, per 8x8 cell: how many of the cell's pixels are in the zone
+    zone_cell_px: Vec<Vec<u8>>,
     threshold: u8,
-    min_area_pct: f64,
-    min_blob_pct: f64,
     frames_seen: u32,
     // block grid (8x8 px) reused between frames
     bw: usize,
     bh: usize,
+    /// changed pixels per cell, all zones together (for `cells`)
     blocks: Vec<u8>,
+    zone_blocks: Vec<Vec<u8>>,
+    zone_changed: Vec<usize>,
+    /// zones that fired on the last frame, with their scores
+    fired: Vec<(usize, u8)>,
 }
 
 impl MotionDetector {
+    /// Bare polygons with the camera's thresholds (tests, older callers).
     pub fn new(w: usize, h: usize, threshold: u8, min_area_pct: f64, min_blob_pct: f64, zones: &[Vec<(f64, f64)>], masks: &[Vec<(f64, f64)>]) -> Self {
-        let mut mask = if zones.is_empty() { vec![1u8; w * h] } else { vec![0u8; w * h] };
-        for z in zones {
-            rasterize(&mut mask, w, h, z, 1);
+        let z: Vec<crate::zones::Zone> = zones.iter().enumerate().map(|(i, p)| crate::zones::Zone { name: format!("Zone {}", i + 1), points: p.clone(), min_area_pct: None, min_blob_pct: None }).collect();
+        let m: Vec<crate::zones::Zone> = masks.iter().map(|p| crate::zones::Zone { name: String::new(), points: p.clone(), min_area_pct: None, min_blob_pct: None }).collect();
+        Self::with_zones(w, h, threshold, min_area_pct, min_blob_pct, &z, &m)
+    }
+
+    /// Named zones, each with its own sensitivity (`None` = the camera's
+    /// `min_area_pct` / `min_blob_pct`). No zones = the whole frame.
+    pub fn with_zones(w: usize, h: usize, threshold: u8, min_area_pct: f64, min_blob_pct: f64, zones: &[crate::zones::Zone], masks: &[crate::zones::Zone]) -> Self {
+        let mut specs: Vec<ZoneSpec> = Vec::new();
+        let mut zmap = vec![0u16; w * h];
+        if zones.is_empty() {
+            zmap.iter_mut().for_each(|p| *p = 1);
+            specs.push(ZoneSpec { name: String::new(), min_area_pct, min_blob_pct });
+        }
+        for (i, z) in zones.iter().take(crate::zones::MAX_ZONES).enumerate() {
+            crate::zones::rasterize(w, h, &z.points, |p| zmap[p] |= 1 << i);
+            specs.push(ZoneSpec { name: z.name.clone(), min_area_pct: z.min_area_pct.unwrap_or(min_area_pct), min_blob_pct: z.min_blob_pct.unwrap_or(min_blob_pct) });
         }
         for m in masks {
-            rasterize(&mut mask, w, h, m, 0);
+            crate::zones::rasterize(w, h, &m.points, |p| zmap[p] = 0);
         }
-        let mask_pixels = mask.iter().filter(|m| **m == 1).count().max(1);
         let bw = w.div_ceil(8);
         let bh = h.div_ceil(8);
+        let n = specs.len();
+        let mut zone_px = vec![0usize; n];
+        let mut zone_cell_px = vec![vec![0u8; bw * bh]; n];
+        for y in 0..h {
+            for x in 0..w {
+                let mut bits = zmap[y * w + x];
+                while bits != 0 {
+                    let z = bits.trailing_zeros() as usize;
+                    zone_px[z] += 1;
+                    zone_cell_px[z][(y / 8) * bw + x / 8] += 1;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        zone_px.iter_mut().for_each(|p| *p = (*p).max(1));
         MotionDetector {
-            w, h, reference: vec![0; w * h], mask, mask_pixels, threshold, min_area_pct, min_blob_pct,
-            frames_seen: 0, bw, bh, blocks: vec![0; bw * bh],
+            w, h, reference: vec![0; w * h], zmap, zones: specs, zone_px, zone_cell_px, threshold,
+            frames_seen: 0, bw, bh, blocks: vec![0; bw * bh], zone_blocks: vec![vec![0; bw * bh]; n], zone_changed: vec![0; n], fired: Vec::new(),
         }
     }
 
-    /// Feed one grayscale frame; returns a 0..255 motion score (0 = none).
+    /// Feed one grayscale frame; returns a 0..255 motion score (0 = none):
+    /// the highest score of the zones that fired.
     pub fn feed(&mut self, frame: &[u8]) -> u8 {
         debug_assert_eq!(frame.len(), self.w * self.h);
+        self.fired.clear();
         if self.frames_seen == 0 {
             self.reference.copy_from_slice(frame);
             self.frames_seen = 1;
             return 0;
         }
-        // 1. count changed pixels per 8x8 block (within mask)
+        // 1. count changed pixels per 8x8 block, overall and per zone
         self.blocks.iter_mut().for_each(|b| *b = 0);
-        let mut changed = 0usize;
+        self.zone_blocks.iter_mut().for_each(|zb| zb.iter_mut().for_each(|b| *b = 0));
+        self.zone_changed.iter_mut().for_each(|c| *c = 0);
         let thr = self.threshold as i16;
         for y in 0..self.h {
             let row = y * self.w;
             let brow = (y / 8) * self.bw;
             for x in 0..self.w {
                 let i = row + x;
-                if self.mask[i] == 0 {
+                let mut bits = self.zmap[i];
+                if bits == 0 {
                     continue;
                 }
                 let d = (frame[i] as i16 - self.reference[i] as i16).abs();
                 if d > thr {
-                    changed += 1;
-                    self.blocks[brow + x / 8] += 1;
+                    let b = brow + x / 8;
+                    self.blocks[b] = self.blocks[b].saturating_add(1);
+                    while bits != 0 {
+                        let z = bits.trailing_zeros() as usize;
+                        self.zone_changed[z] += 1;
+                        self.zone_blocks[z][b] += 1;
+                        bits &= bits - 1;
+                    }
                 }
             }
         }
@@ -270,29 +330,57 @@ impl MotionDetector {
         if self.frames_seen < 10 {
             return 0; // warm-up
         }
-        let area_pct = changed as f64 * 100.0 / self.mask_pixels as f64;
-        if area_pct < self.min_area_pct {
-            return 0;
+        // 3. per zone: enough of it changed, and as one object (largest blob of
+        //    cells where >= 1/3 of the zone's pixels in the cell changed)
+        let mut best = 0u8;
+        for z in 0..self.zones.len() {
+            let area_pct = self.zone_changed[z] as f64 * 100.0 / self.zone_px[z] as f64;
+            if area_pct < self.zones[z].min_area_pct || self.zone_changed[z] == 0 {
+                continue;
+            }
+            let (zb, cp) = (&self.zone_blocks[z], &self.zone_cell_px[z]);
+            let active: Vec<bool> = zb.iter().zip(cp).map(|(c, p)| *p > 0 && *c as u32 * 64 >= *p as u32 * 21).collect();
+            let blob_px = largest_component(&active, cp, self.bw, self.bh);
+            let blob_pct = blob_px as f64 * 100.0 / self.zone_px[z] as f64;
+            if blob_pct < self.zones[z].min_blob_pct {
+                continue;
+            }
+            // score: percentage of the zone changed, compressed: 1% -> ~40, 5% -> ~120, 20%+ -> 255
+            let s = (area_pct.ln_1p() * 80.0).clamp(1.0, 255.0) as u8;
+            self.fired.push((z, s));
+            best = best.max(s);
         }
-        // 3. largest connected blob of "active" blocks (>= 1/3 of block pixels changed)
-        let active: Vec<bool> = self.blocks.iter().map(|b| *b >= 21).collect();
-        let largest = largest_component(&active, self.bw, self.bh);
-        let blob_pct = largest as f64 * 64.0 * 100.0 / self.mask_pixels as f64;
-        if blob_pct < self.min_blob_pct {
-            return 0;
-        }
-        // score: percentage of zone changed, compressed: 1% -> ~40, 5% -> ~120, 20%+ -> 255
-        let s = (area_pct.ln_1p() * 80.0).clamp(1.0, 255.0);
-        s as u8
+        best
     }
 
     /// Cells of the last fed frame where at least 1/8 of the pixels changed.
     pub fn cells(&self) -> MotionCells {
         MotionCells { w: self.w, h: self.h, bw: self.bw, bh: self.bh, bits: self.blocks.iter().map(|b| *b >= 8).collect() }
     }
+
+    /// Names of the zones that fired on the last frame, best first (empty
+    /// for a camera without zones).
+    pub fn fired_zones(&self) -> Vec<String> {
+        let mut f = self.fired.clone();
+        f.sort_by(|a, b| b.1.cmp(&a.1));
+        f.into_iter().map(|(z, _)| self.zones[z].name.clone()).filter(|n| !n.is_empty()).collect()
+    }
+
+    /// Per-zone result of the last frame: (name, score, changed %), for the
+    /// live tuning view.
+    pub fn zone_report(&self) -> Vec<(String, u8, f64)> {
+        (0..self.zones.len())
+            .map(|z| {
+                let s = self.fired.iter().find(|(i, _)| *i == z).map(|(_, s)| *s).unwrap_or(0);
+                (self.zones[z].name.clone(), s, self.zone_changed[z] as f64 * 100.0 / self.zone_px[z] as f64)
+            })
+            .collect()
+    }
 }
 
-fn largest_component(active: &[bool], bw: usize, bh: usize) -> usize {
+/// Size in pixels of the largest 4-connected group of active cells, each
+/// cell counting the pixels it holds (cells at a zone's edge are partial).
+fn largest_component(active: &[bool], weight: &[u8], bw: usize, bh: usize) -> usize {
     let mut seen = vec![false; active.len()];
     let mut best = 0;
     let mut stack = Vec::new();
@@ -300,11 +388,11 @@ fn largest_component(active: &[bool], bw: usize, bh: usize) -> usize {
         if !active[start] || seen[start] {
             continue;
         }
-        let mut size = 0;
+        let mut size = 0usize;
         stack.push(start);
         seen[start] = true;
         while let Some(i) = stack.pop() {
-            size += 1;
+            size += weight[i] as usize;
             let (x, y) = (i % bw, i / bw);
             let mut push = |nx: usize, ny: usize| {
                 let j = ny * bw + nx;
@@ -323,37 +411,9 @@ fn largest_component(active: &[bool], bw: usize, bh: usize) -> usize {
     best
 }
 
-/// Scanline polygon fill into a w*h mask with `value` (coords normalized 0..1).
-fn rasterize(mask: &mut [u8], w: usize, h: usize, poly: &[(f64, f64)], value: u8) {
-    if poly.len() < 3 {
-        return;
-    }
-    let pts: Vec<(f64, f64)> = poly.iter().map(|(x, y)| (x * w as f64, y * h as f64)).collect();
-    for y in 0..h {
-        let fy = y as f64 + 0.5;
-        let mut xs: Vec<f64> = Vec::new();
-        for i in 0..pts.len() {
-            let (x0, y0) = pts[i];
-            let (x1, y1) = pts[(i + 1) % pts.len()];
-            if (y0 <= fy && y1 > fy) || (y1 <= fy && y0 > fy) {
-                xs.push(x0 + (fy - y0) * (x1 - x0) / (y1 - y0));
-            }
-        }
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for pair in xs.chunks(2) {
-            if pair.len() == 2 {
-                let a = pair[0].max(0.0).round() as usize;
-                let b = pair[1].min(w as f64).round() as usize;
-                for x in a..b.min(w) {
-                    mask[y * w + x] = value;
-                }
-            }
-        }
-    }
-}
-
+/// Zones' polygons of a camera (either JSON form, see [`crate::zones`]).
 pub fn parse_polys(json: &str) -> Vec<Vec<(f64, f64)>> {
-    serde_json::from_str::<Vec<Vec<(f64, f64)>>>(json).unwrap_or_default()
+    crate::zones::parse_polys(json)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,10 +522,10 @@ struct DetectRun {
 
 impl DetectRun {
     fn new(ctx: Arc<DetectCtx>, cam: Camera, handle: Arc<DetectorHandle>) -> Self {
-        let zones = parse_polys(&cam.zones_json);
-        let masks = parse_polys(&cam.masks_json);
+        let zones = crate::zones::parse(&cam.zones_json, "Zone");
+        let masks = crate::zones::parse(&cam.masks_json, "Mask");
         DetectRun {
-            det: MotionDetector::new(cam.detect_width as usize, cam.detect_height as usize, cam.pixel_threshold, cam.min_area_pct, cam.min_blob_pct, &zones, &masks),
+            det: MotionDetector::with_zones(cam.detect_width as usize, cam.detect_height as usize, cam.pixel_threshold, cam.min_area_pct, cam.min_blob_pct, &zones, &masks),
             fps_t: Instant::now(),
             fps_n: 0,
             preview: (ctx.preview_secs > 0).then(|| crate::preview::PreviewWriter::new(&ctx.thumb_dir, cam.id, ctx.preview_secs, cam.detect_width, cam.detect_height)),
@@ -494,6 +554,7 @@ impl DetectRun {
         let mut in_flight = false;
         let cells = (score > 0).then(|| self.det.cells());
         self.ev.frame_cells = cells.clone();
+        self.ev.frame_zones = if score > 0 { self.det.fired_zones() } else { Vec::new() };
         if let Some(g) = self.gate.as_mut() {
             if let Some(cells) = cells {
                 g.maybe_send(dts, frame, self.w, self.h, self.ev.event_id, cells);
@@ -680,6 +741,10 @@ struct EventState {
     frame_cells: Option<MotionCells>,
     /// changed cells at the peak: where the thumbnail's objects must be
     peak_cells: Option<MotionCells>,
+    /// zones that fired on the frame being stepped (set by `on_frame`)
+    frame_zones: Vec<String>,
+    /// every zone that fired during this event, in the order first seen
+    zones: Vec<String>,
 }
 
 impl EventState {
@@ -690,6 +755,7 @@ impl EventState {
             "peak": self.peak,
             "detections": self.objects.detections,
             "objects": self.objects.list(),
+            "zones": self.zones,
         });
         if let Some(c) = &self.peak_cells {
             m["peak_cells"] = c.to_json();
@@ -774,8 +840,16 @@ impl EventState {
         if score > 0 {
             self.consecutive = self.consecutive.saturating_add(1);
             self.deferred_close = None; // motion resumed: the event simply continues
+            for z in std::mem::take(&mut self.frame_zones) {
+                if !self.zones.contains(&z) {
+                    self.zones.push(z);
+                }
+            }
         } else {
             self.consecutive = 0;
+            if self.event_id.is_none() {
+                self.zones.clear(); // stray motion that never became an event
+            }
         }
         if self.deferred_close.is_some() {
             return Ok(()); // waiting for the last detection before deciding
@@ -983,6 +1057,58 @@ mod tests {
         let mut d = a.clone();
         d.name = "renamed".into();
         assert_eq!(detect_key(&a), detect_key(&d), "a rename does not restart the detector");
+    }
+
+    /// Each zone has its own sensitivity: a small change in a sensitive
+    /// doorway zone fires (and is named), the same change in a dull road
+    /// zone does not; a mask over part of a zone hides that part.
+    #[test]
+    fn zones_fire_on_their_own_sensitivity() {
+        use crate::zones::Zone;
+        let (w, h) = (160usize, 90usize);
+        let z = |name: &str, pts: Vec<(f64, f64)>, area: Option<f64>, blob: Option<f64>| Zone { name: name.into(), points: pts, min_area_pct: area, min_blob_pct: blob };
+        let left = vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)];
+        let right = vec![(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)];
+        // camera default: 5% area; "Door" (left) fires at 0.5%, "Road" (right) keeps the default
+        let zones = [z("Door", left.clone(), Some(0.5), Some(0.2)), z("Road", right.clone(), None, None)];
+        let mut det = MotionDetector::with_zones(w, h, 25, 5.0, 2.0, &zones, &[]);
+        let base = vec![100u8; w * h];
+        for _ in 0..12 { assert_eq!(det.feed(&base), 0); }
+        // a 12x12 object (~2% of a half) in each half, one at a time
+        let blob = |x0: usize| { let mut f = base.clone(); for y in 30..42 { for x in x0..x0 + 12 { f[y * w + x] = 250; } } f };
+        let s = det.feed(&blob(20));
+        assert!(s > 0, "door fires");
+        assert_eq!(det.fired_zones(), vec!["Door".to_string()]);
+        for _ in 0..40 { det.feed(&base); } // settle back
+        assert_eq!(det.feed(&blob(110)), 0, "road needs 5%");
+        assert!(det.fired_zones().is_empty());
+        let rep = det.zone_report();
+        assert_eq!(rep.len(), 2);
+        assert!(rep[1].2 > 1.0 && rep[1].1 == 0, "{rep:?}");
+        // both halves at once, big enough for the road too: both named, best first
+        for _ in 0..40 { det.feed(&base); }
+        let mut f = base.clone();
+        for y in 10..80 { for x in 85..150 { f[y * w + x] = 250; } }
+        for y in 30..42 { for x in 20..32 { f[y * w + x] = 250; } }
+        assert!(det.feed(&f) > 0);
+        assert_eq!(det.fired_zones(), vec!["Road".to_string(), "Door".to_string()]);
+        // a mask over the door's top half hides motion there
+        let mut masked = MotionDetector::with_zones(w, h, 25, 5.0, 2.0, &zones, &[z("", vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)], None, None)]);
+        for _ in 0..12 { masked.feed(&base); }
+        assert_eq!(masked.feed(&blob(20)), 0, "rows 30..42 of 90 are under the mask");
+    }
+
+    /// No zones: the whole frame is one unnamed zone; fired_zones stays empty.
+    #[test]
+    fn whole_frame_without_zones_has_no_zone_names() {
+        let (w, h) = (160usize, 90usize);
+        let mut det = MotionDetector::with_zones(w, h, 25, 0.5, 0.2, &[], &[]);
+        let base = vec![100u8; w * h];
+        for _ in 0..12 { det.feed(&base); }
+        let mut f = base.clone();
+        for y in 20..50 { for x in 40..70 { f[y * w + x] = 250; } }
+        assert!(det.feed(&f) > 0);
+        assert!(det.fired_zones().is_empty());
     }
 
     #[test]

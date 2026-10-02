@@ -34,7 +34,11 @@ zmng add-camera "Front Door" rtsp://user:pass@10.10.0.101:554/Streaming/Channels
      --sub-url rtsp://user:pass@10.10.0.101:554/Streaming/Channels/102
 zmng run                                        # http://localhost:8080 → create the first admin
 ```
-Camera settings (retention, detection thresholds, zones, masks) are edited in the Admin page or with `PATCH /api/cameras/{id}`.
+Camera settings (retention, detection thresholds, zones, masks) are edited in the Admin page or with `PATCH /api/cameras/{id}`; zones and masks are drawn on the camera page (**Zones**, admins).
+
+## Zones
+
+A camera's zones are named polygons drawn over its picture (camera page → **Zones**, or Admin → Cameras → Edit → *Edit zones on the picture…*): **+ Zone** / **+ Mask**, click the corners, click the first point (or Enter) to close; drag corners, drag the edge dots to add corners, right-click a corner to delete it, drag inside a shape to move it. Each zone has its own sensitivity: *High* (0.3 % of the zone changed, largest moving object 0.1 %), the camera default, *Low* (3 % / 1.5 %) or custom values; the detector scores every zone on its own pixels, so a doorway can be sensitive while the road behind it is not, and a frame's score is the best zone's. With zones, everything outside them is ignored; masks are never analysed (and also drop detected objects whose box stands in them). Events record the zones that fired (`zones` in the event JSON, webhook/MQTT payloads and `meta_json`); `GET /api/events?zone=Door,Porch` filters by them, and the Events page offers a zone filter once one camera is picked. Stored as `zones_json` / `masks_json`: `[{"name","points":[[x,y],…],"min_area_pct","min_blob_pct"}]` in 0..1 (the older bare-polygon form `[[[x,y],…]]` is still read); at most 16 zones, names unique per camera without commas. zmNinjaNg shows them through `/zm/api/zones.json`.
 
 Detector test without a camera: `--sub-url "lavfi:testsrc=size=640x360:rate=5"`.
 
@@ -82,7 +86,7 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/preview.jpg?t` | scrub-preview tile (160 px, colour) nearest `t`, taken from the detector's frames every `preview_secs`; one small file read, no decode |
 | `GET /api/cameras/{id}/previews`, `GET /api/cameras/{id}/previews/{YYYYMMDDHH}.jpg|.json` | hours with previews; an hour as a sprite sheet (30 columns) plus its manifest `{cols, tile_w, tile_h, times}` |
 | `GET /api/segments/{id}/file.mp4` (Range), `/init.mp4`, `/frag/{n}.m4s` | raw media for HLS |
-| `GET /api/events?camera&start&end&min_score&kind&archived&before&limit&order` | keyset-paged list (`kind`: comma list of `motion`, `person`, `car`, ...); each event carries `objects` |
+| `GET /api/events?camera&start&end&min_score&kind&zone&archived&before&limit&order` | keyset-paged list (`kind`: comma list of `motion`, `person`, `car`, ...; `zone`: comma list of zone names); each event carries `objects` and `zones` |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
 | `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin); a password reset ends that user's sign-ins |
 | `POST /api/me/password` `{current, new}` | change your own password (any role; the current password is required, failures count towards the login throttle); your other sign-ins end, API tokens stay |

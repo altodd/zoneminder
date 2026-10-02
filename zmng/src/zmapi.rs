@@ -379,19 +379,18 @@ async fn monitor_daemon(Path(_rest): Path<String>) -> Response {
 /// coordinates with two decimals, as ZoneMinder stores them.
 fn zone_rows(c: &crate::db::Camera) -> Vec<Value> {
     let fmt = |poly: &[(f64, f64)]| poly.iter().map(|(x, y)| format!("{:.2},{:.2}", x * 100.0, y * 100.0)).collect::<Vec<_>>().join(" ");
-    let mut zones = crate::detect::parse_polys(&c.zones_json);
-    let masks = crate::detect::parse_polys(&c.masks_json);
-    let named = !zones.is_empty();
+    let mut zones = crate::zones::parse(&c.zones_json, "Zone");
+    let masks = crate::zones::parse(&c.masks_json, "Mask");
     if zones.is_empty() {
-        zones.push(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        zones.push(crate::zones::Zone { name: "All".into(), points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], min_area_pct: None, min_blob_pct: None });
     }
-    let row = |i: usize, kind: &str, name: String, poly: &[(f64, f64)]| {
-        json!({"Zone": {"Id": (c.id * 1000 + i as i64 + 1).to_string(), "MonitorId": c.id.to_string(), "Name": name, "Type": kind,
-            "Units": "Percent", "NumCoords": poly.len().to_string(), "Coords": fmt(poly), "CheckMethod": "Blobs",
+    let row = |i: usize, kind: &str, z: &crate::zones::Zone| {
+        json!({"Zone": {"Id": (c.id * 1000 + i as i64 + 1).to_string(), "MonitorId": c.id.to_string(), "Name": z.name, "Type": kind,
+            "Units": "Percent", "NumCoords": z.points.len().to_string(), "Coords": fmt(&z.points), "CheckMethod": "Blobs",
             "MinPixelThreshold": c.pixel_threshold.to_string(), "AlarmRGB": "16711680"}})
     };
-    let mut out: Vec<Value> = zones.iter().enumerate().map(|(i, p)| row(i, "Active", if named { format!("Zone {}", i + 1) } else { "All".into() }, p)).collect();
-    out.extend(masks.iter().enumerate().map(|(i, p)| row(zones.len() + i, "Inactive", format!("Mask {}", i + 1), p)));
+    let mut out: Vec<Value> = zones.iter().enumerate().map(|(i, z)| row(i, "Active", z)).collect();
+    out.extend(masks.iter().enumerate().map(|(i, m)| row(zones.len() + i, "Inactive", m)));
     out
 }
 
@@ -1383,7 +1382,7 @@ mod tests {
         let short = EsFilter::parse("4,5", "30");
         assert_eq!(short.interval(5), Some(0));
         let e = crate::notify::EventInfo { id: 12, camera_id: 3, camera_name: "Front".into(), start_ms: 0, end_ms: None, score: 1, kind: "person".into(), thumb: None,
-            objects: vec![crate::notify::DetectedObject { label: "person".into(), confidence: 0.91, bbox: [0.1, 0.1, 0.5, 0.9] }] };
+            objects: vec![crate::notify::DetectedObject { label: "person".into(), confidence: 0.91, bbox: [0.1, 0.1, 0.5, 0.9] }], zones: vec![] };
         let a = es_alarm_json(&e);
         assert_eq!(a["event"], "alarm");
         assert_eq!(a["events"][0]["MonitorId"], 3);

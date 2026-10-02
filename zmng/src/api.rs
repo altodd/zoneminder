@@ -508,6 +508,8 @@ struct EventOut {
     objects: Vec<crate::notify::DetectedObject>,
     /// seconds of actual motion (not counting pre/post-roll); None for imported events
     motion_secs: Option<f64>,
+    /// zones that fired during the event (cameras with named zones)
+    zones: Vec<String>,
 }
 
 /// Detect fps per camera, to turn an event's motion frame count into seconds.
@@ -517,13 +519,15 @@ fn fps_map(app: &App) -> std::collections::HashMap<i64, f64> {
 
 fn event_out(e: crate::db::Event, fps: &std::collections::HashMap<i64, f64>) -> EventOut {
     let objects = crate::notify::objects_from_meta(&e);
-    let motion_secs = serde_json::from_str::<serde_json::Value>(&e.meta_json)
-        .ok()
+    let meta = serde_json::from_str::<serde_json::Value>(&e.meta_json).ok();
+    let motion_secs = meta
+        .as_ref()
         .and_then(|m| m.get("motion_frames").and_then(|f| f.as_f64()))
         .and_then(|f| fps.get(&e.camera_id).filter(|r| **r > 0.0).map(|r| (f / r * 10.0).round() / 10.0));
     EventOut {
         motion_secs,
         objects,
+        zones: crate::notify::zones_from_meta(&e),
         id: e.id,
         camera_id: e.camera_id,
         start: video::dts_to_ms(e.start_dts),
@@ -595,6 +599,8 @@ struct EventsQ {
     kind: Option<String>,
     /// minimum seconds of actual motion (hides blips)
     min_motion: Option<f64>,
+    /// comma separated zone names: events in which one of them fired
+    zone: Option<String>,
 }
 
 async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -605,6 +611,7 @@ async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<a
         _ => vis.clone(),
     };
     let kinds: Option<Vec<String>> = q.kind.as_ref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
+    let zones: Option<Vec<String>> = q.zone.as_ref().filter(|s| !s.trim().is_empty()).map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
     let list = app
         .db
         .events_q(&crate::db::EventQuery {
@@ -618,6 +625,7 @@ async fn events(State(app): State<App>, Query(q): Query<EventsQ>, user: Option<a
             ascending: q.order.as_deref() == Some("asc"),
             kinds: kinds.as_deref(),
             min_motion_secs: q.min_motion,
+            zones: zones.as_deref(),
         })
         .map_err(err500)?;
     let fps = fps_map(&app);
