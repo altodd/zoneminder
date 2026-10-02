@@ -169,18 +169,21 @@ fn class_of(e: &EventInfo) -> Vec<&'static str> {
 }
 
 /// Decides which rules fire for a notification. Remembers which events
-/// already alerted each rule and when each rule last alerted per camera.
+/// already alerted each rule (and with which trigger) and when each rule
+/// last alerted per camera and kind of alert.
 #[derive(Default)]
 pub struct Engine {
-    sent: HashMap<(i64, i64), i64>,
-    last: HashMap<(i64, i64), i64>,
+    /// (rule, event) -> (when, alerted only as plain motion)
+    sent: HashMap<(i64, i64), (i64, bool)>,
+    /// (rule, camera or storage, kind) -> when
+    last: HashMap<(i64, i64, &'static str), i64>,
 }
 
 impl Engine {
     /// Alerts for `n` at local time `now` (`now_ms` = the same instant).
     pub fn decide(&mut self, rules: &[Rule], cams: &[Camera], armed: bool, now: chrono::NaiveDateTime, now_ms: i64, n: &Notification) -> Vec<Alert> {
         // forget dedup entries older than a day
-        self.sent.retain(|_, t| now_ms - *t < 86_400_000);
+        self.sent.retain(|_, (t, _)| now_ms - *t < 86_400_000);
         let mut out = Vec::new();
         for r in rules.iter().filter(|r| r.enabled) {
             if r.only_when_armed && !armed {
@@ -191,18 +194,27 @@ impl Engine {
             }
             match n {
                 Notification::EventStart(e) | Notification::EventUpdate(e) | Notification::EventEnd(e) => {
-                    if !r.covers(e.camera_id, cams) || self.sent.contains_key(&(r.id, e.id)) {
+                    if !r.covers(e.camera_id, cams) {
                         continue;
                     }
                     let classes = class_of(e);
-                    let Some(trigger) = r.triggers.iter().find(|t| classes.contains(&t.as_str())) else { continue };
+                    // the rule's triggers in priority order: an object class before plain motion
+                    let Some(trigger) = r.triggers.iter().filter(|t| classes.contains(&t.as_str())).min_by_key(|t| (t.as_str() == "motion") as u8) else { continue };
+                    let upgrade = trigger != "motion";
+                    match self.sent.get(&(r.id, e.id)) {
+                        // alerted already; once more only if it was plain motion and now it is a person/vehicle/animal
+                        Some((_, as_motion)) if !(*as_motion && upgrade) => continue,
+                        _ => {}
+                    }
                     if !r.zones.is_empty() && !e.zones.iter().any(|z| r.zones.iter().any(|w| w.eq_ignore_ascii_case(z))) {
                         continue;
                     }
-                    self.sent.insert((r.id, e.id), now_ms);
-                    if !self.throttle_ok(r, e.camera_id, now_ms) {
-                        continue;
+                    // an upgrade is the same event: not held back by the interval
+                    let followup = self.sent.contains_key(&(r.id, e.id));
+                    if !followup && !self.throttle_ok(r, e.camera_id, "event", now_ms) {
+                        continue; // not marked sent: once the interval passes, a later update of this event may alert
                     }
+                    self.sent.insert((r.id, e.id), (now_ms, !upgrade));
                     let what = match trigger.as_str() {
                         "motion" => e.objects.first().map(|o| o.label.clone()).unwrap_or_else(|| "motion".into()),
                         t => e.objects.iter().find(|o| class_of(&EventInfo { kind: o.label.clone(), objects: vec![], ..e.clone() }).contains(&t)).map(|o| o.label.clone()).unwrap_or_else(|| t.to_string()),
@@ -224,7 +236,7 @@ impl Engine {
                     });
                 }
                 Notification::CameraDown { camera_id, name } if r.triggers.iter().any(|t| t == "camera_down") => {
-                    if !r.covers(*camera_id, cams) || !self.throttle_ok(r, *camera_id, now_ms) {
+                    if !r.covers(*camera_id, cams) || !self.throttle_ok(r, *camera_id, "camera_down", now_ms) {
                         continue;
                     }
                     out.push(Alert {
@@ -233,8 +245,8 @@ impl Engine {
                         tags: vec!["warning".into()], priority: 4, camera_id: Some(*camera_id), event_id: None, open: Some("#/status".into()), event: None,
                     });
                 }
-                Notification::StorageLow { path, free_bytes, .. } if r.triggers.iter().any(|t| t == "storage_low") => {
-                    if !self.throttle_ok(r, -1, now_ms) {
+                Notification::StorageLow { storage_id, path, free_bytes, .. } if r.triggers.iter().any(|t| t == "storage_low") => {
+                    if !self.throttle_ok(r, *storage_id, "storage_low", now_ms) {
                         continue;
                     }
                     out.push(Alert {
@@ -249,8 +261,8 @@ impl Engine {
         out
     }
 
-    fn throttle_ok(&mut self, r: &Rule, camera: i64, now_ms: i64) -> bool {
-        let key = (r.id, camera);
+    fn throttle_ok(&mut self, r: &Rule, subject: i64, kind: &'static str, now_ms: i64) -> bool {
+        let key = (r.id, subject, kind);
         if self.last.get(&key).is_some_and(|t| now_ms - t < r.min_interval_secs as i64 * 1000) {
             return false;
         }
@@ -278,6 +290,7 @@ pub async fn send(http: &reqwest::Client, rule: &Rule, a: &Alert, picture: Optio
         _ => None,
     };
     let auth = (!rule.target_token.trim().is_empty()).then(|| format!("Bearer {}", rule.target_token.trim()));
+    let has_picture = picture.is_some();
     let req = match rule.target_kind.as_str() {
         "ntfy" => {
             let mut req = match &picture {
@@ -305,8 +318,17 @@ pub async fn send(http: &reqwest::Client, rule: &Rule, a: &Alert, picture: Optio
         None => req,
     };
     let res = req.timeout(std::time::Duration::from_secs(15)).send().await?;
-    anyhow::ensure!(res.status().is_success(), "{} answered {}", rule.target_kind, res.status());
-    Ok(())
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body: String = res.text().await.unwrap_or_default().chars().take(200).collect();
+    // an ntfy server without attachment storage refuses the picture: send the text alone
+    if rule.target_kind == "ntfy" && has_picture && status.is_client_error() && status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
+        warn!(rule = %rule.name, %status, "ntfy refused the picture ({}); sending without it", body.trim());
+        return Box::pin(send(http, rule, a, None, public_url)).await;
+    }
+    anyhow::bail!("{} answered {status}{}", rule.target_kind, if body.trim().is_empty() { String::new() } else { format!(": {}", body.trim()) })
 }
 
 /// Run the alert engine until the bus closes: decide, then deliver each
@@ -436,6 +458,13 @@ mod tests {
         let a = e.decide(&rules, &cams(), true, now, 4, &Notification::EventStart(ev(12, 2, &[], &[])));
         assert_eq!(a.iter().map(|a| a.rule_id).collect::<Vec<_>>(), vec![2]);
         assert_eq!(a[0].title, "cam2: motion");
+        // a rule for people *and* any motion: motion at the start, one follow-up when it turns out to be a person
+        let both = vec![rule(5, &["person", "motion"])];
+        let a = e.decide(&both, &cams(), true, now, 10, &Notification::EventStart(ev(20, 1, &[], &[])));
+        assert_eq!(a[0].trigger, "motion");
+        let a = e.decide(&both, &cams(), true, now, 11, &Notification::EventUpdate(ev(20, 1, &["person"], &[])));
+        assert_eq!((a.len(), a[0].trigger.as_str()), (1, "person"));
+        assert!(e.decide(&both, &cams(), true, now, 12, &Notification::EventEnd(ev(20, 1, &["person"], &[]))).is_empty());
         // a vehicle rule names the vehicle
         let v = vec![rule(3, &["vehicle"])];
         let a = e.decide(&v, &cams(), true, now, 5, &Notification::EventUpdate(ev(13, 1, &["person", "truck"], &[])));
@@ -452,7 +481,22 @@ mod tests {
         assert!(e.decide(&rules, &cams(), false, at(23, 0, 1), 0, &s(2)).is_empty(), "disarmed");
         assert_eq!(e.decide(&rules, &cams(), true, at(23, 0, 1), 0, &s(3)).len(), 1);
         assert!(e.decide(&rules, &cams(), true, at(23, 1, 1), 60_000, &s(4)).is_empty(), "within 5 minutes of the last");
-        assert_eq!(e.decide(&rules, &cams(), true, at(23, 6, 1), 360_000, &s(5)).len(), 1);
+        // the same event, still going after the interval: it alerts then
+        let a = e.decide(&rules, &cams(), true, at(23, 6, 1), 360_000, &Notification::EventEnd(ev(4, 1, &[], &[])));
+        assert_eq!(a.iter().map(|a| a.event_id).collect::<Vec<_>>(), vec![Some(4)]);
+        assert!(e.decide(&rules, &cams(), true, at(23, 7, 1), 420_000, &s(5)).is_empty());
+        assert_eq!(e.decide(&rules, &cams(), true, at(23, 12, 1), 720_000, &s(6)).len(), 1);
+        // a camera going down is not held back by an event alert on the same camera
+        let mixed = vec![Rule { min_interval_secs: 300, ..rule(7, &["motion", "camera_down"]) }];
+        assert_eq!(e.decide(&mixed, &cams(), true, at(12, 0, 1), 0, &Notification::EventStart(ev(30, 1, &[], &[]))).len(), 1);
+        assert_eq!(e.decide(&mixed, &cams(), true, at(12, 1, 1), 60_000, &Notification::CameraDown { camera_id: 1, name: "x".into() }).len(), 1);
+        // two volumes running low are two alerts
+        let st = vec![rule(8, &["storage_low"])];
+        let low = |id| Notification::StorageLow { storage_id: id, path: format!("/v{id}"), free_bytes: 1, reserve_bytes: 0 };
+        let st = vec![Rule { min_interval_secs: 3600, ..st[0].clone() }];
+        assert_eq!(e.decide(&st, &cams(), true, at(12, 0, 1), 0, &low(1)).len(), 1);
+        assert_eq!(e.decide(&st, &cams(), true, at(12, 0, 1), 1, &low(2)).len(), 1);
+        assert!(e.decide(&st, &cams(), true, at(12, 0, 1), 2, &low(1)).is_empty());
         // a rule that ignores arming fires while disarmed
         let always = vec![Rule { only_when_armed: false, ..rule(9, &["camera_down", "storage_low"]) }];
         let a = e.decide(&always, &cams(), false, at(12, 0, 1), 0, &Notification::CameraDown { camera_id: 2, name: "Hall".into() });

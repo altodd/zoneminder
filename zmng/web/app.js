@@ -553,37 +553,47 @@ function dryRunPanel(cam, settings) {
   const RANGES_DR = [['3600000', 'Last hour'], ['10800000', 'Last 3 hours'], ['night', 'Last night (10 PM–6 AM)'], ['morning', 'This morning'], ['43200000', 'Last 12 hours']];
   const rangeSel = h('select', { style: 'width:auto' }, ...RANGES_DR.map(([v, l]) => h('option', { value: v }, l)));
   const out = h('div');
-  let job = null, timer = null;
-  const stop = () => { clearTimeout(timer); timer = null; };
+  let job = null, timer = null, running = false, gen = 0;
+  const stop = () => { clearTimeout(timer); timer = null; gen++; };
   const show = (v) => {
+    running = v.state === 'running';
     const total = v.events.length;
     const counts = {};
     v.events.forEach((e) => e.zones.forEach((z) => { counts[z] = (counts[z] || 0) + 1; }));
     const head = v.state === 'running'
       ? h('div', { class: 'row' }, h('progress', { max: 1, value: v.progress }), h('span', { class: 'muted small' }, `${Math.round(v.progress * 100)}% · ${v.frames} frames · ${total} event${total === 1 ? '' : 's'} so far`),
-        h('button', { class: 'ghost small', onclick: async () => { stop(); try { await api.del(`/api/dryrun/${v.id}`); } catch {} fill(out, h('p', { class: 'muted small' }, 'Cancelled.')); } }, 'Cancel'))
+        h('button', { class: 'ghost small', onclick: async () => { stop(); running = false; try { await api.del(`/api/dryrun/${v.id}`); } catch {} fill(out, h('p', { class: 'muted small' }, 'Cancelled.')); } }, 'Cancel'))
       : v.state === 'done' ? h('p', {}, h('b', {}, `${total} event${total === 1 ? '' : 's'}`), ` with these settings; ${v.recorded_events} recorded with the saved ones.`, Object.keys(counts).length ? ` By zone: ${Object.entries(counts).map(([z, n]) => `${z} ${n}`).join(', ')}.` : '')
         : h('p', { class: 'err' }, v.error || v.state);
     fill(out, head, total ? h('div', { class: 'tablewrap dryevents' }, h('table', {}, ...v.events.map((e) => h('tr', {},
       h('td', {}, h('a', { href: `#/camera/${keyOf(cam)}/${e.peak_ms}`, target: '_blank', title: 'open this moment in a new tab' }, fmtDT(e.start_ms))),
       h('td', {}, fmtDur(e.end_ms - e.start_ms)), h('td', {}, e.zones.join(', ') || '—'), h('td', { class: 'muted small' }, `score ${e.score} · ${e.motion_secs} s motion`))))) : null);
   };
-  const poll = async () => {
-    if (!job) return;
-    try { const v = await api.get(`/api/dryrun/${job}`); show(v); if (v.state === 'running') timer = setTimeout(poll, 1000); } catch (err) { fill(out, h('p', { class: 'err' }, err.message)); }
+  // `my` ties a poll loop to one run: a stop() or a new run ends the old loop even mid-request
+  const poll = async (my) => {
+    if (!job || my !== gen) return;
+    try {
+      const v = await api.get(`/api/dryrun/${job}`);
+      if (my !== gen) return;
+      show(v); if (v.state === 'running') timer = setTimeout(() => poll(my), 1000);
+    } catch (err) { if (my === gen) fill(out, h('p', { class: 'err' }, err.message)); }
   };
   const run = async () => {
     stop();
+    const my = gen;
     const r = presetRange(rangeSel.value);
     try {
       const v = await api.post(`/api/cameras/${cam.id}/dryrun`, { start: Math.round(r[0]), end: Math.round(r[1]), ...settings() });
-      job = v.id; show(v); timer = setTimeout(poll, 800);
-    } catch (err) { fill(out, h('p', { class: 'err' }, err.message)); }
+      job = v.id;
+      if (my !== gen) { api.del(`/api/dryrun/${v.id}`).catch(() => {}); return; }
+      show(v); timer = setTimeout(() => poll(my), 800);
+    } catch (err) { if (my === gen) fill(out, h('p', { class: 'err' }, err.message)); }
   };
   fill(box, h('h3', {}, 'Test on recorded video'),
     h('div', { class: 'row' }, rangeSel, h('button', { class: 'ghost', onclick: run }, 'Run test'), h('span', { class: 'muted small' }, 'replays the recording with the settings above (not saved); object detection is not replayed')),
     out);
-  return { el: box, destroy: stop };
+  // closing the editor ends the polling and the server's run (it holds one of two slots)
+  return { el: box, destroy() { stop(); if (job && running) api.del(`/api/dryrun/${job}`).catch(() => {}); } };
 }
 
 function zoneEditor(cam, { onSaved } = {}) {
@@ -853,16 +863,23 @@ async function viewCamera(main, camId, atMs) {
   const head = h('div', { class: 'toolbar' },
     h('a', { href: '#/live', class: 'muted' }, '◀ all cameras'), h('h2', { style: 'margin:0' }, camLabel(cam)),
     h('span', { class: 'pill ' + (cam.status?.connected ? 'ok' : 'bad') }, statusText(cam)), h('span', { class: 'grow' }), timeLabel,
-    state.me.user.role === 'admin' && !cam.peer ? h('button', { class: 'ghost', title: 'show what the motion detector sees, live', onclick: (e) => toggleMotion(e.target) }, 'Motion') : null,
+    state.me.user.role === 'admin' && !cam.peer ? h('button', { class: 'ghost motion', title: 'show what the motion detector sees, live', onclick: () => toggleMotion() }, 'Motion') : null,
     state.me.user.role === 'admin' && !cam.peer ? h('button', { class: 'ghost', title: 'draw where motion counts, and how much', onclick: () => zoneEditor(cam, { onSaved: () => route() }) }, 'Zones') : null, liveBtn);
   const motionPanel = h('div', { class: 'card livepanel', hidden: true });
   let motion = null;
-  const toggleMotion = (btn) => {
-    if (motion) { motion.destroy(); motion = null; motionPanel.hidden = true; btn.classList.remove('on'); return; }
+  // the overlay shows what the detector sees now: it belongs to live view
+  const motionOff = () => { motion?.destroy(); motion = null; motionPanel.hidden = true; head.querySelector('button.motion')?.classList.remove('on'); };
+  const motionOn = () => {
     const media = player.querySelector('video, img');
     if (!media) return;
-    motionPanel.hidden = false; btn.classList.add('on');
+    motion?.destroy();
+    motionPanel.hidden = false; head.querySelector('button.motion')?.classList.add('on');
     motion = motionOverlay(player, media, cam, { panel: motionPanel });
+  };
+  const toggleMotion = () => {
+    if (motion) { motionOff(); return; }
+    if (mode !== 'live') goLive();
+    motionOn();
   };
   const scrubber = makeScrubber();
   const pl = { cam, video, mse: null };
@@ -871,7 +888,7 @@ async function viewCamera(main, camId, atMs) {
     onScrubStart: () => { wasPaused = video.paused; video.pause(); },
     onScrub: (t) => { timeLabel.textContent = fmtDT(t); scrubber.show([pl], t); },
     onSeek: (t) => play(t, { resume: !wasPaused || mode === 'live' }), onRangeChange: () => {} });
-  const marks = markControls({ now: () => playhead, onChange: (a, b) => tl.setMarks(a, b), exportFor: ([a, b]) => exportDialog({ cams: state.cameras, chosen: [cam], start: a, end: b }) });
+  const marks = markControls({ now: () => (mode === 'live' ? Date.now() : playhead), onChange: (a, b) => tl.setMarks(a, b), exportFor: ([a, b]) => exportDialog({ cams: state.cameras, chosen: [cam], start: a, end: b }) });
   // playback speed for recorded video (live always plays in real time)
   const SPEEDS = [0.5, 1, 2, 4, 8, 16];
   const speed = () => Number(speedSel.value) || 1;
@@ -903,8 +920,9 @@ async function viewCamera(main, camId, atMs) {
     catch (e) { overlay.textContent = `${e.message} — snapshots`; snapshots(); }
   }
   let snapTimer = null;
-  function snapshots() { const img = h('img', { style: 'width:100%;display:block' }); video.replaceWith(img); const load = () => { img.src = `${camApi(cam)}/snapshot.jpg?width=1920&t=${Date.now()}`; }; load(); snapTimer = setInterval(load, 1000); }
+  function snapshots() { const img = h('img', { style: 'width:100%;display:block' }); video.replaceWith(img); const load = () => { img.src = `${camApi(cam)}/snapshot.jpg?width=1920&t=${Date.now()}`; }; load(); snapTimer = setInterval(load, 1000); if (motion) motionOn(); }
   async function play(ms, { resume = true } = {}) {
+    if (motion) motionOff(); // live analysis over recorded video would mislead
     mode = 'playback'; liveBadge.hidden = true; liveBtn.disabled = false; mse.onLiveEnded = null; speedSel.disabled = false;
     playhead = Math.min(ms, Date.now() - 3000); tl.setPlayhead(playhead);
     const s = Math.max(playhead - 1500, 0), e = Math.min(Date.now(), s + CHUNK); playRange = [s, e];
@@ -927,7 +945,7 @@ async function viewCamera(main, camId, atMs) {
   });
   video.addEventListener('ended', () => { if (mode === 'playback' && playRange && playRange[1] < Date.now() - 5000) play(playRange[1]); });
   const keys = (e) => {
-    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || document.querySelector('.modal')) return;
     if (e.key === ' ') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
     if (e.key === 'ArrowRight') play(playhead + (e.shiftKey ? 60000 : 10000));
     if (e.key === 'ArrowLeft') play(playhead - (e.shiftKey ? 60000 : 10000));
@@ -1188,7 +1206,7 @@ function reviewSession(stage, cams, range, startAt, { counts = () => true, empty
     if (p === synced()[0] && playhead + 2000 < range.end) seekAll(playhead + 500);
   }));
   const keys = (e) => {
-    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.metaKey || e.ctrlKey) return;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.metaKey || e.ctrlKey || document.querySelector('.modal')) return;
     if (e.key === ' ') { e.preventDefault(); togglePause(); }
     else if (e.key === 'n' || e.key === 'N') jump(1);
     else if (e.key === 'p' || e.key === 'P') jump(-1);
@@ -1423,7 +1441,7 @@ function alertsCard(cams) {
       h('td', { class: 'actions' },
         h('button', { class: 'ghost small', onclick: async (e) => { e.target.disabled = true; try { await api.post(`/api/alerts/rules/${r.id}/test`); toast(`Test sent through "${r.name}"`, { kind: 'ok' }); } catch (err) { toast(`Test failed: ${err.message}`, { kind: 'bad', ttl: 15000 }); } e.target.disabled = false; draw(); } }, 'Test'),
         h('button', { class: 'ghost small', onclick: () => editRule(r, cams, draw) }, 'Edit'),
-        h('button', { class: 'ghost small', onclick: async () => { if (confirm(`Delete the alert rule "${r.name}"?`)) { await api.del(`/api/alerts/rules/${r.id}`); draw(); } } }, 'Delete'))));
+        h('button', { class: 'ghost small', onclick: async () => { if (!confirm(`Delete the alert rule "${r.name}"?`)) return; try { await api.del(`/api/alerts/rules/${r.id}`); } catch (err) { toast(err.message, { kind: 'bad' }); } draw(); } }, 'Delete'))));
     fill(card,
       h('div', { class: 'row' }, h('h2', {}, 'Alerts'), h('span', { class: 'grow' }),
         h('span', { class: 'pill ' + (a.armed ? 'ok' : '') }, a.armed ? 'armed' : 'disarmed'), h('button', { class: 'ghost small', onclick: async () => { await setArmed(!a.armed); draw(); } }, a.armed ? 'Disarm' : 'Arm')),
@@ -1433,6 +1451,7 @@ function alertsCard(cams) {
       a.public_url ? null : h('p', { class: 'muted small' }, 'Set public_url in zmng.toml (the address people open zmng at) so tapping an alert opens the moment.'),
       h('p', { class: 'muted small' }, 'Phones: install the ntfy app and subscribe to the rule\'s topic (an unguessable name on ntfy.sh, or your own ntfy server with an access token). Home Assistant: a webhook rule, or arm and disarm with the MQTT "Armed" switch.'));
   };
+  card._redraw = draw; // the SSE "armed" handler redraws it
   draw();
   return card;
 }
@@ -1445,17 +1464,24 @@ function editRule(r, cams, onSaved) {
   const groups = allGroups().map((g) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: g, checked: rule.groups.some((x) => x.toLowerCase() === g.toLowerCase()), onchange: () => drawZones() }), `group ${g}`));
   const camBoxes = cams.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id, checked: rule.cameras.includes(c.id), onchange: () => drawZones() }), c.name));
   const zoneBox = h('div', { class: 'row' });
+  // the zones chosen for this rule, kept while cameras are ticked and unticked
+  const chosenZones = new Set(rule.zones.map((z) => z.toLowerCase()));
   const picked = () => {
     const gs = groups.filter((b) => $('input', b).checked).map((b) => $('input', b).value.toLowerCase());
     const ids = camBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value));
     return !gs.length && !ids.length ? cams : cams.filter((c) => ids.includes(c.id) || groupsOf(c).some((g) => gs.includes(g.toLowerCase())));
   };
   let zoneChecks = [];
+  const zoneLabels = new Map(rule.zones.map((z) => [z.toLowerCase(), z]));
   function drawZones() {
-    const kept = new Set([...rule.zones, ...zoneChecks.filter((b) => $('input', b).checked).map((b) => $('input', b).value)].map((z) => z.toLowerCase()));
     const names = [...new Set(picked().flatMap((c) => parseZonesJson(c.zones_json, 'Zone').map((z) => z.name)))];
-    zoneChecks = names.map((n) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: n, checked: kept.has(n.toLowerCase()) }), n));
-    rule.zones = [];
+    names.forEach((n) => { if (!zoneLabels.has(n.toLowerCase())) zoneLabels.set(n.toLowerCase(), n); });
+    const here = new Set(names.map((n) => n.toLowerCase()));
+    // chosen zones that no picked camera has stay listed (and chosen) so saving never widens the rule
+    const orphans = [...chosenZones].filter((z) => !here.has(z)).map((z) => zoneLabels.get(z) || z);
+    zoneChecks = [...names, ...orphans].map((n) => h('label', { class: 'chip' + (here.has(n.toLowerCase()) ? '' : ' orphan'), title: here.has(n.toLowerCase()) ? '' : 'no picked camera has this zone' },
+      h('input', { type: 'checkbox', value: n, checked: chosenZones.has(n.toLowerCase()), onchange: (e) => { if (e.target.checked) chosenZones.add(n.toLowerCase()); else chosenZones.delete(n.toLowerCase()); } }),
+      here.has(n.toLowerCase()) ? n : `${n} (not on the picked cameras)`));
     fill(zoneBox, h('span', { class: 'muted small' }, 'Only in zones:'), ...(zoneChecks.length ? zoneChecks : [h('span', { class: 'muted small' }, 'the picked cameras have no named zones (anywhere counts)')]));
   }
   drawZones();
@@ -1468,10 +1494,11 @@ function editRule(r, cams, onSaved) {
     h('option', { value: '' }, 'Preset…'), ...SCHEDULE_PRESETS.map(([l], i) => h('option', { value: i }, l)));
   const schedRow = h('div', { hidden: !!always.checked }, h('div', { class: 'row' }, ...days), h('div', { class: 'row' }, h('label', { class: 'mini' }, 'from', from), h('label', { class: 'mini' }, 'to', to), presets, h('span', { class: 'muted small' }, 'a window that ends before it starts runs past midnight')));
   const armed = h('input', { type: 'checkbox', checked: rule.only_when_armed });
-  const interval = h('select', { style: 'width:auto' }, ...[0, 30, 60, 300, 900, 3600].map((v) => h('option', { value: v, selected: v === rule.min_interval_secs }, v ? `at most one per camera every ${fmtInterval(v).replace(' apart', '')}` : 'every event')));
+  const intervals = [...new Set([0, 30, 60, 300, 900, 3600, rule.min_interval_secs])].sort((a, b) => a - b);
+  const interval = h('select', { style: 'width:auto' }, ...intervals.map((v) => h('option', { value: v, selected: v === rule.min_interval_secs }, v ? `at most one per camera every ${fmtInterval(v).replace(' apart', '')}` : 'every event')));
   const kind = h('select', { style: 'width:auto' }, h('option', { value: 'ntfy', selected: rule.target_kind === 'ntfy' }, 'ntfy (phone push)'), h('option', { value: 'webhook', selected: rule.target_kind === 'webhook' }, 'webhook (JSON POST)'));
   const url = h('input', { value: rule.target_url, placeholder: 'https://ntfy.sh/church-cameras-7f3a', style: 'flex:1;min-width:260px' });
-  const token = h('input', { type: 'password', autocomplete: 'off', placeholder: rule.token_set ? 'set (leave blank to keep)' : 'optional: ntfy access token or bearer token', style: 'width:260px' });
+  const token = h('input', { type: 'password', autocomplete: 'new-password', placeholder: rule.token_set ? 'set (leave blank to keep)' : 'optional: ntfy access token or bearer token', style: 'width:260px' });
   const clearTok = rule.token_set ? h('label', { class: 'row check' }, h('input', { type: 'checkbox' }), 'remove the token') : null;
   const picture = h('input', { type: 'checkbox', checked: rule.picture });
   const errEl = h('p', { class: 'err' });
@@ -1482,7 +1509,7 @@ function editRule(r, cams, onSaved) {
       triggers: trig.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
       groups: groups.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
       cameras: camBoxes.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value)),
-      zones: zoneChecks.filter((b) => $('input', b).checked).map((b) => $('input', b).value),
+      zones: [...chosenZones].map((z) => zoneLabels.get(z) || z),
       schedule: always.checked ? null : { days: days.filter((b) => $('input', b).checked).map((b) => Number($('input', b).value)), from: from.value, to: to.value },
       only_when_armed: armed.checked, min_interval_secs: Number(interval.value),
       target_kind: kind.value, target_url: url.value.trim(), target_token: token.value, picture: picture.checked, clear_token: !!clearTok && $('input', clearTok).checked,
@@ -1836,7 +1863,7 @@ function listen() {
   sse.addEventListener('camera_down', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: not recording`, { kind: 'bad', ttl: 30000 }); });
   sse.addEventListener('camera_up', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: recording again`, { kind: 'ok' }); });
   sse.addEventListener('storage_low', (m) => { const e = JSON.parse(m.data); toast(`Storage ${e.path} low: ${gb(e.free_bytes)} free`, { kind: 'bad', ttl: 30000 }); });
-  sse.addEventListener('armed', (m) => { const e = JSON.parse(m.data); if (state.me) { state.me.armed = e.armed; drawArmed(); } if (e.by !== state.me?.user?.username) toast(`${e.armed ? 'Armed' : 'Disarmed'} by ${e.by}`); });
+  sse.addEventListener('armed', (m) => { const e = JSON.parse(m.data); if (state.me) { state.me.armed = e.armed; drawArmed(); } $('#alerts')?._redraw?.(); if (e.by !== state.me?.user?.username) toast(`${e.armed ? 'Armed' : 'Disarmed'} by ${e.by}`); });
 }
 
 async function boot() {

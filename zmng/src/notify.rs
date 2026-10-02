@@ -405,7 +405,11 @@ pub async fn mqtt_sink(mut rx: broadcast::Receiver<Notification>, db: Db, cfg: M
                     }
                     publish(&client, msgs);
                 }
-                // Home Assistant's "Armed" switch
+                // Home Assistant's "Armed" switch; a retained command would replay on every
+                // reconnect and undo later changes made in the UI, so only live ones count
+                Ok(MEvent::Incoming(Incoming::Publish(p))) if p.topic == t.armed_set() && p.retain => {
+                    warn!("mqtt {}: ignoring a retained command (publish it without retain)", t.armed_set());
+                }
                 Ok(MEvent::Incoming(Incoming::Publish(p))) if p.topic == t.armed_set() => {
                     let want = match p.payload.as_ref() {
                         b"ON" | b"on" | b"1" | b"true" => Some(true),

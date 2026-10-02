@@ -205,3 +205,56 @@ async fn home_assistant_arms_through_the_mqtt_switch() {
     }
     assert_eq!(broker.last("zmng/armed").unwrap().payload, b"OFF");
 }
+
+/// A self-hosted ntfy without attachment storage refuses the picture (400):
+/// the alert still arrives, as text.
+#[tokio::test]
+async fn ntfy_without_attachments_gets_the_text_alone() {
+    let got = Arc::new(Mutex::new(Vec::<Got>::new()));
+    let g = got.clone();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let g = g.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body = http_body_util::BodyExt::collect(body).await.unwrap().to_bytes().to_vec();
+            let put = parts.method == axum::http::Method::PUT;
+            g.lock().unwrap().push(Got { method: parts.method.to_string(), path: parts.uri.path().to_string(), headers: parts.headers, body });
+            if put { (axum::http::StatusCode::BAD_REQUEST, "attachments not allowed") } else { (axum::http::StatusCode::OK, "") }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let rule = zmng::alerts::Rule { name: "p".into(), target_url: format!("http://127.0.0.1:{port}/t"), ..Default::default() };
+    let a = zmng::alerts::Alert { rule_id: 1, trigger: "person".into(), title: "front: person".into(), message: "front · now".into(), tags: vec![], priority: 4, camera_id: Some(1), event_id: None, open: None, event: None };
+    zmng::alerts::send(&reqwest::Client::new(), &rule, &a, Some(bytes::Bytes::from_static(b"\xff\xd8x")), None).await.unwrap();
+    let g = got.lock().unwrap().clone();
+    assert_eq!(g.iter().map(|x| x.method.as_str()).collect::<Vec<_>>(), vec!["PUT", "POST"]);
+    assert_eq!(String::from_utf8_lossy(&g[1].body), "front · now");
+}
+
+/// A stored token stays with its destination: moving the rule to another
+/// host (or kind) without giving a new token drops it.
+#[tokio::test]
+async fn a_token_does_not_follow_the_rule_to_another_host() {
+    let fx = Fixture::new();
+    let admin = fx.token_for(fx.add_admin("admin", "password123"));
+    let r = fx.router();
+    let rule = json!({"name": "x", "triggers": ["person"], "target_kind": "ntfy", "target_url": "https://ntfy.church.example/cams", "target_token": "tk_private"});
+    let id = call(&r, "POST", "/api/alerts/rules", Some(&admin), Some(rule.clone())).await.json()["id"].as_i64().unwrap();
+    let mut same = rule.clone();
+    same["target_url"] = json!("https://ntfy.church.example/other-topic");
+    same["target_token"] = json!("");
+    call(&r, "PATCH", &format!("/api/alerts/rules/{id}"), Some(&admin), Some(same)).await;
+    assert_eq!(fx.db.alert_rule(id).unwrap().unwrap().target_token, "tk_private", "same server: kept");
+    let mut moved = rule.clone();
+    moved["target_kind"] = json!("webhook");
+    moved["target_url"] = json!("https://hooks.example.net/abc");
+    moved["target_token"] = json!("");
+    call(&r, "PATCH", &format!("/api/alerts/rules/{id}"), Some(&admin), Some(moved)).await;
+    assert_eq!(fx.db.alert_rule(id).unwrap().unwrap().target_token, "", "another host: dropped");
+    // ids are never reused (the engine remembers rules by id)
+    call(&r, "DELETE", &format!("/api/alerts/rules/{id}"), Some(&admin), None).await;
+    let id2 = call(&r, "POST", "/api/alerts/rules", Some(&admin), Some(rule)).await.json()["id"].as_i64().unwrap();
+    assert!(id2 > id);
+}

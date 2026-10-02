@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS session (
 );
 -- alert rules (see alerts.rs): the rule as JSON, and the last delivery
 CREATE TABLE IF NOT EXISTS alert_rule (
-  id           INTEGER PRIMARY KEY,
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- never reused: the alert engine remembers rules by id
   rule_json    TEXT NOT NULL,
   last_sent_ms INTEGER,
   last_error   TEXT,

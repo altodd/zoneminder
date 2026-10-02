@@ -271,3 +271,4 @@ button.ghost.on { color: var(--text); border-color: var(--accent); }
 /* alerts */
 #armed.armed { color: var(--ok); border-color: var(--ok); }
 tr.muted td { color: var(--muted); }
+.chip.orphan { border-style: dashed; color: var(--muted); }

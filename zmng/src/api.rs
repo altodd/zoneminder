@@ -935,7 +935,11 @@ async fn alert_rule_update(State(app): State<App>, Path(id): Path<i64>, user: Op
     let old = app.db.alert_rule(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such rule").into_response())?;
     let mut rule = req.rule;
     rule.id = id;
-    if rule.target_token.trim().is_empty() && !req.clear_token {
+    // keep the stored token only for the same kind of destination on the same host:
+    // a token for one server must not follow the rule to another
+    let origin = |u: &str| url::Url::parse(u.trim()).ok().map(|u| u.origin().ascii_serialization());
+    let same_place = rule.target_kind == old.target_kind && origin(&rule.target_url) == origin(&old.target_url);
+    if rule.target_token.trim().is_empty() && !req.clear_token && same_place {
         rule.target_token = old.target_token;
     }
     rule.validate().map_err(bad)?;
