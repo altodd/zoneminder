@@ -4,7 +4,6 @@
 //! functions it has no equivalent for).
 mod common;
 use common::*;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use zmng::mp4::TIMESCALE;
 
@@ -33,11 +32,8 @@ fn world() -> World {
 /// Pretend the detector for `cam` is running and (maybe) inside an event.
 fn set_detector(fx: &Fixture, cam: i64, in_event: Option<i64>) {
     let camera = fx.db.camera(cam).unwrap().unwrap();
-    let h = zmng::detect::DetectorHandle {
-        camera: RwLock::new(camera),
-        stop: tokio::sync::watch::channel(false).0,
-        status: RwLock::new(zmng::detect::DetectStatus { running: true, fps: 5.0, in_event, ..Default::default() }),
-    };
+    let h = zmng::detect::DetectorHandle::new(camera);
+    *h.status.write() = zmng::detect::DetectStatus { running: true, fps: 5.0, in_event, ..Default::default() };
     fx.hub.detectors.write().insert(cam, Arc::new(h));
 }
 

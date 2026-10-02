@@ -246,3 +246,24 @@ a.button.disabled { opacity: .45; pointer-events: none; }
 .zrow input[type=number] { width: 70px; }
 label.mini { font-size: 11px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; margin: 0; }
 .pill.zonepill { color: var(--accent); }
+
+/* motion tuning */
+.motioncv { position: absolute; pointer-events: none; }
+.livepanel { display: grid; gap: 4px; }
+.livepanel:empty { display: none; }
+.card.livepanel { margin-top: 8px; }
+.zmeter { display: grid; grid-template-columns: minmax(70px, 140px) minmax(60px, 1fr); gap: 2px 8px; align-items: center; font-size: 12px; }
+.zmeter .small { grid-column: 1 / -1; color: var(--muted); }
+.zmeter .zname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zmeter .bar { height: 8px; background: var(--panel2); border-radius: 4px; position: relative; overflow: hidden; }
+.zmeter .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent2); }
+.zmeter .bar::after { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--muted); }
+.zmeter.fired .bar i { background: var(--motion); }
+.zmeter.fired .zname { color: var(--motion); }
+.camdefaults { display: grid; grid-template-columns: auto auto; gap: 4px 8px; align-items: center; justify-content: start; margin-top: 4px; }
+.camdefaults > span { grid-column: 1 / -1; }
+.camdefaults label.mini { display: contents; }
+.dryrun { margin-top: 10px; }
+.dryrun progress { width: 180px; }
+.dryevents { max-height: 220px; overflow: auto; }
+button.ghost.on { color: var(--text); border-color: var(--accent); }

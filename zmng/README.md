@@ -97,6 +97,15 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/peers`, `/api/peers/{name}/api/...` | federation: peer reachability; proxied read API of a peer |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
 
+## Tuning motion detection
+
+Two tools in the zone editor (and the camera page's **Motion** button) replace waiting a night to judge a threshold change:
+
+* **Live motion** draws what the detector sees right now over the picture: the 8×8 cells that changed (orange; red while the frame scores), and per zone how much changed against what the zone needs, how large the largest moving object is against its minimum, and whether the zone fires. `GET /api/cameras/{id}/analysis` (admins) is the same as server-sent events (`event: analysis`, `{t_ms, score, w, h, bw, bh, changed, threshold, zones: [{name, changed_pct, blob_pct, min_area_pct, min_blob_pct, fired, score}]}`); the detector only builds it while someone listens.
+* **Test on recorded video** replays the last hour, last night, this morning or the last 12 hours through the detector with the editor's *unsaved* zones, sensitivities, pixel threshold and defaults, as fast as ffmpeg decodes the substream (main stream when no substream is recorded), and lists the events they would have produced next to the number recorded with the saved settings, with links to each moment. Same event rules as live (two scored frames open an event, quiet for the cooldown or 10 minutes long closes it, pre/post-roll); object detection is not replayed. `POST /api/cameras/{id}/dryrun {start, end, zones_json, masks_json, pixel_threshold, min_area_pct, min_blob_pct, cooldown_secs}` (admins, ≤ 12 h, at most 2 at once; a camera's earlier run is cancelled) returns a job; `GET /api/dryrun/{job}` gives `state`, `progress`, `frames`, `events`, `recorded_events`; `DELETE` cancels.
+
+Detector frames carry the recording's own timestamps (ffmpeg runs with `-copyts`; times are read from `showinfo`'s integer `pts` and time base), so motion scores line up with the fragments they describe.
+
 ## Export (incident handover)
 
 On the camera page and in Review, **[ In** and **Out ]** (keys I and O) mark a range on the playhead (drawn as a band on the timeline); **Export…** opens a dialog with the times (to the second), the cameras (Review's selection, or this camera), full resolution or substream, and a preview of what the ZIP will hold: size per camera, the gaps in the recording, cameras with nothing recorded. *Download ZIP* then streams `GET /api/export.zip`:

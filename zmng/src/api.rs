@@ -54,6 +54,8 @@ pub struct App {
     pub mjpeg_streams: Arc<parking_lot::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     /// an event re-classification pass is running
     pub classify_running: Arc<std::sync::atomic::AtomicBool>,
+    /// detection dry runs (zone tuning against recorded video)
+    pub dryruns: crate::dryrun::Jobs,
 }
 
 /// (camera, main stream, width)
@@ -808,6 +810,81 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
         b = b.header(header::CONTENT_LENGTH, len);
     }
     Ok(b.body(body).unwrap())
+}
+
+/// Live tuning view: what the detector sees in every frame (changed cells,
+/// per-zone change against the zone's thresholds) as server-sent events.
+/// Admins only; the analysis is only built while someone listens.
+async fn analysis_stream(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let h = app.hub.detectors.read().get(&id).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "the detector is not running for this camera"}))).into_response())?;
+    let mut rx = h.analysis.subscribe();
+    let stream = async_stream_from(move |tx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(a) => {
+                    let ev = axum::response::sse::Event::default().event("analysis").json_data(&*a).unwrap_or_default();
+                    if tx.send(Ok::<_, std::convert::Infallible>(ev)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+    Ok(axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response())
+}
+
+/// A stream fed by a task: `f` gets the sender and runs until it returns.
+fn async_stream_from<T: Send + 'static, F, Fut>(f: F) -> impl futures::Stream<Item = T>
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<T>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<T>(4);
+    tokio::spawn(f(tx));
+    futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
+}
+
+#[derive(Deserialize)]
+struct DryRunReq {
+    /// epoch milliseconds
+    start: i64,
+    end: i64,
+    #[serde(flatten)]
+    settings: crate::dryrun::Settings,
+}
+
+/// Start a dry run of other detection settings over recorded video (admins).
+async fn dryrun_start(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(req): Json<DryRunReq>) -> ApiResult {
+    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+    let cam = app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?;
+    let job = crate::dryrun::start(&app.dryruns, app.db.clone(), app.cfg.ffmpeg.clone(), &cam, req.settings, req.start, req.end).map_err(bad)?;
+    info!(user = %u.username, camera = id, start = req.start, end = req.end, "detection dry run");
+    let v = job.view.read().clone();
+    Ok(Json(v).into_response())
+}
+
+async fn dryrun_get(State(app): State<App>, Path(job): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let j = app.dryruns.lock().get(&job).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, "no such dry run").into_response())?;
+    let v = j.view.read().clone();
+    Ok(Json(v).into_response())
+}
+
+async fn dryrun_cancel(State(app): State<App>, Path(job): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    require_admin(user.as_ref().map(|e| &e.0))?;
+    let j = app.dryruns.lock().get(&job).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, "no such dry run").into_response())?;
+    if let Some(a) = j.abort.write().take() {
+        a.abort();
+    }
+    let mut v = j.view.write();
+    if v.state == "running" {
+        v.state = "cancelled".into();
+        *j.finished_ms.write() = Some(crate::db::now_dts() / 90);
+    }
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1759,6 +1836,7 @@ impl App {
             snap_locks: Default::default(),
             mjpeg_streams: Default::default(),
             classify_running: Default::default(),
+            dryruns: Default::default(),
         }
     }
 }
@@ -1784,6 +1862,9 @@ pub fn router(app: App) -> Router {
         .route("/api/cameras", get(cameras).post(camera_create))
         .route("/api/cameras/{id}", get(camera_get).patch(camera_update).delete(camera_delete))
         .route("/api/cameras/{id}/timeline", get(timeline))
+        .route("/api/cameras/{id}/analysis", get(analysis_stream))
+        .route("/api/cameras/{id}/dryrun", post(dryrun_start))
+        .route("/api/dryrun/{job}", get(dryrun_get).delete(dryrun_cancel))
         .route("/api/export.json", get(export_preview))
         .route("/api/export.zip", get(export_zip))
         .route("/api/cameras/{id}/video.mp4", get(video_range))
