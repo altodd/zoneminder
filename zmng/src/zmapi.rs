@@ -191,7 +191,8 @@ async fn users(State(_app): State<App>, user: Option<axum::Extension<AuthUser>>)
     Ok(Json(json!({"users": [{"User": {
         "Id": u.id.to_string(), "Username": u.username, "Enabled": "1",
         "System": if admin { "Edit" } else { "None" }, "Monitors": if admin { "Edit" } else { "View" },
-        "Stream": "View", "Events": "Edit", "Control": "None", "Groups": "View", "Snapshots": "View", "Devices": "None"
+        // PTZ is for admins (a move changes what every viewer sees)
+        "Stream": "View", "Events": "Edit", "Control": if admin { "Edit" } else { "None" }, "Groups": "View", "Snapshots": "View", "Devices": "None"
     }}]}))
     .into_response())
 }
@@ -238,6 +239,11 @@ async fn not_found() -> Response {
 }
 async fn saved() -> Response {
     Json(json!({"message": "Saved"})).into_response()
+}
+/// zmNinjaNg's Start/Stop/Restart and run-state buttons: zmng has no run
+/// states and is a system service, so say so instead of "Saved".
+async fn state_change() -> Response {
+    err(StatusCode::NOT_IMPLEMENTED, "zmng has no run states; start, stop or restart it on the server (systemctl restart zmng)")
 }
 
 // ---------------------------------------------------------------------------
@@ -289,14 +295,111 @@ async fn monitor_one(State(app): State<App>, Path(id): Path<String>, user: Optio
     let (i, c) = cams.iter().enumerate().find(|(_, c)| c.id == id).ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
     Ok(Json(json!({"monitor": monitor_json(&app, c, i)})).into_response())
 }
-async fn monitor_alarm(Path(_rest): Path<String>) -> Response {
-    Json(json!({"status": 0, "output": 0})).into_response()
+/// `id:<n>/command:<status|on|off>.json` path segments.
+fn alarm_args(rest: &str) -> (Option<i64>, String) {
+    let mut id = None;
+    let mut cmd = String::new();
+    for seg in rest.trim_end_matches(".json").split('/') {
+        match seg.split_once(':') {
+            Some(("id", v)) => id = v.trim().parse().ok(),
+            Some(("command", v)) => cmd = v.trim().to_lowercase(),
+            _ => {}
+        }
+    }
+    (id, cmd)
+}
+
+/// ZoneMinder's alarm state for a monitor: 2 (Alarm) while the detector has
+/// an event open, else 0 (Idle). zmNinjaNg polls this for its Live Activity
+/// page and the alarm ring. Forcing an alarm on or off has no equivalent
+/// here (events come from motion and object detection), so `on`/`off` get
+/// ZoneMinder's error shape and the app reports the failure.
+async fn monitor_alarm(State(app): State<App>, Path(rest): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let (id, cmd) = alarm_args(&rest);
+    let id = id.filter(|id| crate::api::visible_cameras_pub(&app, u).contains(id)).ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
+    if cmd != "status" {
+        return Ok(Json(json!({"status": "false", "code": 501, "error": "zmng does not force alarms: events come from motion and object detection"})).into_response());
+    }
+    let alarm = crate::detect::status(&app.hub, id).is_some_and(|d| d.running && d.in_event.is_some());
+    let state = if alarm { "2" } else { "0" };
+    Ok(Json(json!({"status": state, "output": state})).into_response())
+}
+
+/// `POST monitors/<id>.json` from the app's mode and settings dialogs. zmng
+/// records and detects continuously, so only on/off maps: `Enabled`,
+/// `Capturing` (None = off) and `Function` None/Mocord. A value that is
+/// already true (Analysing=Always on an enabled camera) is accepted; every
+/// other change is refused with a message rather than a "Saved" that did
+/// nothing. Admins only, as in ZoneMinder (Monitors: Edit).
+async fn monitor_post(State(app): State<App>, Path(id): Path<String>, user: Option<axum::Extension<AuthUser>>, Form(f): Form<HashMap<String, String>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    if u.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "Insufficient privileges"));
+    }
+    let id: i64 = id.trim_end_matches(".json").parse().map_err(|_| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
+    let cam = app.db.camera(id).map_err(e500)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
+    let mut enabled: Option<bool> = None;
+    let mut refused = Vec::new();
+    let mut want = |v: bool, field: &str, refused: &mut Vec<String>| match enabled {
+        Some(prev) if prev != v => refused.push(format!("{field} contradicts another field")),
+        _ => enabled = Some(v),
+    };
+    for (k, v) in &f {
+        let Some(field) = k.strip_prefix("Monitor[").and_then(|x| x.strip_suffix(']')) else { continue };
+        let v = v.trim();
+        match field {
+            "Enabled" => want(v == "1" || v.eq_ignore_ascii_case("true"), field, &mut refused),
+            "Capturing" if v.eq_ignore_ascii_case("None") => want(false, field, &mut refused),
+            "Capturing" if v.eq_ignore_ascii_case("Always") || v.eq_ignore_ascii_case("Ondemand") => want(true, field, &mut refused),
+            "Function" if v.eq_ignore_ascii_case("None") => want(false, field, &mut refused),
+            "Function" if v.eq_ignore_ascii_case("Mocord") => want(true, field, &mut refused),
+            // what an enabled camera does anyway
+            "Analysing" | "Recording" | "Decoding" if v.eq_ignore_ascii_case("Always") => {}
+            "Name" if v == cam.name => {}
+            _ => refused.push(format!("{field}={v}")),
+        }
+    }
+    if !refused.is_empty() {
+        refused.sort();
+        let msg = format!("zmng cannot set {} (it records and detects continuously; only Enabled, Capturing and Function None/Mocord can be changed from the app)", refused.join(", "));
+        return Err(err(StatusCode::BAD_REQUEST, &msg));
+    }
+    if let Some(on) = enabled.filter(|on| *on != cam.enabled) {
+        app.db.update_camera(id, json!({"enabled": on}).as_object().unwrap()).map_err(e500)?;
+        info!(camera = id, enabled = on, user = %u.username, "camera switched from the ZoneMinder API");
+    }
+    Ok(saved().await)
 }
 async fn monitor_daemon(Path(_rest): Path<String>) -> Response {
     Json(json!({"status": "ok", "statustext": "running"})).into_response()
 }
-async fn zones(Query(_q): Query<HashMap<String, String>>) -> Response {
-    Json(json!({"zones": []})).into_response()
+/// ZoneMinder zone rows for one camera: its zones as Active, its masks as
+/// Inactive, or one "All" zone (the whole frame) when it has none; percent
+/// coordinates with two decimals, as ZoneMinder stores them.
+fn zone_rows(c: &crate::db::Camera) -> Vec<Value> {
+    let fmt = |poly: &[(f64, f64)]| poly.iter().map(|(x, y)| format!("{:.2},{:.2}", x * 100.0, y * 100.0)).collect::<Vec<_>>().join(" ");
+    let mut zones = crate::detect::parse_polys(&c.zones_json);
+    let masks = crate::detect::parse_polys(&c.masks_json);
+    let named = !zones.is_empty();
+    if zones.is_empty() {
+        zones.push(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+    }
+    let row = |i: usize, kind: &str, name: String, poly: &[(f64, f64)]| {
+        json!({"Zone": {"Id": (c.id * 1000 + i as i64 + 1).to_string(), "MonitorId": c.id.to_string(), "Name": name, "Type": kind,
+            "Units": "Percent", "NumCoords": poly.len().to_string(), "Coords": fmt(poly), "CheckMethod": "Blobs",
+            "MinPixelThreshold": c.pixel_threshold.to_string(), "AlarmRGB": "16711680"}})
+    };
+    let mut out: Vec<Value> = zones.iter().enumerate().map(|(i, p)| row(i, "Active", if named { format!("Zone {}", i + 1) } else { "All".into() }, p)).collect();
+    out.extend(masks.iter().enumerate().map(|(i, p)| row(zones.len() + i, "Inactive", format!("Mask {}", i + 1), p)));
+    out
+}
+
+async fn zones(State(app): State<App>, Query(q): Query<HashMap<String, String>>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let only: Option<i64> = q.get("MonitorId").and_then(|s| s.parse().ok());
+    let rows: Vec<Value> = visible(&app, u).iter().filter(|c| only.is_none_or(|id| id == c.id)).flat_map(zone_rows).collect();
+    Ok(Json(json!({"zones": rows})).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +630,9 @@ async fn index_php(State(app): State<App>, RawQuery(raw): RawQuery, headers: Hea
                 let t = e.start_dts + (n.max(1) - 1) * TIMESCALE as i64 / 18;
                 return crate::api::frame_jpeg_pub(&app, e.camera_id, t, width).await;
             }
+            if fid == "objdetect" {
+                return objdetect_jpeg(&app, &e, width).await;
+            }
             if let Some(rel) = &e.thumb_path {
                 if width <= 640 {
                     if let Ok(data) = tokio::fs::read(app.cfg.thumb_dir.join(rel)).await {
@@ -579,6 +685,30 @@ async fn index_php(State(app): State<App>, RawQuery(raw): RawQuery, headers: Hea
         }
         _ => Err(err(StatusCode::NOT_FOUND, "unsupported view")),
     }
+}
+
+/// ZoneMinder's `objdetect.jpg`: the event picture (the stored thumbnail,
+/// or the main-stream frame at the peak when a larger one is asked for) with
+/// the detected objects' boxes drawn on it. 404 when nothing was detected,
+/// as ZoneMinder has no such file then (the app skips that frame).
+async fn objdetect_jpeg(app: &App, e: &Event, width: u32) -> ApiResult {
+    let objs = crate::notify::objects_from_meta(e);
+    if objs.is_empty() {
+        return Err(err(StatusCode::NOT_FOUND, "no objects detected in this event"));
+    }
+    let stored = match (&e.thumb_path, width <= 640) {
+        (Some(rel), true) => tokio::fs::read(app.cfg.thumb_dir.join(rel)).await.ok(),
+        _ => None,
+    };
+    let jpeg = match stored {
+        Some(j) => j,
+        None => {
+            let res = crate::api::frame_jpeg_pub(app, e.camera_id, e.peak_dts.unwrap_or(e.start_dts), width).await?;
+            http_body_util::BodyExt::collect(res.into_body()).await.map_err(e500)?.to_bytes().to_vec()
+        }
+    };
+    let out = tokio::task::spawn_blocking(move || crate::objects::draw_boxes(&jpeg, &objs)).await.map_err(e500)?.map_err(e500)?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=300")], out).into_response())
 }
 
 /// ZoneMinder control command name -> (pan, tilt, zoom) velocity, or None
@@ -1201,7 +1331,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/configs/viewByName/{name}", get(config_by_name))
         .route("/zm/api/servers.json", get(|| async { Json(json!({"servers": []})).into_response() }))
         .route("/zm/api/states.json", get(|| async { Json(json!({"states": []})).into_response() }))
-        .route("/zm/api/states/change/{*rest}", post(saved))
+        .route("/zm/api/states/change/{*rest}", post(state_change))
         .route("/zm/api/groups.json", get(groups))
         .route("/zm/api/tags.json", get(not_found))
         .route("/zm/api/tags/{*rest}", get(not_found))
@@ -1211,7 +1341,7 @@ pub fn router() -> Router<App> {
         .route("/zm/api/monitors.json", get(monitors))
         .route("/zm/api/monitors/alarm/{*rest}", get(monitor_alarm))
         .route("/zm/api/monitors/daemonStatus/{*rest}", get(monitor_daemon))
-        .route("/zm/api/monitors/{id}", get(monitor_one).post(saved))
+        .route("/zm/api/monitors/{id}", get(monitor_one).post(monitor_post))
         .route("/zm/api/controls/{id}", get(control_one))
         .route("/zm/api/events/index.json", get(events_index))
         .route("/zm/api/events/index/{*filters}", get(events_index))

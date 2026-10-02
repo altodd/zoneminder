@@ -258,6 +258,51 @@ pub fn jpeg_size(jpeg: &[u8]) -> Result<(u32, u32)> {
     Ok(r.into_dimensions()?)
 }
 
+/// Outline colour per object kind, the same as the web UI's timeline colours.
+fn box_colour(label: &str) -> [u8; 3] {
+    match label {
+        "person" => [0x3d, 0xdc, 0x84],
+        "car" | "truck" | "bus" | "motorcycle" | "bicycle" => [0xc3, 0x8b, 0xff],
+        "dog" | "cat" | "bird" | "horse" => [0x4f, 0xd1, 0xc5],
+        _ => [0xf9, 0xb8, 0x4f],
+    }
+}
+
+/// The event picture with each object's box drawn on it (ZoneMinder's
+/// `objdetect.jpg`). Boxes are normalized, so any picture of the same field
+/// of view works; the line width follows the picture size.
+pub fn draw_boxes(jpeg: &[u8], objs: &[DetectedObject]) -> Result<Vec<u8>> {
+    let mut img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?.to_rgb8();
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return Ok(jpeg.to_vec());
+    }
+    let t = (w / 240).clamp(2, 6);
+    for o in objs {
+        let c = image::Rgb(box_colour(&o.label));
+        let px = |v: f64, max: u32| ((v.clamp(0.0, 1.0) * max as f64).round() as u32).min(max - 1);
+        let (x0, y0, x1, y1) = (px(o.bbox[0], w), px(o.bbox[1], h), px(o.bbox[2], w), px(o.bbox[3], h));
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        for k in 0..t {
+            let (top, bottom) = ((y0 + k).min(y1), y1.saturating_sub(k).max(y0));
+            let (left, right) = ((x0 + k).min(x1), x1.saturating_sub(k).max(x0));
+            for x in x0..=x1 {
+                img.put_pixel(x, top, c);
+                img.put_pixel(x, bottom, c);
+            }
+            for y in y0..=y1 {
+                img.put_pixel(left, y, c);
+                img.put_pixel(right, y, c);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
+    Ok(out)
+}
+
 /// Intersection over union of two normalized boxes.
 pub fn iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
@@ -456,6 +501,23 @@ mod tests {
         assert_eq!(kept[0].bbox[0], 0.6);
         assert_eq!(filter(objs, &[], 0.0, &[], &[]).len(), 4);
         assert!(!inside(&[(0.0, 0.0), (1.0, 1.0)], 0.5, 0.5));
+    }
+
+    #[test]
+    fn draw_boxes_outlines_each_object_in_its_kind_colour() {
+        let grey = image::RgbImage::from_pixel(320, 180, image::Rgb([128, 128, 128]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode(grey.as_raw(), 320, 180, image::ExtendedColorType::Rgb8).unwrap();
+        let out = draw_boxes(&jpeg, &[obj("person", 0.9, [0.25, 0.25, 0.75, 0.75]), obj("car", 0.8, [0.9, 0.9, 0.9, 0.95])]).unwrap();
+        let img = image::load_from_memory(&out).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (320, 180));
+        // the person box's top edge is green, its middle untouched
+        let edge = img.get_pixel(160, 46);
+        assert!(edge[1] > 180 && edge[0] < 120, "edge {edge:?}");
+        let mid = img.get_pixel(160, 90);
+        assert!((mid[0] as i32 - 128).abs() < 12 && (mid[1] as i32 - 128).abs() < 12, "mid {mid:?}");
+        // a zero-width box draws nothing and does not panic; garbage in is an error
+        assert!(draw_boxes(b"not a jpeg", &[]).is_err());
     }
 
     #[test]
