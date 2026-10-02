@@ -61,7 +61,7 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 .grid.focus .tile video { max-height: 80vh; }
 .tile { cursor: pointer; }
 .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-.toolbar .grow { flex: 1; }
+.toolbar .grow, .row .grow, .controls .grow { flex: 1; }
 
 /* review / timeline */
 .player { background: #000; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); position: relative; }

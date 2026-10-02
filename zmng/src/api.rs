@@ -217,7 +217,7 @@ async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> 
         || path == "/zm/api/host/getVersion.json" || path == "/zm/api/host/login.json" || path == "/zm/ws"
         || !(path.starts_with("/api/") || path.starts_with("/zm/"));
     let user = match token_from(req.headers()).or_else(|| token_from_query(req.uri())) {
-        Some(t) => app.db.session_user(&t).ok().flatten(),
+        Some(t) => app.db.auth_user(&t).ok().flatten(),
         None => None,
     };
     let user = match user {
@@ -1153,14 +1153,95 @@ struct FrameQ {
 
 /// Long-lived bearer token for automation (Home Assistant etc.), bound to the
 /// calling admin.  Returned once; stored as a session with a 10-year TTL.
-async fn create_token(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
-    let u = require_admin(user.as_ref().map(|e| &e.0))?;
+#[derive(Deserialize, Default)]
+struct TokenCreate {
+    /// what it is for ("Home Assistant", "barn peer"); default "API token"
+    name: Option<String>,
+    /// whose token it is (default: the admin creating it); a federation
+    /// peer's or a guest integration's token belongs to a viewer
+    user_id: Option<i64>,
+    /// None/absent = never expires
+    expires_days: Option<f64>,
+}
+
+/// Issue a long-lived API token (admins). It acts exactly as its user,
+/// with that user's cameras; it is returned once and stored hashed.
+async fn create_token(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, body: Option<Json<TokenCreate>>) -> ApiResult {
+    let me = require_admin(user.as_ref().map(|e| &e.0))?;
+    if me.id == 0 {
+        return Err(bad("finish setup first"));
+    }
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let name = req.name.as_deref().map(str::trim).unwrap_or("API token");
+    if name.is_empty() || name.len() > 80 {
+        return Err(bad("token name: 1-80 characters"));
+    }
+    let owner = match req.user_id {
+        Some(id) => app.db.session_user_by_id(id).map_err(err500)?.ok_or_else(|| bad("no such user"))?,
+        None => me.clone(),
+    };
+    let expires_at = match req.expires_days {
+        Some(d) if !(d > 0.0 && d <= 3650.0) => return Err(bad("expires_days: more than 0, at most 3650")),
+        Some(d) => Some(crate::db::now_secs() + (d * 86400.0) as i64),
+        None => None,
+    };
+    let token = format!("zmng_{}", new_token());
+    let id = app.db.create_api_token(owner.id, name, &token, expires_at, Some(me.id)).map_err(err500)?;
+    info!(by = %me.username, owner = %owner.username, name, "API token created");
+    Ok(Json(serde_json::json!({"id": id, "token": token, "name": name, "user_id": owner.id, "username": owner.username, "expires_at": expires_at})).into_response())
+}
+
+/// API tokens: every token for admins, a user's own otherwise.
+async fn list_tokens(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let rows = app.db.api_tokens(if u.role == "admin" { None } else { Some(u.id) }).map_err(err500)?;
+    Ok(Json(rows).into_response())
+}
+
+/// Revoke a token: admins any, users their own (others' look absent).
+async fn revoke_token(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    if !app.db.delete_api_token(id, if u.role == "admin" { None } else { Some(u.id) }).map_err(err500)? {
+        return Err((StatusCode::NOT_FOUND, "no such token").into_response());
+    }
+    info!(by = %u.username, token = id, "API token revoked");
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
+}
+
+#[derive(Deserialize)]
+struct PasswordChange {
+    current: String,
+    new: String,
+}
+
+/// Change your own password (any role). The current password is required,
+/// also when the request comes with an API token, and failures count
+/// towards the login throttle. Other sign-ins of this user end; the one
+/// making the change and the user's API tokens stay.
+async fn change_own_password(State(app): State<App>, headers: HeaderMap, uri: axum::http::Uri, user: Option<axum::Extension<AuthUser>>, Json(p): Json<PasswordChange>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
     if u.id == 0 {
         return Err(bad("finish setup first"));
     }
-    let token = new_token();
-    app.db.create_session(u.id, &token, 10 * 365 * 86400).map_err(err500)?;
-    Ok(Json(serde_json::json!({"token": token})).into_response())
+    if !app.login_guard.lock().allowed() {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":"too many failed attempts; try again in a minute"}))).into_response());
+    }
+    if !verify_password(&p.current, &u.pass_hash) {
+        app.login_guard.lock().record_failure();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"the current password is not right"}))).into_response());
+    }
+    if p.new.len() < 8 {
+        return Err(bad("the new password needs at least 8 characters"));
+    }
+    if p.new == p.current {
+        return Err(bad("the new password is the same as the current one"));
+    }
+    app.db.set_password_hash(u.id, &hash_password(&p.new).map_err(err500)?).map_err(err500)?;
+    let keep = token_from(&headers).or_else(|| token_from_query(&uri));
+    let ended = app.db.delete_user_sessions(u.id, keep.as_deref()).map_err(err500)?;
+    info!(user = %u.username, other_sessions_ended = ended, "password changed by the user");
+    Ok(Json(serde_json::json!({"ok": true, "sessions_ended": ended})).into_response())
 }
 
 async fn users(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -1225,9 +1306,10 @@ struct UserPatch {
 }
 
 /// Edit a user: name, password, role, and what a viewer may see (cameras
-/// and/or groups). Existing sign-ins and API tokens stay valid. The last
+/// and/or groups). A password reset ends the user's sign-ins; renames and
+/// grant changes leave them, and API tokens stay valid throughout. The last
 /// admin cannot be demoted, and nobody can demote themselves.
-async fn user_update(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(p): Json<UserPatch>) -> ApiResult {
+async fn user_update(State(app): State<App>, Path(id): Path<i64>, headers: HeaderMap, user: Option<axum::Extension<AuthUser>>, Json(p): Json<UserPatch>) -> ApiResult {
     let me = require_admin(user.as_ref().map(|e| &e.0))?.clone();
     let target = app.db.session_user_by_id(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such user").into_response())?;
     // validate everything before changing anything
@@ -1261,7 +1343,10 @@ async fn user_update(State(app): State<App>, Path(id): Path<i64>, user: Option<a
     }
     if let Some(pw) = &p.password {
         app.db.set_password_hash(id, &hash_password(pw).map_err(err500)?).map_err(err500)?;
-        info!(user = id, "password changed");
+        // a reset ends that user's sign-ins (an admin resetting their own keeps this one)
+        let keep = if me.id == id { token_from(&headers) } else { None };
+        let ended = app.db.delete_user_sessions(id, keep.as_deref()).map_err(err500)?;
+        info!(user = id, by = %me.username, sessions_ended = ended, "password reset");
     }
     if let Some(r) = &p.role {
         app.db.set_role(id, r).map_err(err500)?;
@@ -1593,7 +1678,9 @@ pub fn router(app: App) -> Router {
         .route("/api/events/{id}", get(event_get).patch(event_update))
         .route("/api/events/{id}/thumb.jpg", get(event_thumb))
         .route("/api/events/stream", get(event_stream))
-        .route("/api/tokens", post(create_token))
+        .route("/api/tokens", get(list_tokens).post(create_token))
+        .route("/api/tokens/{id}", axum::routing::delete(revoke_token))
+        .route("/api/me/password", post(change_own_password))
         .route("/api/users", get(users).post(user_create))
         .route("/api/users/{id}", axum::routing::patch(user_update).delete(user_delete))
         .route("/api/groups/rename", post(group_rename))

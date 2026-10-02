@@ -82,7 +82,9 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/segments/{id}/file.mp4` (Range), `/init.mp4`, `/frag/{n}.m4s` | raw media for HLS |
 | `GET /api/events?camera&start&end&min_score&kind&archived&before&limit&order` | keyset-paged list (`kind`: comma list of `motion`, `person`, `car`, ...); each event carries `objects` |
 | `GET/PATCH /api/events/{id}`, `GET /api/events/{id}/thumb.jpg` | event detail, archive/notes, thumbnail |
-| `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin) |
+| `GET/POST /api/users`, `PATCH/DELETE /api/users/{id}` | users and their camera lists (admin); a password reset ends that user's sign-ins |
+| `POST /api/me/password` `{current, new}` | change your own password (any role; the current password is required, failures count towards the login throttle); your other sign-ins end, API tokens stay |
+| `GET /api/tokens`, `POST /api/tokens` `{name, user_id, expires_days}`, `DELETE /api/tokens/{id}` | API tokens: admins issue a named token for any user (it acts as that user), optionally expiring; the `zmng_…` token is returned once and stored hashed. Admins list and revoke all, others their own |
 | `GET /api/events/stream` | server-sent events: `event_start`, `event_update`, `event_end`, `camera_down`, `camera_up`, `storage_low` (ACL re-checked per message) |
 | `GET /api/status` | health report: per-camera recording/detector state, last event, ingest, per-volume headroom and effective retention days, issues list |
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
@@ -97,7 +99,7 @@ Each server records its own cameras; one of them (or all of them) lists the othe
 [[peers]]
 name = "barn"                         # [a-z0-9-]+, used in URLs and labels
 url = "http://10.10.100.101:8080"
-token = "…"                           # created on the peer: POST /api/tokens while logged in as the account this site may use
+token = "zmng_…"                      # issued on the peer: Admin → API tokens, "acts as" a viewer of the shared cameras
 ```
 `/api/peers/<name>/api/...` proxies the peer's *read* API with that token (cameras, events, segments, previews, timeline, media, status; PATCH on events; PTZ for local admins), never its users, tokens, storage or its own peers. Create the token on the peer for a **viewer** account limited to the cameras this site is allowed to see: the peer's ACL for that account is what the proxy returns. The browser merges the peers' cameras into the live wall, Review and Events (labelled `name @peer`) and plays their media through the proxy; `GET /api/peers` shows which peers answer. Recording, retention, detection, notifications and the Status page stay per server. Peer events are not pushed over SSE and their go2rtc/WebRTC tiles are not available through the proxy.
 
@@ -160,7 +162,7 @@ Every event start/end, camera outage/recovery, storage warning and service start
   topic_prefix = "zmng"                # zmng/status, zmng/camera/<id>/{motion,recording,event,thumbnail}
   discovery_prefix = "homeassistant"   # "" disables discovery
   ```
-  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. While the broker is unreachable, notifications are dropped (state topics are republished on reconnect); a camera removed from zmng keeps its stale discovery entry in HA until you delete the device there. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<long-lived token>` (HA's generic camera cannot send a bearer header; `POST /api/tokens` makes the token).
+  Each camera appears in HA as a device with a *Motion* binary sensor (`ON` for the length of the event), a *Recording* sensor, a *Last event* sensor (attributes = the event JSON) and a *Last event thumbnail* camera entity. `zmng/status` is retained `online`/`offline` (last will) and is the availability topic. While the broker is unreachable, notifications are dropped (state topics are republished on reconnect); a camera removed from zmng keeps its stale discovery entry in HA until you delete the device there. Live images for HA dashboards: the `generic` camera platform on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<API token>` (HA's generic camera cannot send a bearer header; issue the token under Admin → API tokens for a viewer who sees only those cameras).
 * **UI** — `GET /api/events/stream` is a server-sent-events feed of the same notifications, filtered to the cameras the user may see; the web UI shows toasts from it.
 * **zmNinjaNg** — `/zm/ws` speaks the zmeventnotification websocket protocol (auth, `control/version`, `control/filter` with `monlist`/`intlist`, `push/token` registration, `alarm` messages with `DetectionJson`). Point the app's event-server URL at `ws(s)://<host>/zm/ws`.
 

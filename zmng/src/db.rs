@@ -172,6 +172,19 @@ CREATE TABLE IF NOT EXISTS session (
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+-- long-lived credentials for Home Assistant, federation peers and scripts;
+-- the token is shown once and only its SHA-256 is kept
+CREATE TABLE IF NOT EXISTS api_token (
+  id           INTEGER PRIMARY KEY,
+  user_id      INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  token_hash   TEXT NOT NULL UNIQUE,
+  hint         TEXT NOT NULL,          -- first characters, to tell tokens apart
+  created_at   INTEGER NOT NULL,
+  created_by   INTEGER,
+  expires_at   INTEGER,                -- NULL = never
+  last_used_at INTEGER
+);
 "#;
 
 /// Indexes are created after `migrate()` so a database from an older build
@@ -290,7 +303,49 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has_col("camera", "record_sub")? {
         c.execute_batch("ALTER TABLE camera ADD COLUMN record_sub INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN event_retention_days REAL NOT NULL DEFAULT 0;")?;
     }
+    // tokens from older builds were 10-year sessions: make them listed,
+    // revocable API tokens (same token, now stored hashed)
+    {
+        let mut st = c.prepare("SELECT token, user_id, created_at, expires_at FROM session WHERE expires_at - created_at > ?1")?;
+        let rows: Vec<(String, i64, i64, i64)> = st.query_map(params![LEGACY_TOKEN_SECS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
+        for (token, user_id, created_at, expires_at) in rows {
+            let day = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at, 0).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
+            c.execute(
+                "INSERT OR IGNORE INTO api_token(user_id,name,token_hash,hint,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![user_id, format!("token from an earlier version ({day})"), token_hash(&token), token_hint(&token), created_at, expires_at],
+            )?;
+            c.execute("DELETE FROM session WHERE token=?1", params![token])?;
+        }
+    }
     Ok(())
+}
+
+/// Sessions longer than this were API tokens (older builds issued 10 years).
+const LEGACY_TOKEN_SECS: i64 = 365 * 86400;
+
+/// SHA-256 of a token, hex: what the api_token table keeps.
+pub fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+/// The first characters of a token, shown in lists to tell tokens apart.
+pub fn token_hint(token: &str) -> String {
+    token.chars().take(10).collect()
+}
+
+/// An API token as listed (never the token itself).
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiToken {
+    pub id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub name: String,
+    pub hint: String,
+    pub created_at: i64,
+    pub created_by: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -1544,6 +1599,69 @@ impl Db {
             c.execute("DELETE FROM session WHERE token=?1", params![token])?;
             Ok(())
         })
+    }
+
+    /// End a user's sign-ins (browser and zmNinjaNg sessions), all but
+    /// `keep`. API tokens are separate credentials and stay.
+    pub fn delete_user_sessions(&self, user_id: i64, keep: Option<&str>) -> Result<usize> {
+        self.with(|c| Ok(c.execute("DELETE FROM session WHERE user_id=?1 AND token<>?2", params![user_id, keep.unwrap_or("")])?))
+    }
+
+    /// The user behind a request token: a sign-in session, else an API
+    /// token (not expired). An API token's use is recorded at most once a
+    /// minute.
+    pub fn auth_user(&self, token: &str) -> Result<Option<User>> {
+        if !token.starts_with("zmng_") {
+            if let Some(u) = self.session_user(token)? {
+                return Ok(Some(u));
+            }
+        }
+        let hash = token_hash(token);
+        self.with(|c| {
+            let now = now_secs();
+            let row = c
+                .query_row(
+                    "SELECT u.id,u.username,u.role,u.pass_hash,t.id,t.last_used_at FROM api_token t JOIN user u ON u.id=t.user_id WHERE t.token_hash=?1 AND (t.expires_at IS NULL OR t.expires_at>?2)",
+                    params![hash, now],
+                    |r| Ok((User { id: r.get(0)?, username: r.get(1)?, role: r.get(2)?, pass_hash: r.get(3)? }, r.get::<_, i64>(4)?, r.get::<_, Option<i64>>(5)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(u, id, last)| {
+                if last.is_none_or(|l| now - l >= 60) {
+                    let _ = c.execute("UPDATE api_token SET last_used_at=?1 WHERE id=?2", params![now, id]);
+                }
+                u
+            }))
+        })
+    }
+
+    pub fn create_api_token(&self, user_id: i64, name: &str, token: &str, expires_at: Option<i64>, created_by: Option<i64>) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO api_token(user_id,name,token_hash,hint,created_at,created_by,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![user_id, name, token_hash(token), token_hint(token), now_secs(), created_by, expires_at],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// Tokens of one user, or of everyone (`None`), newest first.
+    pub fn api_tokens(&self, user_id: Option<i64>) -> Result<Vec<ApiToken>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT t.id,t.user_id,u.username,t.name,t.hint,t.created_at,t.created_by,t.expires_at,t.last_used_at FROM api_token t JOIN user u ON u.id=t.user_id WHERE ?1 IS NULL OR t.user_id=?1 ORDER BY t.id DESC",
+            )?;
+            let rows = st.query_map(params![user_id], |r| {
+                Ok(ApiToken { id: r.get(0)?, user_id: r.get(1)?, username: r.get(2)?, name: r.get(3)?, hint: r.get(4)?, created_at: r.get(5)?, created_by: r.get(6)?, expires_at: r.get(7)?, last_used_at: r.get(8)? })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Revoke a token; `owner` limits it to that user's tokens. Returns
+    /// whether a token was removed.
+    pub fn delete_api_token(&self, id: i64, owner: Option<i64>) -> Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM api_token WHERE id=?1 AND (?2 IS NULL OR user_id=?2)", params![id, owner])? > 0))
     }
 }
 

@@ -89,7 +89,7 @@ The files are not touched; each event becomes a legacy segment (timestamps shift
 
 `deploy/homeassistant.yaml` has the pieces:
 * MQTT discovery creates one device per camera (Motion, Recording, Last event, Last event thumbnail) as soon as `[mqtt]` is configured; nothing to add in HA.
-* Live images: `camera: platform: generic` on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<token>` with a long-lived token from `Admin → Create API token`. HA's generic camera cannot send a bearer header, so the token goes in the query string (the URL lives in HA's config only; the snapshot is decoded from the substream unless `stream=main` is added).
+* Live images: `camera: platform: generic` on `/api/cameras/<id>/snapshot.jpg?width=1280&token=<token>` with a token from `Admin → API tokens` that acts as a viewer limited to those cameras (revocable there). HA's generic camera cannot send a bearer header, so the token goes in the query string (the URL lives in HA's config only; the snapshot is decoded from the substream unless `stream=main` is added).
 * Automations: trigger on `binary_sensor.<camera>_motion` or the `zmng/camera/<id>/event` topic (payload = the event JSON); or point `alert_webhook` at an HA webhook trigger.
 * Health: `sensor` on `/api/status` or scrape `/api/metrics` with Prometheus/Grafana.
 

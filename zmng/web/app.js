@@ -932,7 +932,6 @@ async function viewAdmin(main) {
     ...storages.map((st) => h('tr', {}, h('td', {}, h('b', {}, storageName(storages, st.id)), h('div', {}, h('code', {}, st.path)), st.available ? null : h('span', { class: 'pill bad' }, 'not mounted')), h('td', {}, gb(st.used_bytes)), h('td', {}, gb(st.free_bytes)), h('td', {}, st.max_bytes ? gb(st.max_bytes) : '—'), h('td', {}, gb(st.reserve_bytes)),
       h('td', {}, st.read_only ? h('span', { class: 'pill' }, 'read-only') : st.archive_to ? `→ ${storageName(storages, st.archive_to)} after ${st.archive_after_days ?? '—'} d @ ${st.archive_rate_mbps} Mb/s` : '—'),
       h('td', { class: 'actions' }, h('button', { class: 'ghost small', onclick: () => editStorage(st, storages) }, 'Edit')))));
-  const tokenBtn = h('button', { class: 'ghost small', onclick: async () => { const t = await api.post('/api/tokens'); prompt('Long-lived API token (Home Assistant etc.). Shown once:', t.token); } }, 'Create API token');
   const objects = state.me.objects
     ? h('div', {}, h('p', {}, h('span', { class: 'pill ok' }, 'detector configured'), ' People, vehicles and animals are labelled on motion, and again from each event\'s full-resolution picture when it ends.'),
       h('div', { class: 'row' }, h('button', { class: 'ghost small', onclick: async (e) => { e.target.disabled = true; try { const r = await api.post('/api/events/classify', { days: 7 }); toast(`Checking ${r.queued} events from the last 7 days in the background`, { kind: 'ok' }); } catch (err) { toast(err.message, { kind: 'bad' }); } } }, 'Label the last 7 days of events'), h('span', { class: 'muted small' }, 'for events recorded before the detector was set up')))
@@ -943,13 +942,109 @@ async function viewAdmin(main) {
     h('div', { class: 'card' }, h('h2', {}, 'Cameras'), h('div', { class: 'tablewrap' }, camTable), h('div', { style: 'margin-top:10px' }, addCam), h('p', { class: 'muted small' }, 'Camera changes take effect within about 30 seconds.')),
     groupsCard,
     h('div', { class: 'two' },
-      h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see the cameras in their groups plus any assigned one by one — nothing until you choose. A camera added to a group is shared with that group\'s users at once.'), tokenBtn),
+      h('div', { class: 'card' }, h('h2', {}, 'Users'), h('div', { class: 'tablewrap' }, userTable), h('div', { style: 'margin-top:10px' }, addUser), h('p', { class: 'muted small' }, 'Viewers see the cameras in their groups plus any assigned one by one — nothing until you choose. A camera added to a group is shared with that group\'s users at once.')),
       h('div', { class: 'card' }, h('h2', {}, 'Object detection'), objects)),
+    tokensCard(users),
     h('div', { class: 'card' }, h('h2', {}, 'Storage'), h('div', { class: 'tablewrap' }, stor), h('p', { class: 'muted small' }, 'Retention deletes whole segments, oldest first: per-camera age limit (events kept longer), then per-volume space budget. Tiering copies old segments to an archive volume first.')),
     h('details', { class: 'card' }, h('summary', {}, 'Diagnostics'), h('p', {}, `This browser — MSE: ${support.mse} · HEVC via MSE: ${support.hevcMse} · H.264 via MSE: ${support.h264Mse} · native HLS: ${support.nativeHls} · server transcode: ${!!state.me.transcode}`), h('p', { class: 'muted' }, 'zmNinjaNg: use this server\'s address plus /zm as the portal URL. Live video plays as MSE (H.264 substream) through the app\'s go2rtc player.')));
   if (focus === 'groups') groupsCard.scrollIntoView({ block: 'start' });
 }
 const gb = (b) => `${(b / 1e9).toFixed(1)} GB`;
+const fmtDay = (secs) => (secs ? new Date(secs * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : '—');
+const fmtAgo = (secs) => (secs ? `${fmtDur(Date.now() - secs * 1000)} ago` : 'never');
+
+// API tokens: a table (with revoke) of `list`; `onChange` redraws after a revoke.
+function tokenTable(list, onChange, { showUser = true } = {}) {
+  if (!list.length) return h('p', { class: 'muted' }, 'No API tokens.');
+  const expiry = (t) => (t.expires_at ? (t.expires_at * 1000 < Date.now() ? h('span', { class: 'pill bad' }, 'expired') : fmtDay(t.expires_at)) : 'never');
+  return h('div', { class: 'tablewrap' }, h('table', {},
+    h('tr', {}, h('th', {}, 'Name'), showUser ? h('th', {}, 'Acts as') : null, h('th', {}, 'Token'), h('th', {}, 'Created'), h('th', {}, 'Last used'), h('th', {}, 'Expires'), h('th', {}, '')),
+    ...list.map((t) => h('tr', {}, h('td', {}, h('b', {}, t.name)), showUser ? h('td', {}, t.username) : null, h('td', {}, h('code', {}, `${t.hint}…`)),
+      h('td', {}, fmtDay(t.created_at)), h('td', {}, fmtAgo(t.last_used_at)), h('td', {}, expiry(t)),
+      h('td', { class: 'actions' }, h('button', { class: 'ghost small', onclick: async () => {
+        if (!confirm(`Revoke "${t.name}"? Whatever uses it (Home Assistant, a peer, a script) stops working at once.`)) return;
+        try { await api.del(`/api/tokens/${t.id}`); toast(`Revoked "${t.name}"`, { kind: 'ok' }); onChange(); } catch (err) { toast(err.message, { kind: 'bad' }); }
+      } }, 'Revoke'))))));
+}
+
+// A new token, shown once.
+function showNewToken(t) {
+  const field = h('input', { value: t.token, readonly: true, spellcheck: 'false', style: 'font-family:monospace' });
+  const copy = async () => {
+    field.select();
+    try { await navigator.clipboard.writeText(t.token); toast('Copied', { kind: 'ok' }); } catch { document.execCommand?.('copy'); }
+  };
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card' },
+    h('h2', {}, `Token "${t.name}"`),
+    h('p', {}, 'Copy it now: it is not shown again (only its first characters are kept to tell tokens apart).'),
+    h('div', { class: 'row nowrap' }, field, h('button', { type: 'button', onclick: copy }, 'Copy')),
+    h('p', { class: 'muted small' }, `It acts as ${t.username} and sees exactly what ${t.username} sees. Use it as "Authorization: Bearer <token>", or ?token=<token> where a header is not possible (Home Assistant's generic camera).${t.expires_at ? ` It expires on ${fmtDay(t.expires_at)}.` : ''}`),
+    h('div', { class: 'row' }, h('button', { class: 'ghost', onclick: () => modal.remove() }, 'Done'))));
+  closeOnEscape(modal, () => modal.remove());
+  document.body.append(modal);
+  setTimeout(() => field.select(), 50);
+}
+
+// Admin: every token, and a form to issue one for any user.
+function tokensCard(users) {
+  const card = h('div', { class: 'card', id: 'tokens' });
+  const draw = async () => {
+    let list = [];
+    try { list = await api.get('/api/tokens'); } catch (err) { toast(err.message, { kind: 'bad' }); }
+    const name = h('input', { placeholder: 'What it is for, e.g. Home Assistant', maxlength: 80, required: true, style: 'width:240px' });
+    const who = h('select', { style: 'width:auto', title: 'the token sees what this user sees' }, ...users.map((u) => h('option', { value: u.id, selected: u.id === state.me.user.id }, `acts as ${u.username} (${u.role})`)));
+    const exp = h('select', { style: 'width:auto' }, ...[['', 'never expires'], ['30', 'expires in 30 days'], ['90', 'expires in 90 days'], ['365', 'expires in a year']].map(([v, l]) => h('option', { value: v }, l)));
+    const create = async (e) => {
+      e.preventDefault();
+      try {
+        const t = await api.post('/api/tokens', { name: name.value.trim(), user_id: Number(who.value), expires_days: exp.value ? Number(exp.value) : null });
+        showNewToken(t); draw();
+      } catch (err) { toast(err.message, { kind: 'bad' }); }
+    };
+    fill(card, h('h2', {}, 'API tokens'), tokenTable(list, draw),
+      h('form', { class: 'row', style: 'margin-top:10px', onsubmit: create }, name, who, exp, h('button', {}, 'Create token')),
+      h('p', { class: 'muted small' }, 'For Home Assistant, a federation peer or a script. A token acts as the user you pick: for a peer or a guest integration pick a viewer who sees only the cameras that should be shared. Tokens survive password changes; revoke one to cut it off.'));
+  };
+  draw();
+  return card;
+}
+
+// Everyone: change your own password; see and revoke your own tokens.
+function showAccount() {
+  const me = state.me.user;
+  const cur = h('input', { type: 'password', autocomplete: 'current-password', required: true });
+  const pw1 = h('input', { type: 'password', autocomplete: 'new-password', required: true, minlength: 8 });
+  const pw2 = h('input', { type: 'password', autocomplete: 'new-password', required: true, minlength: 8 });
+  const errEl = h('p', { class: 'err' });
+  const tokensBox = h('div');
+  const drawTokens = async () => {
+    try {
+      const mine = (await api.get('/api/tokens')).filter((t) => t.user_id === me.id);
+      fill(tokensBox, tokenTable(mine, drawTokens, { showUser: false }), me.role === 'admin' ? h('p', { class: 'muted small' }, 'Issue tokens under Admin → API tokens.') : null);
+    } catch (err) { fill(tokensBox, h('p', { class: 'err' }, err.message)); }
+  };
+  const save = async (e) => {
+    e.preventDefault();
+    errEl.textContent = '';
+    if (pw1.value !== pw2.value) { errEl.textContent = 'The two new passwords differ.'; return; }
+    try {
+      const r = await api.post('/api/me/password', { current: cur.value, new: pw1.value });
+      close();
+      toast(`Password changed.${r.sessions_ended ? ` Signed out ${r.sessions_ended} other sign-in${r.sessions_ended === 1 ? '' : 's'}` : ''} Use the new password next time, also in zmNinjaNg.`, { kind: 'ok', ttl: 12000 });
+    } catch (err) { errEl.textContent = err.message; }
+  };
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('h2', {}, me.username), h('span', { class: 'pill' }, me.role), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
+    h('h3', {}, 'Change your password'),
+    h('form', { onsubmit: save }, h('label', {}, 'Current password', cur), h('label', {}, 'New password (8+ characters)', pw1), h('label', {}, 'New password again', pw2), errEl,
+      h('div', { class: 'row' }, h('button', {}, 'Change password'), h('span', { class: 'muted small' }, 'Your other sign-ins (other browsers, zmNinjaNg) are signed out.'))),
+    h('h3', {}, 'Your API tokens'), tokensBox));
+  const close = () => modal.remove();
+  closeOnEscape(modal, close);
+  document.body.append(modal);
+  drawTokens();
+  setTimeout(() => cur.focus(), 50);
+}
 const storageName = (all, id) => { const st = all.find((x) => x.id === id); if (!st) return `storage ${id}`; return st.read_only ? `imported (${id})` : st.archive_to ? `primary (${id})` : all.some((x) => x.archive_to === id) ? `archive (${id})` : `storage ${id}`; };
 
 // Groups are the cameras' comma-separated tags: one matrix of checkboxes
@@ -1148,6 +1243,7 @@ $('#login-form').addEventListener('submit', async (e) => {
   } catch (err) { $('#login-err').textContent = err.message; }
 });
 $('#logout').addEventListener('click', async () => { await api.post('/api/logout'); location.reload(); });
+$('#account').addEventListener('click', () => { if (state.me?.user) showAccount(); });
 setInterval(() => { $('#clock').textContent = new Date().toLocaleString(); }, 1000);
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1278,7 @@ async function boot() {
     try { const remote = await api.get(`/api/peers/${pr}/api/cameras`); state.cameras.push(...remote.map((c) => ({ ...c, peer: pr }))); } catch (e) { toast(`Peer ${pr}: ${e.message}`, { kind: 'bad' }); }
   }
   document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = state.me.user.role !== 'admin'; });
+  $('#account').textContent = state.me.user.username;
   listen();
   route();
 }

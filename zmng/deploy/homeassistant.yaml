@@ -9,8 +9,8 @@
 #    and shows the latest event. For live stills the generic camera platform cannot send an
 #    Authorization header, so the token would have to go in the URL (it then shows up in
 #    Caddy and HA logs). If you do that, create a dedicated *viewer* account limited to the
-#    cameras HA needs and use ITS token (Admin -> Users, then "Create API token" while
-#    logged in as that user), never an admin token:
+#    cameras HA needs and issue a token that acts as it (Admin -> API tokens, "acts as"
+#    that viewer), never an admin token. Revoke it there if it leaks:
 # camera:
 #   - platform: generic
 #     name: Front Door
