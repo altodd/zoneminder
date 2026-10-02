@@ -25,6 +25,10 @@ Built on `redesign` after this review, with Aaron's decisions (CBA guests keep a
 | P1 #2 live detector view and dry runs over recorded video | `feat(zmng): live motion view and dry runs of zone settings over recorded video` (also fixed the live detector's timestamps) |
 | P1 #4 push route (ntfy), P1 #5 rules, schedules, arming | `feat(zmng): alert rules with schedules and arming, ntfy push with the live picture` |
 
+Each part then had an independent review (alerts and the UI; tokens, export and the ZoneMinder API; the detector, zones and dry runs). Their findings are fixed in `fix(zmng): review of alerts and the UI: …`, `fix(zmng): review of tokens, export and the ZoneMinder API` and `fix(zmng): review of the detector, zones and dry runs`. Upgrade notes are in CUTOVER §10. Two suggestions were left out on purpose:
+- Writing ZIP entries as deflate "stored" blocks so Java's `ZipInputStream` can read them. Desktop unzip tools, Windows, macOS and Python read the archive from its central directory, and nobody here uses a Java tool for it.
+- Sharing one path per file in the export plan. It saves a few hundred kilobytes on a 6-hour export.
+
 Still open from this review: the rest of P2 (manual events, digital zoom, stream quality choice, event list workflow, operator role, retention by kind and offsite copy, live wall extras, recording-gap report) and P3.
 
 ## Verdict
