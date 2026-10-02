@@ -48,7 +48,9 @@ fn parse_any(json: &str) -> Option<Vec<Zone>> {
 pub fn parse(json: &str, prefix: &str) -> Vec<Zone> {
     let mut zones = parse_any(json).unwrap_or_default();
     for (i, z) in zones.iter_mut().enumerate() {
-        if z.name.trim().is_empty() {
+        // names as matched everywhere (events, filters, alert rules)
+        z.name = z.name.trim().to_string();
+        if z.name.is_empty() {
             z.name = format!("{prefix} {}", i + 1);
         }
     }

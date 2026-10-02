@@ -62,4 +62,12 @@ async fn named_zones_are_validated_recorded_and_filterable() {
     assert_eq!(ids("/api/events?order=asc".into()).await, vec![door, both, road, none]);
     let ev = get(&r, &format!("/api/events/{both}"), &admin).await.json();
     assert_eq!(ev["zones"], json!(["Road", "Door"]));
+    // case folds ASCII only, the way SQLite and the alert rules do
+    // (SQLite's lower("CAFÉ") is "cafÉ": the exact name must still find it)
+    let cafe = close(40, json!(["CAFÉ"]));
+    assert_eq!(ids("/api/events?zone=CAF%C3%89".into()).await, vec![cafe]);
+    assert_eq!(ids("/api/events?zone=caf%C3%89".into()).await, vec![cafe]);
+    // names typed with spaces around them are the trimmed name everywhere
+    let spaced = json!([{"name": "  Gate ", "points": [[0, 0], [1, 0], [1, 1]]}]).to_string();
+    assert_eq!(zmng::zones::parse(&spaced, "Zone")[0].name, "Gate");
 }

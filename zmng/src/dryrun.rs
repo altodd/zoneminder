@@ -5,17 +5,19 @@
 //!
 //! The substream recording (or the main stream for cameras that do not
 //! record one) is read from disk and decoded by ffmpeg as fast as it goes,
-//! one frame per `1/detect_fps` seconds of recording (no frames invented
-//! across gaps). Events follow the same rules as the live detector (two
-//! scored frames in a row open one; quiet for `cooldown_secs` or 10 minutes
-//! long closes it; pre/post-roll added). Object detection is not replayed.
+//! the first frame of every `1/detect_fps` seconds of recording (no frames
+//! invented across gaps). Events follow the same rules as the live detector
+//! (two scored frames in a row open one; quiet for `cooldown_secs` or 10
+//! minutes long closes it; pre/post-roll added). Object detection is not
+//! replayed.
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::db::Camera;
 use crate::detect::MotionDetector;
@@ -25,6 +27,10 @@ use crate::mp4::TIMESCALE;
 pub const MAX_RANGE_MS: i64 = 12 * 3600 * 1000;
 /// Dry runs at once, all cameras together (each holds an ffmpeg decode).
 pub const MAX_JOBS: usize = 2;
+/// Longest a dry run may take, whatever its range.
+pub const MAX_RUN: Duration = Duration::from_secs(2 * 3600);
+/// No frame from ffmpeg for this long: the run is stuck.
+const STALL: Duration = Duration::from_secs(120);
 
 /// Settings to try; absent fields keep the camera's.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -85,10 +91,12 @@ pub struct Sim {
     pre: i64,
     post: i64,
     cooldown: i64,
-    frame_secs: f64,
+    /// one detector interval, 90 kHz
+    frame_ticks: i64,
     consecutive: u8,
     pending_zones: Vec<String>,
-    open: Option<(i64, SimEvent, i64, u32)>, // (first motion dts, event, last motion dts, motion frames)
+    open: Option<(i64, SimEvent, i64, i64)>, // (first motion dts, event, last motion dts, motion ticks)
+    prev_dts: Option<i64>,
     pub events: Vec<SimEvent>,
     pub frames: u64,
 }
@@ -103,26 +111,35 @@ impl Sim {
             pre: (cam.pre_secs * ts) as i64,
             post: (cam.post_secs * ts) as i64,
             cooldown: (cam.cooldown_secs * ts) as i64,
-            frame_secs: 1.0 / cam.detect_fps.max(0.2),
+            frame_ticks: (ts / cam.detect_fps.max(0.5)) as i64,
             consecutive: 0,
             pending_zones: Vec::new(),
             open: None,
+            prev_dts: None,
             events: Vec::new(),
             frames: 0,
         }
     }
 
+    /// Close the open event; like the live detector, start over (a new
+    /// event needs two scored frames in a row again).
     fn close(&mut self) {
-        if let Some((_, mut e, last, motion_frames)) = self.open.take() {
+        if let Some((_, mut e, last, motion_ticks)) = self.open.take() {
             e.end_ms = (last + self.post) / 90;
-            e.motion_secs = (motion_frames as f64 * self.frame_secs * 10.0).round() / 10.0;
+            e.motion_secs = (motion_ticks as f64 / TIMESCALE as f64 * 10.0).round() / 10.0;
             self.events.push(e);
         }
+        self.consecutive = 0;
+        self.pending_zones.clear();
     }
 
     /// One grayscale frame (the Y plane) at `dts` (90 kHz).
     pub fn feed(&mut self, dts: i64, y: &[u8]) {
         self.frames += 1;
+        // seconds of motion from the real frame spacing (a gap in the
+        // recording counts as at most two intervals)
+        let gap = self.prev_dts.map_or(self.frame_ticks, |p| (dts - p).clamp(0, 2 * self.frame_ticks));
+        self.prev_dts = Some(dts);
         let score = self.det.feed(y);
         if score > 0 {
             self.consecutive = self.consecutive.saturating_add(1);
@@ -141,13 +158,13 @@ impl Sim {
             None => {
                 if self.consecutive >= 2 {
                     let zones = std::mem::take(&mut self.pending_zones);
-                    self.open = Some((dts, SimEvent { start_ms: (dts - self.pre) / 90, end_ms: 0, peak_ms: dts / 90, score, zones, motion_secs: 0.0 }, dts, 1));
+                    self.open = Some((dts, SimEvent { start_ms: (dts - self.pre) / 90, end_ms: 0, peak_ms: dts / 90, score, zones, motion_secs: 0.0 }, dts, gap));
                 }
             }
-            Some((first, e, last, motion_frames)) => {
+            Some((first, e, last, motion_ticks)) => {
                 if score > 0 {
                     *last = dts;
-                    *motion_frames += 1;
+                    *motion_ticks += gap;
                     if score > e.score {
                         e.score = score;
                         e.peak_ms = dts / 90;
@@ -196,6 +213,43 @@ pub struct Job {
     pub finished_ms: RwLock<Option<i64>>,
 }
 
+impl Job {
+    /// Stop a running job: its ffmpeg is killed and the state is
+    /// "cancelled". No effect once it ended.
+    pub fn cancel(&self) {
+        let abort = self.abort.write().take();
+        if let Some(a) = abort {
+            a.abort();
+        }
+        let mut v = self.view.write();
+        if v.state == "running" {
+            v.state = "cancelled".into();
+            *self.finished_ms.write() = Some(crate::db::now_dts() / 90);
+        }
+    }
+
+    /// Record how the run ended, unless it was cancelled meanwhile.
+    fn finish(&self, res: Result<()>) {
+        let mut v = self.view.write();
+        if v.state != "running" {
+            return;
+        }
+        match res {
+            Ok(()) => {
+                v.state = "done".into();
+                v.progress = 1.0;
+            }
+            Err(e) => {
+                v.state = "failed".into();
+                v.error = Some(format!("{e:#}"));
+            }
+        }
+        *self.finished_ms.write() = Some(crate::db::now_dts() / 90);
+        drop(v);
+        self.abort.write().take();
+    }
+}
+
 pub type Jobs = Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<Job>>>>;
 
 /// Start a dry run of `cam` (with `settings`) over [start_ms, end_ms).
@@ -212,12 +266,8 @@ pub fn start(jobs: &Jobs, db: crate::db::Db, ffmpeg: String, cam: &Camera, setti
     // forget finished runs after an hour; cancel this camera's previous run
     map.retain(|_, j| j.finished_ms.read().is_none_or(|t| now - t < 3_600_000));
     for j in map.values() {
-        if j.view.read().camera_id == cam.id && j.view.read().state == "running" {
-            if let Some(a) = j.abort.write().take() {
-                a.abort();
-            }
-            j.view.write().state = "cancelled".into();
-            *j.finished_ms.write() = Some(now);
+        if j.view.read().camera_id == cam.id {
+            j.cancel();
         }
     }
     anyhow::ensure!(map.values().filter(|j| j.view.read().state == "running").count() < MAX_JOBS, "{MAX_JOBS} dry runs are already running; try again when one finishes");
@@ -230,25 +280,24 @@ pub fn start(jobs: &Jobs, db: crate::db::Db, ffmpeg: String, cam: &Camera, setti
         abort: RwLock::new(None),
         finished_ms: RwLock::new(None),
     });
+    // the run, and a watcher that records how it ended: an error, the time
+    // limit, a panic or a cancel never leaves a job "running"
+    let j2 = job.clone();
+    let work = tokio::spawn(async move { tokio::time::timeout(MAX_RUN, run(&db, &ffmpeg, &tried, stream, start_dts, end_dts, &j2)).await });
+    *job.abort.write() = Some(work.abort_handle());
+    let j3 = job.clone();
+    tokio::spawn(async move {
+        let res = match work.await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(anyhow::anyhow!("stopped after {} minutes", MAX_RUN.as_secs() / 60)),
+            Err(e) if e.is_cancelled() => Err(anyhow::anyhow!("cancelled")),
+            Err(e) => Err(anyhow::anyhow!("the dry run stopped unexpectedly: {e}")),
+        };
+        j3.finish(res);
+    });
+    // visible to other requests only with its abort handle in place
     map.insert(id, job.clone());
     drop(map);
-    let j2 = job.clone();
-    let task = tokio::spawn(async move {
-        let res = run(&db, &ffmpeg, &tried, stream, start_dts, end_dts, &j2).await;
-        let mut v = j2.view.write();
-        match res {
-            Ok(()) => {
-                v.state = "done".into();
-                v.progress = 1.0;
-            }
-            Err(e) => {
-                v.state = "failed".into();
-                v.error = Some(format!("{e:#}"));
-            }
-        }
-        *j2.finished_ms.write() = Some(crate::db::now_dts() / 90);
-    });
-    *job.abort.write() = Some(task.abort_handle());
     Ok(job)
 }
 
@@ -256,14 +305,14 @@ async fn run(db: &crate::db::Db, ffmpeg: &str, cam: &Camera, stream: &str, start
     let plan = crate::video::plan_range_stream(db, cam.id, stream, start, end)?;
     anyhow::ensure!(!plan.items.is_empty(), "nothing was recorded in this range");
     let (w, h) = (cam.detect_width as usize, cam.detect_height as usize);
-    // 90 % of the interval: frame times are not exact multiples of it
-    let step = 0.9 / cam.detect_fps.max(0.2);
+    let fps = cam.detect_fps.max(0.5);
     let mut child = crate::thumbs::ffmpeg_command(ffmpeg)
         .args([
             "-nostdin", "-loglevel", "info", "-nostats", "-threads", "1", "-copyts",
             "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn", "-threads", "1", "-filter_threads", "1",
-            // one frame per detector interval of recording; nothing is invented across gaps
-            "-vf", &format!("select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,{step:.3}),scale={w}:{h}:flags=fast_bilinear,format=yuv420p,showinfo"),
+            // the first frame of every 1/fps seconds of recording (the live
+            // detector's rate); nothing is invented across gaps
+            "-vf", &format!("select=isnan(prev_selected_t)+gt(floor(t*{fps})\\,floor(prev_selected_t*{fps})),scale={w}:{h}:flags=fast_bilinear,format=yuv420p,showinfo"),
             "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
         ])
         .stdin(Stdio::piped())
@@ -279,39 +328,38 @@ async fn run(db: &crate::db::Db, ffmpeg: &str, cam: &Camera, stream: &str, start
         use futures::StreamExt;
         let mut s = Box::pin(crate::video::stream_plan(plan));
         while let Some(chunk) = s.next().await {
-            let Ok(chunk) = chunk else { break };
+            let chunk = chunk.context("reading the recording")?;
             if stdin.write_all(&chunk).await.is_err() {
-                break;
+                break; // ffmpeg stopped reading; its exit status says why
             }
         }
+        anyhow::Ok(())
     });
-    let (pts_tx, mut pts_rx) = tokio::sync::mpsc::unbounded_channel::<i64>();
-    tokio::spawn(async move {
-        let mut r = tokio::io::BufReader::new(stderr);
-        let mut line = String::new();
-        let mut clock = crate::detect::ShowinfoClock::default();
-        while let Ok(n) = r.read_line(&mut line).await {
-            if n == 0 {
-                break;
+    // the last lines ffmpeg printed, for the error when it fails
+    let tail = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::<String>::new()));
+    let t2 = tail.clone();
+    let ts = TIMESCALE as i64;
+    let mut times = crate::detect::FrameTimes::spawn(stderr, Duration::from_secs(5), start - 60 * ts..end + 60 * ts, move |l| {
+        let l = l.trim();
+        if !l.is_empty() {
+            let mut t = t2.lock();
+            if t.len() == 4 {
+                t.pop_front();
             }
-            if let Some(dts) = clock.line(&line) {
-                let _ = pts_tx.send(dts);
-            }
-            line.clear();
+            t.push_back(l.to_string());
         }
     });
+    let step = (ts as f64 / fps) as i64;
     let mut sim = Sim::new(cam);
     let mut frame = vec![0u8; w * h * 3 / 2];
     loop {
-        match stdout.read_exact(&mut frame).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        match tokio::time::timeout(STALL, stdout.read_exact(&mut frame)).await {
+            Err(_) => anyhow::bail!("ffmpeg produced no frame for {} s", STALL.as_secs()),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(e)) => return Err(e.into()),
         }
-        let dts = tokio::time::timeout(std::time::Duration::from_secs(5), pts_rx.recv()).await.ok().flatten().unwrap_or(0);
-        if dts < start - 60 * TIMESCALE as i64 || dts >= end + 60 * TIMESCALE as i64 {
-            continue; // not a frame we can place on the timeline
-        }
+        let dts = times.next(|prev| prev.map_or(start, |p| p + step)).await;
         sim.feed(dts, &frame[..w * h]);
         if sim.frames.is_multiple_of(25) {
             let mut v = job.view.write();
@@ -320,12 +368,20 @@ async fn run(db: &crate::db::Db, ffmpeg: &str, cam: &Camera, stream: &str, start
             v.events = sim.events.clone();
         }
     }
-    let _ = feeder.await;
-    let _ = child.wait().await;
+    let fed = feeder.await;
+    let status = child.wait().await.context("waiting for ffmpeg")?;
     sim.finish();
-    let mut v = job.view.write();
-    v.frames = sim.frames;
-    v.events = sim.events.clone();
+    {
+        let mut v = job.view.write();
+        v.frames = sim.frames;
+        v.events = sim.events.clone();
+    }
+    // what was decoded stays visible; the run still counts as failed
+    fed.map_err(|e| anyhow::anyhow!("feeding ffmpeg: {e}"))??;
+    if !status.success() {
+        let tail: Vec<String> = tail.lock().iter().cloned().collect();
+        anyhow::bail!("ffmpeg failed ({status}): {}", tail.join(" / "));
+    }
     anyhow::ensure!(sim.frames > 0, "ffmpeg decoded no frames from the recording");
     Ok(())
 }
@@ -377,6 +433,46 @@ mod tests {
         assert_eq!(e.start_ms, (t_motion + tick - 2 * ts) / 90);
         assert!(e.end_ms > e.start_ms && e.score > 0);
         assert!(e.motion_secs >= 1.0, "{}", e.motion_secs);
+    }
+
+    /// An event reaching the 10-minute cap closes; the next one needs two
+    /// scored frames in a row again, as live. Motion seconds follow the real
+    /// frame spacing.
+    #[test]
+    fn sim_caps_events_at_ten_minutes_like_the_live_detector() {
+        let mut cam = Camera::example();
+        cam.detect_width = 160;
+        cam.detect_height = 90;
+        cam.detect_fps = 1.0;
+        cam.pre_secs = 0.0;
+        cam.post_secs = 0.0;
+        cam.min_area_pct = 0.5;
+        cam.min_blob_pct = 0.2;
+        let mut sim = Sim::new(&cam);
+        let (w, h) = (160usize, 90usize);
+        let base = vec![100u8; w * h];
+        let ts = TIMESCALE as i64;
+        let t0 = 1_800_000_000 * ts;
+        for i in 0..12 {
+            sim.feed(t0 + i * ts, &base);
+        }
+        // a box on alternate sides every second: motion on every frame
+        let mut frames = [base.clone(), base.clone()];
+        for (k, f) in frames.iter_mut().enumerate() {
+            for y in 20..60 { for x in (10 + k * 100)..(50 + k * 100) { f[y * w + x] = 250; } }
+        }
+        let first = 12;
+        for i in first..first + 700 {
+            sim.feed(t0 + i * ts, &frames[(i % 2) as usize]);
+        }
+        sim.finish();
+        assert_eq!(sim.events.len(), 2, "{:?}", sim.events);
+        let open1 = first + 1; // the second scored frame
+        assert_eq!(sim.events[0].start_ms, (t0 + open1 * ts) / 90);
+        // closed on the first frame more than 600 s after it opened, then two frames to open again
+        let closed = open1 + 601;
+        assert_eq!(sim.events[1].start_ms, (t0 + (closed + 2) * ts) / 90);
+        assert!((sim.events[0].motion_secs - 601.0).abs() <= 1.0, "{}", sim.events[0].motion_secs);
     }
 
     #[test]

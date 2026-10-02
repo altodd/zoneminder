@@ -898,14 +898,7 @@ async fn dryrun_get(State(app): State<App>, Path(job): Path<String>, user: Optio
 async fn dryrun_cancel(State(app): State<App>, Path(job): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     require_admin(user.as_ref().map(|e| &e.0))?;
     let j = app.dryruns.lock().get(&job).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, "no such dry run").into_response())?;
-    if let Some(a) = j.abort.write().take() {
-        a.abort();
-    }
-    let mut v = j.view.write();
-    if v.state == "running" {
-        v.state = "cancelled".into();
-        *j.finished_ms.write() = Some(crate::db::now_dts() / 90);
-    }
+    j.cancel();
     Ok(Json(serde_json::json!({"ok": true})).into_response())
 }
 

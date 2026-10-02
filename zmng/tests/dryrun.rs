@@ -56,7 +56,9 @@ async fn dry_run_replays_recorded_video_with_other_zones() {
     assert_eq!(job["recorded_events"], 0);
     let done = wait_done(&r, &admin, job["id"].as_str().unwrap()).await;
     assert_eq!(done["state"], "done", "{done}");
-    assert!(done["frames"].as_u64().unwrap() >= 50, "about 5 frames a second of 12 s: {done}");
+    // the first frame of every 1/detect_fps seconds of the 10 fps clip
+    let fps = fx.db.camera(cam).unwrap().unwrap().detect_fps;
+    assert_eq!(done["frames"].as_u64().unwrap(), (12.0 * fps.min(10.0)) as u64, "{done}");
     let evs = done["events"].as_array().unwrap();
     assert_eq!(evs.len(), 1, "{done}");
     assert_eq!(evs[0]["zones"], json!(["Left"]));
@@ -81,6 +83,39 @@ async fn dry_run_replays_recorded_video_with_other_zones() {
     assert_eq!(done["state"], "failed");
     assert!(done["error"].as_str().unwrap().contains("nothing was recorded"), "{done}");
     assert_eq!(get(&r, "/api/dryrun/nope", &admin).await.status, 404);
+    // the recording is gone from disk: failed, with the reason
+    let seg = fx.db.segments_in_range_stream(cam, "sub", dts(T0), dts(T0 + 12)).unwrap();
+    std::fs::remove_file(fx.storage_path().join(&seg[0].path)).unwrap();
+    let job = call(&r, "POST", &format!("/api/cameras/{cam}/dryrun"), Some(&admin), Some(json!({"start": ms(T0), "end": ms(T0 + 12)}))).await.json();
+    let done = wait_done(&r, &admin, job["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["error"].as_str().unwrap().contains("reading the recording"), "{done}");
+}
+
+/// A second run for the same camera cancels the first; cancelling is final
+/// (the run's end does not overwrite it).
+#[tokio::test]
+async fn a_new_dry_run_cancels_the_cameras_previous_one() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("yard");
+    let clip = moving_box_clip();
+    for k in 0..6 {
+        fx.write_segment(cam, "sub", &clip, dts(T0 + 12 * k), |_| 0);
+    }
+    let admin = fx.token_for(fx.add_admin("admin", "password123"));
+    let r = fx.router();
+    let start = |r: axum::Router, admin: String| async move { call(&r, "POST", &format!("/api/cameras/{cam}/dryrun"), Some(&admin), Some(json!({"start": ms(T0), "end": ms(T0 + 72)}))).await.json() };
+    let a = start(r.clone(), admin.clone()).await;
+    let b = start(r.clone(), admin.clone()).await;
+    assert_eq!(get(&r, &format!("/api/dryrun/{}", a["id"].as_str().unwrap()), &admin).await.json()["state"], "cancelled");
+    assert_eq!(wait_done(&r, &admin, b["id"].as_str().unwrap()).await["state"], "done");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(get(&r, &format!("/api/dryrun/{}", a["id"].as_str().unwrap()), &admin).await.json()["state"], "cancelled");
+    // cancel by hand
+    let c = start(r.clone(), admin.clone()).await;
+    let id = c["id"].as_str().unwrap();
+    assert_eq!(call(&r, "DELETE", &format!("/api/dryrun/{id}"), Some(&admin), None).await.status, 200);
+    assert_eq!(wait_done(&r, &admin, id).await["state"], "cancelled");
 }
 
 #[tokio::test]

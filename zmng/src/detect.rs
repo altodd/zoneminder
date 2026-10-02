@@ -248,6 +248,10 @@ pub struct ZoneSpec {
     pub min_blob_pct: f64,
 }
 
+/// Changed pixels a cell needs, besides a third of its zone pixels, to count
+/// towards a zone's blob.
+const MIN_CELL_CHANGED: u8 = 4;
+
 /// ZoneMinder-style motion detector over one or more zones. Every zone is
 /// scored on its own pixels with its own minimum changed area and minimum
 /// blob, so a doorway can be sensitive while the road behind it is not; a
@@ -294,6 +298,9 @@ impl MotionDetector {
         if zones.is_empty() {
             zmap.iter_mut().for_each(|p| *p = 1);
             specs.push(ZoneSpec { name: String::new(), min_area_pct, min_blob_pct });
+        }
+        if zones.len() > crate::zones::MAX_ZONES {
+            tracing::warn!(zones = zones.len(), "only the first {} zones are analysed; save the camera's zones again to merge or remove the rest", crate::zones::MAX_ZONES);
         }
         for (i, z) in zones.iter().take(crate::zones::MAX_ZONES).enumerate() {
             crate::zones::rasterize(w, h, &z.points, |p| zmap[p] |= 1 << i);
@@ -372,7 +379,10 @@ impl MotionDetector {
             return 0; // warm-up
         }
         // 3. per zone: enough of it changed, and as one object (largest blob of
-        //    cells where >= 1/3 of the zone's pixels in the cell changed)
+        //    cells where >= 1/3 of the zone's pixels in the cell changed, and
+        //    at least MIN_CELL_CHANGED of them: a cell holding a sliver of the
+        //    zone's edge must not turn active on one noisy pixel and join two
+        //    blobs)
         let mut best = 0u8;
         for z in 0..self.zones.len() {
             self.zone_blob[z] = 0.0;
@@ -381,7 +391,7 @@ impl MotionDetector {
             }
             let area_pct = self.zone_changed[z] as f64 * 100.0 / self.zone_px[z] as f64;
             let (zb, cp) = (&self.zone_blocks[z], &self.zone_cell_px[z]);
-            let active: Vec<bool> = zb.iter().zip(cp).map(|(c, p)| *p > 0 && *c as u32 * 64 >= *p as u32 * 21).collect();
+            let active: Vec<bool> = zb.iter().zip(cp).map(|(c, p)| *c >= MIN_CELL_CHANGED && *c as u32 * 64 >= *p as u32 * 21).collect();
             let blob_px = largest_component(&active, cp, self.bw, self.bh);
             let blob_pct = blob_px as f64 * 100.0 / self.zone_px[z] as f64;
             self.zone_blob[z] = blob_pct;
@@ -674,8 +684,9 @@ pub struct ShowinfoClock {
 }
 
 impl ShowinfoClock {
-    /// Feed one stderr line; a frame line yields its time in 90 kHz ticks.
-    pub fn line(&mut self, line: &str) -> Option<i64> {
+    /// Feed one stderr line; a frame line yields its number (`n:`) and, once
+    /// the time base is known, its time in 90 kHz ticks.
+    pub fn frame(&mut self, line: &str) -> Option<(u64, Option<i64>)> {
         if let Some(i) = line.find("config in time_base: ") {
             let rest = &line[i + 21..];
             let tb: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '/').collect();
@@ -689,22 +700,106 @@ impl ShowinfoClock {
             }
             return None;
         }
-        if self.den == 0 || !line.contains("showinfo") {
+        if !line.contains("showinfo") {
             return None;
         }
-        let i = line.find(" pts:")?;
-        let digits: String = line[i + 5..].trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
-        let pts: i64 = digits.parse().ok()?;
-        Some((pts as i128 * self.num as i128 * TIMESCALE as i128 / self.den as i128) as i64)
+        let number = |after: &str| -> String { after.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect() };
+        let n: u64 = number(&line[line.find(" n:")? + 3..]).parse().ok()?;
+        let pts: i64 = number(&line[line.find(" pts:")? + 5..]).parse().ok()?;
+        let dts = (self.den != 0).then(|| (pts as i128 * self.num as i128 * TIMESCALE as i128 / self.den as i128) as i64);
+        Some((n, dts))
     }
 }
 
-/// Feed ffmpeg from the substream RECORDER's live fMP4 fragments instead of/// Feed ffmpeg from the substream RECORDER's live fMP4 fragments instead of
+/// Times for the raw frames read from ffmpeg's stdout, from the `showinfo`
+/// lines on its stderr, paired by frame number: a lost or unreadable line
+/// cannot shift every later frame onto the wrong time, and a missing time
+/// base costs no waiting. A frame without a usable time gets the caller's
+/// fallback; times never run backwards.
+pub struct FrameTimes {
+    rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Option<i64>)>,
+    held: Option<(u64, Option<i64>)>,
+    next: u64,
+    wait: Duration,
+    waiting: bool,
+    valid: std::ops::Range<i64>,
+    last: Option<i64>,
+}
+
+impl FrameTimes {
+    /// Read `stderr` on a task of its own; lines that are not frame lines go
+    /// to `other`. Times outside `valid` are not used.
+    pub fn spawn(stderr: tokio::process::ChildStderr, wait: Duration, valid: std::ops::Range<i64>, mut other: impl FnMut(&str) + Send + 'static) -> FrameTimes {
+        use tokio::io::AsyncBufReadExt;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut r = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+            let mut clock = ShowinfoClock::default();
+            while let Ok(n) = r.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                match clock.frame(&line) {
+                    Some(f) => {
+                        if tx.send(f).is_err() {
+                            break;
+                        }
+                    }
+                    None => other(&line),
+                }
+                line.clear();
+            }
+        });
+        FrameTimes { rx, held: None, next: 0, wait, waiting: true, valid, last: None }
+    }
+
+    /// The time of the next frame read from stdout. `fallback` gets the
+    /// previous frame's time and answers for a frame without one.
+    pub async fn next(&mut self, fallback: impl FnOnce(Option<i64>) -> i64) -> i64 {
+        let k = self.next;
+        self.next += 1;
+        let mut t = None;
+        loop {
+            let item = match self.held.take() {
+                Some(x) => Some(x),
+                None if self.waiting => match tokio::time::timeout(self.wait, self.rx.recv()).await {
+                    Ok(Some(x)) => Some(x),
+                    // stderr closed, or ffmpeg prints no frame lines: stop
+                    // waiting for them until they flow again
+                    _ => {
+                        self.waiting = false;
+                        None
+                    }
+                },
+                None => self.rx.try_recv().ok().inspect(|_| self.waiting = true),
+            };
+            match item {
+                Some((n, _)) if n < k => continue,
+                Some((n, d)) if n == k => {
+                    t = d.filter(|d| self.valid.contains(d));
+                    break;
+                }
+                Some(x) => {
+                    self.held = Some(x); // this frame's line was lost: keep it for its frame
+                    break;
+                }
+                None => break,
+            }
+        }
+        let dts = t.unwrap_or_else(|| fallback(self.last));
+        let dts = self.last.map_or(dts, |p| dts.max(p + 1));
+        self.last = Some(dts);
+        dts
+    }
+}
+
+/// Feed ffmpeg from the substream RECORDER's live fMP4 fragments instead of
 /// opening a second RTSP session: no extra camera connection, credentials
 /// never leave the process, and every decoded frame carries the recording's
 /// own absolute timestamp (read back from ffmpeg's `showinfo` filter).
 async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam: &Camera, sh: Arc<crate::recorder::CamHandle>) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let (w, hh) = (cam.detect_width as usize, cam.detect_height as usize);
     let fps = cam.detect_fps.max(0.5);
     // wait for the recorder to have an init segment
@@ -727,7 +822,8 @@ async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam
             "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "65536", "-analyzeduration", "0",
             "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn", "-threads", "1", "-filter_threads", "1",
             "-vf", &format!("fps={fps},scale={w}:{hh}:flags=fast_bilinear,format=yuv420p,showinfo"),
-            "-f", "rawvideo", "pipe:1",
+            // one output frame per filtered frame: showinfo's frame numbers stay the output's
+            "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -765,24 +861,14 @@ async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam
             }
         }
     });
-    // stderr: showinfo lines give the time of each output frame, in order
-    let (pts_tx, mut pts_rx) = tokio::sync::mpsc::unbounded_channel::<i64>();
-    tokio::spawn(async move {
-        let mut r = tokio::io::BufReader::new(stderr);
-        let mut line = String::new();
-        let mut clock = ShowinfoClock::default();
-        while let Ok(n) = r.read_line(&mut line).await {
-            if n == 0 {
-                break;
-            }
-            if let Some(dts) = clock.line(&line) {
-                let _ = pts_tx.send(dts);
-            } else if !line.contains("showinfo") {
-                debug!(ffmpeg = %line.trim());
-            }
-            line.clear();
+    // stderr: showinfo lines give the time of each output frame; absolute
+    // (epoch) times only, as tfdt is absolute and ffmpeg keeps it
+    let mut times = FrameTimes::spawn(stderr, Duration::from_millis(300), 1_000_000_000 * TIMESCALE as i64..i64::MAX, |l| {
+        if !l.contains("showinfo") {
+            debug!(ffmpeg = %l.trim());
         }
     });
+    let step = (TIMESCALE as f64 / fps) as i64;
     info!(camera = cam.id, name = %cam.name, w, h = hh, fps, "detector started (fed by substream recorder)");
     {
         let mut st = h.status.write();
@@ -801,11 +887,8 @@ async fn detect_from_recorder(ctx: &Arc<DetectCtx>, h: &Arc<DetectorHandle>, cam
                 anyhow::bail!("feed ended: {}", why.unwrap_or("writer task failed"));
             }
         }
-        // time of this output frame (absolute, because tfdt is absolute and ffmpeg keeps it)
-        let dts = match tokio::time::timeout(Duration::from_millis(300), pts_rx.recv()).await {
-            Ok(Some(t)) if t > 1_000_000_000 * TIMESCALE as i64 => t,
-            _ => now_dts() - TIMESCALE as i64 / 4,
-        };
+        // a frame without a time: one interval after the last, or about now
+        let dts = times.next(|prev| prev.map_or_else(|| now_dts() - TIMESCALE as i64 / 4, |p| p + step)).await;
         run.on_frame(dts, &frame).await?;
     }
 }
@@ -844,6 +927,12 @@ struct EventState {
 }
 
 impl EventState {
+    /// Back to idle after an event; the camera's label priorities stay (they
+    /// decide the kind of every later event of this session too).
+    fn reset(&mut self) {
+        *self = EventState { labels: std::mem::take(&mut self.labels), ..EventState::default() };
+    }
+
     fn meta(&self) -> serde_json::Value {
         let mut m = serde_json::json!({
             "frames": self.frames,
@@ -908,14 +997,14 @@ impl EventState {
         if cam.require_object && self.objects.is_empty() {
             ctx.db.delete_event(id)?;
             info!(camera = cam.id, event = id, "event discarded: no object detected");
-            *self = EventState::default();
+            self.reset();
             return Ok(());
         }
         let end = last_motion_dts + (cam.post_secs * ts as f64) as i64;
         ctx.db.close_event(id, end, None, &self.meta().to_string())?;
         info!(camera = cam.id, event = id, peak = self.peak, kind = %self.objects.kind(&[]), secs = (end - self.start_dts) / ts, "event end");
         ctx.bus.publish_event(&ctx.db, id, crate::notify::Notification::EventEnd);
-        *self = EventState::default();
+        self.reset();
         // thumbnail in the background, from the open segment when the peak is still in it
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let (db, hub, ffmpeg, thumb_dir, bus, cam_id) = (ctx.db.clone(), ctx.hub.clone(), ctx.ffmpeg.clone(), ctx.thumb_dir.clone(), ctx.bus.clone(), cam.id);
@@ -1096,6 +1185,46 @@ pub async fn make_thumbnail(db: &Db, hub: Option<&LiveHub>, ffmpeg: &str, thumb_
 mod tests {
     use super::*;
 
+    /// Cells that hold only a sliver of a zone's edge need a few changed
+    /// pixels to count: one noisy pixel in each must not join two blobs.
+    #[test]
+    fn zone_edge_slivers_do_not_join_blobs() {
+        let (w, h) = (160usize, 90usize);
+        // pixels x 0..=80: cell column 10 holds one pixel column of the zone
+        let zone = crate::zones::Zone { name: "Z".into(), points: vec![(0.0, 0.0), (81.0 / 160.0, 0.0), (81.0 / 160.0, 1.0), (0.0, 1.0)], min_area_pct: Some(0.0), min_blob_pct: Some(0.0) };
+        let mut det = MotionDetector::with_zones(w, h, 25, 0.0, 0.0, &[zone], &[]);
+        let base = vec![100u8; w * h];
+        for _ in 0..12 {
+            det.feed(&base);
+        }
+        let mut f = base.clone();
+        // two blobs in cell column 9, rows 0..3 and 7..10 (192 pixels each)
+        for y in (0..24).chain(56..80) {
+            for x in 72..80 {
+                f[y * w + x] = 250;
+            }
+        }
+        // three changed pixels in the sliver cell of every row between them
+        for row in 0..10 {
+            for y in row * 8..row * 8 + 3 {
+                f[y * w + 80] = 250;
+            }
+        }
+        let score = det.feed(&f);
+        let a = det.analysis(0, score);
+        let zone_px = 81.0 * 90.0;
+        assert!((a.zones[0].blob_pct - 192.0 * 100.0 / zone_px).abs() < 0.01, "one blob, not both joined: {}", a.zones[0].blob_pct);
+    }
+
+    #[test]
+    fn closing_an_event_keeps_the_label_priorities() {
+        let mut ev = EventState { labels: vec!["person".into(), "car".into()], consecutive: 5, event_id: Some(3), zones: vec!["Z".into()], ..EventState::default() };
+        ev.reset();
+        assert_eq!(ev.labels, ["person", "car"]);
+        assert_eq!((ev.consecutive, ev.event_id), (0, None));
+        assert!(ev.zones.is_empty());
+    }
+
     #[test]
     fn detects_a_moving_block_and_ignores_noise() {
         let (w, h) = (160usize, 90usize);
@@ -1143,15 +1272,43 @@ mod tests {
     }
 
     #[test]
-    fn showinfo_clock_reads_absolute_frame_times() {
+    fn showinfo_clock_reads_frame_numbers_and_absolute_times() {
         let mut c = ShowinfoClock::default();
-        assert_eq!(c.line("[Parsed_showinfo_3 @ 0x1] n:   0 pts:5 pts_time:1"), None, "no time base yet");
-        assert_eq!(c.line("[Parsed_showinfo_3 @ 0x55] config in time_base: 1/5, frame_rate: 5/1"), None);
-        assert_eq!(c.line("[Parsed_showinfo_3 @ 0x55] n:   0 pts:8954710124 pts_time:1.79094e+09 duration:1"), Some(8_954_710_124 * 18_000));
+        assert_eq!(c.frame("[Parsed_showinfo_3 @ 0x1] n:   0 pts:5 pts_time:1"), Some((0, None)), "no time base yet");
+        assert_eq!(c.frame("[Parsed_showinfo_3 @ 0x55] config in time_base: 1/5, frame_rate: 5/1"), None);
+        assert_eq!(c.frame("[Parsed_showinfo_3 @ 0x55] n:   1 pts:8954710124 pts_time:1.79094e+09 duration:1"), Some((1, Some(8_954_710_124 * 18_000))));
         let mut c = ShowinfoClock::default();
-        c.line("[Parsed_showinfo_3 @ 0x55] config in time_base: 1/90000, frame_rate: 10/1");
-        assert_eq!(c.line("[Parsed_showinfo_3 @ 0x55] n:  12 pts:161184781964459 pts_time:1.79094e+09"), Some(161_184_781_964_459));
-        assert_eq!(c.line("[mp4 @ 0x1] some other line pts:3"), None);
+        c.frame("[Parsed_showinfo_3 @ 0x55] config in time_base: 1/90000, frame_rate: 10/1");
+        assert_eq!(c.frame("[Parsed_showinfo_3 @ 0x55] n:  12 pts:161184781964459 pts_time:1.79094e+09"), Some((12, Some(161_184_781_964_459))));
+        assert_eq!(c.frame("[Parsed_showinfo_3 @ 0x55] color_range:tv color_space:unknown"), None);
+        assert_eq!(c.frame("[mp4 @ 0x1] some other line n:1 pts:3"), None);
+    }
+
+    /// Frames get the time of the showinfo line with their number: a lost
+    /// line costs one frame its time, not every later frame; a frame without
+    /// a time gets the fallback; times never go backwards.
+    #[tokio::test]
+    async fn frame_times_pair_by_frame_number() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf '%s\\n' \
+                'config in time_base: 1/90000 [Parsed_showinfo_1 @ 0x1]' \
+                '[Parsed_showinfo_1 @ 0x1] n:   0 pts:1000 pts_time:0' \
+                '[Parsed_showinfo_1 @ 0x1] n:   2 pts:3000 pts_time:0' \
+                '[Parsed_showinfo_1 @ 0x1] n:   3 pts:500 pts_time:0' \
+                'some error' >&2"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let other = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let o2 = other.clone();
+        let mut t = FrameTimes::spawn(child.stderr.take().unwrap(), Duration::from_secs(2), 0..i64::MAX, move |l| o2.lock().push(l.trim().to_string()));
+        assert_eq!(t.next(|_| -1).await, 1000);
+        assert_eq!(t.next(|p| p.unwrap() + 10).await, 1010, "frame 1's line is missing: fallback");
+        assert_eq!(t.next(|_| -1).await, 3000, "frame 2 still gets its own time");
+        assert_eq!(t.next(|_| -1).await, 3001, "never backwards");
+        assert_eq!(t.next(|p| p.unwrap() + 10).await, 3011, "stderr ended: fallback, without waiting");
+        let _ = child.wait().await;
+        assert!(other.lock().contains(&"some error".to_string()));
     }
 
     #[test]

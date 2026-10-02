@@ -1235,7 +1235,7 @@ impl Db {
             }
             let mut ph = Vec::new();
             for k in ks {
-                args.push(k.to_lowercase().into());
+                args.push(k.to_ascii_lowercase().into());
                 ph.push(format!("?{}", args.len()));
             }
             // the kind is only the top label: a person walking past a car is
@@ -1251,7 +1251,8 @@ impl Db {
             }
             let mut ph = Vec::new();
             for z in zs {
-                args.push(z.trim().to_lowercase().into());
+                // ASCII only, as SQLite's lower() and the alert rules fold case
+                args.push(z.trim().to_ascii_lowercase().into());
                 ph.push(format!("?{}", args.len()));
             }
             sql.push_str(&format!(
