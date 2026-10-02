@@ -74,6 +74,8 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/cameras/{id}/timeline?start&end[&bucket]` | coverage intervals, motion histogram, events |
 | `GET /api/cameras/{id}/video.mp4?start&end[&stream=sub][&codec=h264]` | fMP4 for the range (≤ 6 h); header `X-First-Dts-Ms`; `codec=h264` transcodes HEVC on demand |
 | `GET /api/cameras/{id}/playlist.m3u8?start&end` | HLS (fMP4, byte ranges) |
+| `GET /api/export.json?cameras=1,2&start&end[&stream=sub]` | what an export would hold: per camera file name, size, frames, first/last frame, gaps; cameras without recording; the ZIP's exact size |
+| `GET /api/export.zip?cameras=1,2&start&end[&stream=sub]` | the export (≤ 6 h, ≤ 32 cameras): a ZIP streamed with `Content-Length`, see *Export* below |
 | `GET /api/cameras/{id}/live.mp4[?stream=sub][&codec=h264]` | live fMP4 (chunked) |
 | `GET /api/cameras/{id}/snapshot.jpg?width&stream` | latest keyframe as JPEG, decoded from the substream when it runs and can serve `width` (never upscaled; `stream=main` forces the main stream); `X-Stream` says which |
 | `GET /api/cameras/{id}/frame.jpg?t&width[&stream=sub]` | keyframe nearest to time `t` (`stream=sub` ≈ 30 ms, used for scrub previews) |
@@ -90,6 +92,16 @@ Each event mp4 becomes a legacy segment (timestamps shifted on the fly when serv
 | `GET /api/metrics` | the same as Prometheus text (admin token; scrape with `bearer_token`) |
 | `GET /api/peers`, `/api/peers/{name}/api/...` | federation: peer reachability; proxied read API of a peer |
 | `GET /api/storages`, `GET /api/stats`, `GET /api/health` | status |
+
+## Export (incident handover)
+
+On the camera page and in Review, **[ In** and **Out ]** (keys I and O) mark a range on the playhead (drawn as a band on the timeline); **Export…** opens a dialog with the times (to the second), the cameras (Review's selection, or this camera), full resolution or substream, and a preview of what the ZIP will hold: size per camera, the gaps in the recording, cameras with nothing recorded. *Download ZIP* then streams `GET /api/export.zip`:
+
+* one MP4 per camera, copied as recorded (no re-encoding). Our own video-only recordings become a standard MP4 with the index at the front (plays in VLC, Windows Media Player, QuickTime, browsers); recordings with audio, a codec change inside the range, or imported ZoneMinder files are exported as fragmented MP4 (VLC, browsers, ffmpeg). A gap in the recording is kept as a held frame, so playback time is wall-clock time;
+* `manifest.json`: who exported what and when, the range, and per file the camera, codec, resolution, frames, first frame and end in local time and UTC, the gaps, size and SHA-256;
+* `SHA256SUMS` (`sha256sum -c SHA256SUMS`; PowerShell: `Get-FileHash -Algorithm SHA256`) and a `README.txt` for whoever receives it.
+
+The ZIP is written as it is sent (entries stored, ZIP64 when an entry or offset passes 4 GB), and its exact length is computed first from the index, so the browser shows progress on large exports. Viewers can export the cameras they can see. Every export is logged (`export user=… cameras=… start=… end=…`). The last minute (the segment still being written) is not in the index yet; the dialog says so when the range ends within it. Cameras on federation peers are exported from their own server.
 
 ## Several servers, one UI (federation)
 

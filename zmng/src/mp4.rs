@@ -361,6 +361,184 @@ pub fn init_segment_av(p: &VideoParams, audio: Option<&AudioParams>) -> Bytes {
 
 const UNITY_MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 
+/// Seconds from 1904-01-01 (MP4 time) to the Unix epoch.
+const MP4_EPOCH_OFFSET: i64 = 2_082_844_800;
+
+/// Sample table of a progressive (non-fragmented) video-only MP4 whose
+/// media data is one `mdat`: per-sample durations (90 kHz), sizes and
+/// keyframe flags, and the chunks as (samples, byte offset inside the
+/// `mdat` payload).
+#[derive(Default, Debug, Clone)]
+pub struct SampleTable {
+    pub durations: Vec<u32>,
+    pub sizes: Vec<u32>,
+    pub keys: Vec<bool>,
+    pub chunks: Vec<(u32, u64)>,
+}
+
+impl SampleTable {
+    pub fn mdat_len(&self) -> u64 {
+        self.sizes.iter().map(|&s| s as u64).sum()
+    }
+}
+
+/// `ftyp` + `moov` + the `mdat` header (64-bit size) of a progressive MP4
+/// for `t`; the file is this followed by the samples in table order. Plays
+/// in any player (the index is at the front), unlike our fragmented files.
+/// `created_unix` goes into the movie header (players show it as the
+/// recording date).
+pub fn progressive_head(p: &VideoParams, t: &SampleTable, created_unix: i64) -> Bytes {
+    let mut ftyp = BoxWriter::new();
+    ftyp.open(b"ftyp");
+    ftyp.buf.put_slice(b"isom");
+    ftyp.buf.put_u32(512);
+    for b in [b"isom", b"iso2", b"mp41"] {
+        ftyp.buf.put_slice(b);
+    }
+    ftyp.close();
+    let ftyp = ftyp.finish();
+    // the chunk offsets depend on the moov's own size: build it twice
+    let probe = progressive_moov(p, t, created_unix, 0);
+    let base = ftyp.len() as u64 + probe.len() as u64 + 16;
+    let moov = progressive_moov(p, t, created_unix, base);
+    debug_assert_eq!(moov.len(), probe.len());
+    let mut out = BytesMut::with_capacity(ftyp.len() + moov.len() + 16);
+    out.put_slice(&ftyp);
+    out.put_slice(&moov);
+    out.put_u32(1); // size in the 64-bit field that follows
+    out.put_slice(b"mdat");
+    out.put_u64(16 + t.mdat_len());
+    out.freeze()
+}
+
+fn progressive_moov(p: &VideoParams, t: &SampleTable, created_unix: i64, mdat_payload_at: u64) -> Bytes {
+    let created = (created_unix + MP4_EPOCH_OFFSET).max(0) as u64;
+    let duration: u64 = t.durations.iter().map(|&d| d as u64).sum();
+    let mut w = BoxWriter::new();
+    w.open(b"moov");
+    w.open_full(b"mvhd", 1, 0);
+    w.buf.put_u64(created);
+    w.buf.put_u64(created);
+    w.buf.put_u32(TIMESCALE);
+    w.buf.put_u64(duration);
+    w.buf.put_u32(0x0001_0000);
+    w.buf.put_u16(0x0100);
+    w.buf.put_u16(0);
+    w.buf.put_u64(0);
+    for v in UNITY_MATRIX {
+        w.buf.put_u32(v);
+    }
+    w.buf.put_slice(&[0u8; 24]);
+    w.buf.put_u32(2); // next_track_id
+    w.close();
+    w.open(b"trak");
+    w.open_full(b"tkhd", 1, 0x7);
+    w.buf.put_u64(created);
+    w.buf.put_u64(created);
+    w.buf.put_u32(1);
+    w.buf.put_u32(0);
+    w.buf.put_u64(duration);
+    w.buf.put_u64(0);
+    w.buf.put_u16(0);
+    w.buf.put_u16(0);
+    w.buf.put_u16(0);
+    w.buf.put_u16(0);
+    for v in UNITY_MATRIX {
+        w.buf.put_u32(v);
+    }
+    w.buf.put_u32(p.width << 16);
+    w.buf.put_u32(p.height << 16);
+    w.close();
+    w.open(b"mdia");
+    w.open_full(b"mdhd", 1, 0);
+    w.buf.put_u64(created);
+    w.buf.put_u64(created);
+    w.buf.put_u32(TIMESCALE);
+    w.buf.put_u64(duration);
+    w.buf.put_u16(0x55c4);
+    w.buf.put_u16(0);
+    w.close();
+    w.open_full(b"hdlr", 0, 0);
+    w.buf.put_u32(0);
+    w.buf.put_slice(b"vide");
+    w.buf.put_slice(&[0u8; 12]);
+    w.buf.put_slice(b"VideoHandler\0");
+    w.close();
+    w.open(b"minf");
+    w.open_full(b"vmhd", 0, 1);
+    w.buf.put_u64(0);
+    w.close();
+    w.open(b"dinf");
+    w.open_full(b"dref", 0, 0);
+    w.buf.put_u32(1);
+    w.open_full(b"url ", 0, 1);
+    w.close();
+    w.close();
+    w.close();
+    w.open(b"stbl");
+    w.open_full(b"stsd", 0, 0);
+    w.buf.put_u32(1);
+    w.buf.put_slice(&p.sample_entry);
+    w.close();
+    // stts: run-length of durations
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &d in &t.durations {
+        match runs.last_mut() {
+            Some((n, v)) if *v == d => *n += 1,
+            _ => runs.push((1, d)),
+        }
+    }
+    w.open_full(b"stts", 0, 0);
+    w.buf.put_u32(runs.len() as u32);
+    for (n, d) in runs {
+        w.buf.put_u32(n);
+        w.buf.put_u32(d);
+    }
+    w.close();
+    // stss: 1-based numbers of the keyframes
+    w.open_full(b"stss", 0, 0);
+    let keys: Vec<u32> = t.keys.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i as u32 + 1).collect();
+    w.buf.put_u32(keys.len() as u32);
+    for k in keys {
+        w.buf.put_u32(k);
+    }
+    w.close();
+    // stsc: runs of chunks with the same sample count
+    let mut stsc: Vec<(u32, u32)> = Vec::new();
+    for (i, (n, _)) in t.chunks.iter().enumerate() {
+        if stsc.last().map(|(_, m)| m != n).unwrap_or(true) {
+            stsc.push((i as u32 + 1, *n));
+        }
+    }
+    w.open_full(b"stsc", 0, 0);
+    w.buf.put_u32(stsc.len() as u32);
+    for (first, n) in stsc {
+        w.buf.put_u32(first);
+        w.buf.put_u32(n);
+        w.buf.put_u32(1);
+    }
+    w.close();
+    w.open_full(b"stsz", 0, 0);
+    w.buf.put_u32(0);
+    w.buf.put_u32(t.sizes.len() as u32);
+    for &s in &t.sizes {
+        w.buf.put_u32(s);
+    }
+    w.close();
+    w.open_full(b"co64", 0, 0);
+    w.buf.put_u32(t.chunks.len() as u32);
+    for (_, off) in &t.chunks {
+        w.buf.put_u64(mdat_payload_at + off);
+    }
+    w.close();
+    w.close(); // stbl
+    w.close(); // minf
+    w.close(); // mdia
+    w.close(); // trak
+    w.close(); // moov
+    w.finish()
+}
+
 /// One access unit queued into a fragment.
 pub struct Sample {
     /// Absolute decode time, 90 kHz ticks since Unix epoch.
@@ -928,17 +1106,26 @@ pub struct SampleInfo {
 /// every `trun` optional field. Bounds-checked: a corrupt fragment yields an
 /// error, never a panic.
 pub fn parse_fragment_samples(frag: &[u8]) -> anyhow::Result<Vec<SampleInfo>> {
-    let rd32 = |b: &[u8], at: usize| -> anyhow::Result<u32> {
-        b.get(at..at + 4).map(|x| u32::from_be_bytes(x.try_into().unwrap())).ok_or_else(|| anyhow::anyhow!("truncated box"))
-    };
     if frag.len() < 8 || &frag[4..8] != b"moof" {
         anyhow::bail!("not a moof");
     }
-    let moof_len = rd32(frag, 0)? as usize;
+    let moof_len = u32::from_be_bytes(frag[0..4].try_into().unwrap()) as usize;
     if moof_len > frag.len() {
         anyhow::bail!("truncated moof");
     }
-    let moof = &frag[..moof_len];
+    parse_moof_samples(&frag[..moof_len], frag.len())
+}
+
+/// [`parse_fragment_samples`] from the `moof` box alone, for a fragment of
+/// `frag_len` bytes (the sample offsets are checked against it): reading a
+/// fragment's sample table does not need its media data.
+pub fn parse_moof_samples(moof: &[u8], frag_len: usize) -> anyhow::Result<Vec<SampleInfo>> {
+    let rd32 = |b: &[u8], at: usize| -> anyhow::Result<u32> {
+        b.get(at..at + 4).map(|x| u32::from_be_bytes(x.try_into().unwrap())).ok_or_else(|| anyhow::anyhow!("truncated box"))
+    };
+    if moof.len() < 8 || &moof[4..8] != b"moof" {
+        anyhow::bail!("not a moof");
+    }
     let mut out = Vec::new();
     let mut pos = 8;
     while pos + 8 <= moof.len() {
@@ -995,7 +1182,7 @@ pub fn parse_fragment_samples(frag: &[u8]) -> anyhow::Result<Vec<SampleInfo>> {
                             if flags & 0x800 != 0 { q += 4; }
                             // sample_is_non_sync_sample is bit 16; depends_on==2 (bits 24-25) also marks an I-frame
                             let is_key = fl & 0x0001_0000 == 0;
-                            if off < 0 || off as usize + sz as usize > frag.len() {
+                            if off < 0 || off as usize + sz as usize > frag_len {
                                 anyhow::bail!("sample outside fragment");
                             }
                             out.push(SampleInfo { duration: dur, size: sz, is_key, offset: off as usize });

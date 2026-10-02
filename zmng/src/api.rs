@@ -802,6 +802,123 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
     Ok(b.body(body).unwrap())
 }
 
+#[derive(Deserialize)]
+struct ExportQ {
+    /// comma separated camera ids
+    cameras: String,
+    /// epoch milliseconds
+    start: i64,
+    end: i64,
+    /// "main" (default, full resolution) or "sub"
+    stream: Option<String>,
+}
+
+/// Check an export request and plan it (blocking reads of the index and of
+/// fragment headers run off the async threads).
+async fn export_plan(app: &App, u: &User, q: &ExportQ) -> Result<crate::export::ExportPlan, Response> {
+    let (start, end) = (video::ms_to_dts(q.start), video::ms_to_dts(q.end));
+    if end <= start || end - start > crate::export::MAX_RANGE_DTS {
+        return Err(bad("range must be 0 < end-start <= 6 h"));
+    }
+    let kind = stream_of(&q.stream)?;
+    let mut ids: Vec<i64> = Vec::new();
+    for part in q.cameras.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let id: i64 = part.parse().map_err(|_| bad("cameras: comma separated ids"))?;
+        can_see(app, u, id)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() || ids.len() > crate::export::MAX_CAMERAS {
+        return Err(bad(format!("choose 1 to {} cameras", crate::export::MAX_CAMERAS)));
+    }
+    let mut cams = Vec::new();
+    for id in ids {
+        cams.push(app.db.camera(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such camera").into_response())?);
+    }
+    let db = app.db.clone();
+    let stream = kind.as_str().to_string();
+    tokio::task::spawn_blocking(move || crate::export::plan(&db, &cams, &stream, start, end)).await.map_err(err500)?.map_err(err500)
+}
+
+fn export_info(u: &User) -> crate::export::ExportInfo {
+    crate::export::ExportInfo { user: u.username.clone(), server: format!("zmng {}", env!("CARGO_PKG_VERSION")), timezone: crate::zmapi::local_tz_name(), at: chrono::Local::now() }
+}
+
+fn export_zip_name(plan: &crate::export::ExportPlan) -> String {
+    let (a, b) = (crate::export::local(plan.start_dts), crate::export::local(plan.end_dts));
+    format!("zmng-export {}-{}.zip", a.format("%Y-%m-%d %H%M"), b.format("%H%M"))
+}
+
+/// What an export of this range would contain: files, sizes, gaps, cameras
+/// without recording, and the archive size (when known in advance).
+async fn export_preview(State(app): State<App>, Query(q): Query<ExportQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let plan = export_plan(&app, u, &q).await?;
+    let info = export_info(u);
+    let name = export_zip_name(&plan);
+    let (plan, total) = tokio::task::spawn_blocking(move || {
+        let total = crate::export::length(&plan, &info);
+        (plan, total)
+    })
+    .await
+    .map_err(err500)?;
+    let total = total.map_err(err500)?;
+    let files: Vec<serde_json::Value> = plan
+        .files
+        .iter()
+        .map(|f| serde_json::json!({"name": f.name, "camera_id": f.camera_id, "camera": f.camera, "stream": f.stream, "format": f.format,
+            "codec": f.codec, "width": f.width, "height": f.height, "bytes": f.size, "frames": f.frames,
+            "first_ms": f.first_dts / 90, "end_ms": f.end_dts / 90, "gaps": crate::export::gaps_json(&f.gaps)}))
+        .collect();
+    let missing: Vec<serde_json::Value> = plan.missing.iter().map(|m| serde_json::json!({"camera_id": m.camera_id, "camera": m.camera, "reason": m.reason})).collect();
+    Ok(Json(serde_json::json!({"zip": name, "total_bytes": total, "files": files, "missing": missing})).into_response())
+}
+
+/// The export itself: a ZIP streamed as it is written (see `export.rs`).
+async fn export_zip(State(app): State<App>, Query(q): Query<ExportQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+    let u = require(user.as_ref().map(|e| &e.0))?;
+    let plan = export_plan(&app, u, &q).await?;
+    if plan.files.is_empty() {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no recording for these cameras in this range"}))).into_response());
+    }
+    let info = export_info(u);
+    let name = export_zip_name(&plan);
+    info!(user = %u.username, cameras = %q.cameras, start = q.start, end = q.end, stream = %plan.stream, files = plan.files.len(), "export");
+    let (plan, info, total) = tokio::task::spawn_blocking(move || {
+        let total = crate::export::length(&plan, &info);
+        (plan, info, total)
+    })
+    .await
+    .map_err(err500)?;
+    let total = total.map_err(err500)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut w = crate::export::ChannelWriter::new(tx.clone());
+        let res = crate::export::write(&plan, &info, &mut w, false).and_then(|n| {
+            std::io::Write::flush(&mut w)?;
+            Ok(n)
+        });
+        match res {
+            Ok(n) if total.is_some_and(|t| t != n) => tracing::error!(expected = total, wrote = n, "export length differs from its dry run"),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("export stopped: {e:#}");
+                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+            }
+        }
+    });
+    let body = Body::from_stream(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    let mut b = Response::builder()
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""));
+    if let Some(t) = total {
+        b = b.header(header::CONTENT_LENGTH, t);
+    }
+    Ok(b.body(body).unwrap())
+}
+
 async fn video_hls(State(app): State<App>, Path(id): Path<i64>, Query(q): Query<VideoQ>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
     let u = require(user.as_ref().map(|e| &e.0))?;
     can_see(&app, u, id)?;
@@ -1659,6 +1776,8 @@ pub fn router(app: App) -> Router {
         .route("/api/cameras", get(cameras).post(camera_create))
         .route("/api/cameras/{id}", get(camera_get).patch(camera_update).delete(camera_delete))
         .route("/api/cameras/{id}/timeline", get(timeline))
+        .route("/api/export.json", get(export_preview))
+        .route("/api/export.zip", get(export_zip))
         .route("/api/cameras/{id}/video.mp4", get(video_range))
         .route("/api/cameras/{id}/playlist.m3u8", get(video_hls))
         .route("/api/cameras/{id}/live.mp4", get(live))

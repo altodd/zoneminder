@@ -40,6 +40,8 @@ const matchesKinds = (ev, kinds) => !kinds || labelsOf(ev).some((l) => kinds.inc
 const fmtDur = (ms) => { const s = Math.round(ms / 1000); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; };
 const toLocalInput = (ms) => { const d = new Date(ms); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
 const WINDOWS = [[900000, '15 min'], [3600000, '1 h'], [3 * 3600000, '3 h'], [12 * 3600000, '12 h'], [86400000, '24 h']];
+const toLocalInputSec = (ms) => `${toLocalInput(ms)}:${String(new Date(ms).getSeconds()).padStart(2, '0')}`;
+const fmtBytes = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`);
 
 // ---------------------------------------------------------------------------
 // API
@@ -169,6 +171,7 @@ function makeTimeline({ rows, range, onSeek, onScrub, onScrubStart, onRangeChang
   const el = h('div', { class: 'timeline' + (tall ? ' tall' : '') }, canvas, hover, tip, cursor, preview);
   let data = new Map(); // camId -> timeline json
   let playhead = range.start;
+  let marks = { in: null, out: null }; // export range, drawn as a band
   let dragging = false;
   const cache = new Map();
   let previewTimer = null;
@@ -193,6 +196,14 @@ function makeTimeline({ rows, range, onSeek, onScrub, onScrubStart, onRangeChang
       }
       if (rows.length > 1) { ctx.fillStyle = '#c8ced8'; ctx.font = '10px system-ui'; ctx.fillText(row.name, 3, y + Math.min(rowH - 2, 11)); }
     });
+    if (marks.in !== null || marks.out !== null) {
+      const a = marks.in ?? marks.out, b = marks.out ?? marks.in;
+      const x0 = xOf(Math.min(a, b)), x1 = xOf(Math.max(a, b));
+      ctx.fillStyle = 'rgba(79,156,249,.18)'; ctx.fillRect(x0, 12, Math.max(2, x1 - x0), H - 12);
+      ctx.fillStyle = '#4f9cf9';
+      if (marks.in !== null) ctx.fillRect(xOf(marks.in), 12, 2, H - 12);
+      if (marks.out !== null) ctx.fillRect(xOf(marks.out) - 1, 12, 2, H - 12);
+    }
     ctx.fillStyle = '#8b93a1'; ctx.font = '11px system-ui';
     // ticks at least ~80 px apart, on local-time boundaries, labelled "5:15 PM" (a date at midnight)
     const span = range.end - range.start;
@@ -258,6 +269,7 @@ function makeTimeline({ rows, range, onSeek, onScrub, onScrubStart, onRangeChang
     setPlayhead(ms) { if (dragging) return; playhead = ms; cursor.style.left = `${xOf(ms)}px`; },
     get dragging() { return dragging; },
     setRange(s, e) { range.start = s; range.end = e; return load(); },
+    setMarks(a, b) { marks = { in: a, out: b }; draw(); },
     get range() { return range; },
     destroy() { window.removeEventListener('resize', draw); for (const u of cache.values()) URL.revokeObjectURL(u); cache.clear(); },
   };
@@ -335,6 +347,99 @@ function fitGrid(grid, count, { aspect = 16 / 9, below = () => 0, min = 260 } = 
   requestAnimationFrame(fit);
   setTimeout(fit, 300);
   return { fit, destroy() { ro.disconnect(); window.removeEventListener('resize', fit); } };
+}
+
+// ---------------------------------------------------------------------------
+// Export: Mark in / Mark out on a page's playhead, and the export dialog
+// (a ZIP of one MP4 per camera with a manifest and checksums).
+// ---------------------------------------------------------------------------
+
+// Buttons and a label for marking an export range. `now()` is the playhead,
+// `onChange(in, out)` redraws the timeline band, `exportFor(range)` opens the
+// dialog.
+function markControls({ now, onChange, exportFor }) {
+  const m = { in: null, out: null };
+  const label = h('span', { class: 'muted small marks' });
+  const clear = h('button', { class: 'ghost small', title: 'clear the marks', hidden: true, onclick: () => set(null, null) }, '✕');
+  const set = (a, b) => {
+    m.in = a; m.out = b;
+    if (m.in !== null && m.out !== null && m.out < m.in) [m.in, m.out] = [m.out, m.in];
+    label.textContent = m.in === null && m.out === null ? '' : `${m.in !== null ? `in ${fmtTime(m.in)}` : 'in —'} → ${m.out !== null ? `out ${fmtTime(m.out)}` : 'out —'}${m.in !== null && m.out !== null ? ` (${fmtDur(m.out - m.in)})` : ''}`;
+    clear.hidden = m.in === null && m.out === null;
+    onChange(m.in, m.out);
+  };
+  // the range to export: the marks; one mark and the playhead; else ±30 s around the playhead
+  const range = () => {
+    const t = now();
+    if (m.in !== null && m.out !== null) return m.out - m.in >= 1000 ? [m.in, m.out] : [m.in - 30000, m.in + 30000];
+    if (m.in !== null) return t > m.in + 1000 ? [m.in, t] : [m.in, m.in + 60000];
+    if (m.out !== null) return t < m.out - 1000 ? [t, m.out] : [m.out - 60000, m.out];
+    return [t - 30000, t + 30000];
+  };
+  const markIn = () => set(now(), m.out);
+  const markOut = () => set(m.in, now());
+  const el = h('span', { class: 'row marksrow' },
+    h('button', { class: 'ghost', title: 'mark the start of an export here (I)', onclick: markIn }, '[ In'),
+    h('button', { class: 'ghost', title: 'mark the end of an export here (O)', onclick: markOut }, 'Out ]'),
+    label, clear,
+    h('button', { class: 'ghost', title: 'download these cameras and times as a ZIP of MP4 files', onclick: () => exportFor(range()) }, 'Export…'));
+  return { el, markIn, markOut, range };
+}
+
+// The export dialog: times, cameras, quality, a preview of what the ZIP
+// will hold (sizes, gaps, cameras without recording), then the download.
+function exportDialog({ cams, chosen, start, end }) {
+  const local = cams.filter((c) => !c.peer);
+  const fromIn = h('input', { type: 'datetime-local', step: 1, value: toLocalInputSec(start) });
+  const toIn = h('input', { type: 'datetime-local', step: 1, value: toLocalInputSec(Math.min(end, Date.now())) });
+  const boxes = local.map((c) => h('label', { class: 'chip' }, h('input', { type: 'checkbox', value: c.id, checked: chosen.some((x) => keyOf(x) === keyOf(c)) }), c.name));
+  const peerNote = cams.some((c) => c.peer) ? h('p', { class: 'muted small' }, 'Cameras on other servers (@peer) are exported from that server.') : null;
+  const quality = h('select', { style: 'width:auto' }, h('option', { value: 'main' }, 'Full resolution'), h('option', { value: 'sub' }, 'Substream (smaller files)'));
+  const summary = h('div', { class: 'export-summary' });
+  const go = h('a', { class: 'button', download: '' }, 'Download ZIP');
+  const span = () => [new Date(fromIn.value).getTime(), new Date(toIn.value).getTime()];
+  const query = () => {
+    const [a, b] = span();
+    const ids = boxes.filter((x) => $('input', x).checked).map((x) => $('input', x).value);
+    if (!(a < b) || !ids.length) return null;
+    return new URLSearchParams({ cameras: ids.join(','), start: Math.round(a), end: Math.round(b), stream: quality.value }).toString();
+  };
+  let gen = 0;
+  const refresh = debounce(async () => {
+    const q = query(); const my = ++gen;
+    go.classList.add('disabled'); go.removeAttribute('href');
+    if (!q) { fill(summary, h('p', { class: 'err' }, '"From" must be before "To", and at least one camera ticked.')); return; }
+    const [a, b] = span();
+    if (b - a > 6 * 3600000) { fill(summary, h('p', { class: 'err' }, 'One export covers at most 6 hours; split longer ones.')); return; }
+    fill(summary, h('p', { class: 'muted' }, 'Checking the recording…'));
+    try {
+      const p = await api.get(`/api/export.json?${q}`);
+      if (my !== gen) return;
+      const rows = p.files.map((f) => h('tr', {}, h('td', {}, f.camera), h('td', {}, f.bytes ? fmtBytes(f.bytes) : '—'),
+        h('td', {}, `${fmtTime(f.first_ms)} → ${fmtTime(f.end_ms)}`),
+        h('td', {}, f.gaps.length ? h('span', { class: 'pill bad', title: f.gaps.map((g) => `${fmtTime(g.start_ms)}–${fmtTime(g.end_ms)}`).join(', ') }, `${f.gaps.length} gap${f.gaps.length === 1 ? '' : 's'}, ${fmtDur(f.gaps.reduce((t, g) => t + g.end_ms - g.start_ms, 0))} not recorded`) : h('span', { class: 'muted' }, 'complete'))));
+      fill(summary,
+        p.files.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('tr', {}, h('th', {}, 'Camera'), h('th', {}, 'Size'), h('th', {}, 'Recorded'), h('th', {}, '')), ...rows)) : h('p', { class: 'err' }, 'Nothing was recorded by these cameras in this range.'),
+        p.missing.length ? h('p', { class: 'muted small' }, `Not included: ${p.missing.map((m) => `${m.camera} (${m.reason})`).join(', ')}`) : null,
+        p.files.length ? h('p', { class: 'muted small' }, `${p.zip}${p.total_bytes ? ` · ${fmtBytes(p.total_bytes)}` : ''}`) : null,
+        b > Date.now() - 70000 ? h('p', { class: 'muted small' }, 'The last minute is still being recorded; it will be in an export made a minute from now.') : null);
+      if (p.files.length) { go.href = `/api/export.zip?${q}`; go.classList.remove('disabled'); }
+    } catch (err) { if (my === gen) fill(summary, h('p', { class: 'err' }, err.message)); }
+  }, 300);
+  [fromIn, toIn, quality].forEach((x) => x.addEventListener('change', refresh));
+  boxes.forEach((b) => $('input', b).addEventListener('change', refresh));
+  go.addEventListener('click', (e) => { if (!go.href) { e.preventDefault(); return; } toast('Export started: your browser is downloading the ZIP', { kind: 'ok' }); });
+  const modal = h('div', { class: 'modal' }, h('div', { class: 'card wide-modal' },
+    h('div', { class: 'row' }, h('h2', {}, 'Export video'), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
+    h('div', { class: 'row' }, h('label', {}, 'From', fromIn), h('label', {}, 'To', toIn), h('label', {}, 'Quality', quality)),
+    h('div', { class: 'row' }, h('span', { class: 'muted' }, 'Cameras:'), h('button', { class: 'ghost small', onclick: () => { boxes.forEach((b) => { $('input', b).checked = true; }); refresh(); } }, 'all'), ...boxes),
+    peerNote, summary,
+    h('div', { class: 'row' }, go, h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Close')),
+    h('p', { class: 'muted small' }, 'One MP4 per camera, copied as recorded (no re-encoding), plus manifest.json (times in local time and UTC, gaps) and SHA256SUMS so the files can be checked later. Plays in VLC, Windows Media Player and QuickTime.')));
+  const close = () => modal.remove();
+  closeOnEscape(modal, close);
+  document.body.append(modal);
+  refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +542,7 @@ async function viewCamera(main, camId, atMs) {
     onScrubStart: () => { wasPaused = video.paused; video.pause(); },
     onScrub: (t) => { timeLabel.textContent = fmtDT(t); scrubber.show([pl], t); },
     onSeek: (t) => play(t, { resume: !wasPaused || mode === 'live' }), onRangeChange: () => {} });
+  const marks = markControls({ now: () => playhead, onChange: (a, b) => tl.setMarks(a, b), exportFor: ([a, b]) => exportDialog({ cams: state.cameras, chosen: [cam], start: a, end: b }) });
   // playback speed for recorded video (live always plays in real time)
   const SPEEDS = [0.5, 1, 2, 4, 8, 16];
   const speed = () => Number(speedSel.value) || 1;
@@ -447,10 +553,10 @@ async function viewCamera(main, camId, atMs) {
     h('button', { class: 'ghost', onclick: () => shift(-windowMs / 2) }, '◀'), h('button', { class: 'ghost', onclick: () => shift(windowMs / 2) }, '▶'),
     h('button', { class: 'ghost', onclick: () => play(playhead - 10000) }, '−10 s'), h('button', { class: 'ghost', onclick: () => play(playhead + 10000) }, '+10 s'),
     h('span', { class: 'grow' }),
-    h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/video.mp4?start=${Math.round(playhead - 30000)}&end=${Math.round(playhead + 30000)}`) }, 'Export ±30 s'),
+    cam.peer ? null : marks.el,
     h('button', { class: 'ghost', onclick: () => window.open(`${camApi(cam)}/frame.jpg?t=${Math.round(playhead)}&width=3840`) }, 'Full-res frame'),
     h('button', { class: 'ghost', onclick: () => { location.hash = '#/events'; localStorage.setItem('evCam', keyOf(cam)); } }, 'Events'),
-    h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s · [ ] speed'));
+    h('span', { class: 'muted small' }, 'drag the timeline to scrub · wheel to zoom · space pause · ←/→ 10 s · [ ] speed · I/O mark an export'));
   main.replaceChildren(head, player, tl.el, controls);
   if (cam.ptz && state.me.user.role === 'admin' && !cam.peer) player.append(ptzPad(cam));
 
@@ -497,6 +603,8 @@ async function viewCamera(main, camId, atMs) {
     if (e.key === 'ArrowRight') play(playhead + (e.shiftKey ? 60000 : 10000));
     if (e.key === 'ArrowLeft') play(playhead - (e.shiftKey ? 60000 : 10000));
     if (e.key === ']' || e.key === '[') { const i = SPEEDS.indexOf(speed()) + (e.key === ']' ? 1 : -1); if (i >= 0 && i < SPEEDS.length) { speedSel.value = SPEEDS[i]; speedSel.dispatchEvent(new Event('change')); } }
+    if (!cam.peer && !e.metaKey && !e.ctrlKey && (e.key === 'i' || e.key === 'I')) marks.markIn();
+    if (!cam.peer && !e.metaKey && !e.ctrlKey && (e.key === 'o' || e.key === 'O')) marks.markOut();
   };
   document.addEventListener('keydown', keys);
   await tl.load();
@@ -697,11 +805,12 @@ function reviewSession(stage, cams, range, startAt, { counts = () => true, empty
   };
   const legend = state.me.objects ? h('span', { class: 'legend small' }, ...['motion', 'person', 'vehicle', 'animal'].map((k) => h('span', {}, h('i', { style: `background:${KIND_COLOR[k]}` }), k))) : null;
   const quietBadge = h('span', { class: 'pill', hidden: true }, '⏩ quiet');
-  const controls = h('div', { class: 'controls' }, playBtn, speedSel, quietSel,
+  const marks = markControls({ now: () => playhead, onChange: (a, b) => tl.setMarks(a, b), exportFor: ([a, b]) => exportDialog({ cams: state.cameras, chosen: cams, start: a, end: b }) });
+  const controls = h('div', { class: 'controls' }, playBtn, speedSel, quietSel, marks.el,
     h('button', { class: 'ghost', title: 'previous event (P)', onclick: () => jump(-1) }, '⏮ event'), h('button', { class: 'ghost', title: 'next event (N)', onclick: () => jump(1) }, 'event ⏭'),
     h('button', { class: 'ghost', onclick: () => seekAll(playhead - 60000) }, '−1 min'), h('button', { class: 'ghost', onclick: () => seekAll(playhead + 60000) }, '+1 min'),
     timeLabel, quietBadge, h('span', { class: 'grow' }), legend,
-    h('span', { class: 'muted small' }, `${cams.length} camera${cams.length === 1 ? '' : 's'} · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag the timeline to scrub · N/P events · each tile has its own speed`));
+    h('span', { class: 'muted small' }, `${cams.length} camera${cams.length === 1 ? '' : 's'} · ${fmtDT(range.start)} → ${fmtDT(range.end)} · drag the timeline to scrub · N/P events · I/O mark an export · each tile has its own speed`));
   fill(stage, grid, tl.el, controls);
   const sizer = fitGrid(grid, () => players.length, { aspect: aspectOf(cams), below: () => tl.el.offsetHeight + controls.offsetHeight + 26, min: 240 });
   async function load(p, s, e, resume) {
@@ -754,6 +863,8 @@ function reviewSession(stage, cams, range, startAt, { counts = () => true, empty
     if (e.key === ' ') { e.preventDefault(); togglePause(); }
     else if (e.key === 'n' || e.key === 'N') jump(1);
     else if (e.key === 'p' || e.key === 'P') jump(-1);
+    else if (e.key === 'i' || e.key === 'I') marks.markIn();
+    else if (e.key === 'o' || e.key === 'O') marks.markOut();
     else if (e.key === 'ArrowRight') seekAll(playhead + (e.shiftKey ? 60000 : 10000));
     else if (e.key === 'ArrowLeft') seekAll(playhead - (e.shiftKey ? 60000 : 10000));
   };

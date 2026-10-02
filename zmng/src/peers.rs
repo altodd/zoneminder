@@ -23,7 +23,8 @@ pub struct PeerConfig {
     pub name: String,
     /// Base URL of the peer, e.g. `http://10.10.100.101:8080`.
     pub url: String,
-    /// Bearer token created on the peer (`POST /api/tokens` there).
+    /// API token issued on the peer (Admin → API tokens there), acting as a
+    /// viewer of the cameras this site may see.
     pub token: String,
 }
 
