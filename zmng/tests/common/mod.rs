@@ -110,6 +110,17 @@ impl Fixture {
     /// samples, exactly as the recorder does (init + one fragment per GOP),
     /// and index it. `motion(frag_index)` supplies per-fragment scores.
     pub fn write_segment(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8) -> i64 {
+        self.write_segment_ext(cam, stream, enc, start_dts, motion, false)
+    }
+
+    /// A segment as imported from ZoneMinder: the file's own timeline starts
+    /// at 0 and the index carries the offset to wall-clock time.
+    pub fn write_legacy_segment(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64) -> i64 {
+        self.write_segment_ext(cam, stream, enc, start_dts, |_| 0, true)
+    }
+
+    fn write_segment_ext(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8, legacy: bool) -> i64 {
+        let offset = if legacy { start_dts } else { 0 };
         let init = mp4::init_segment(&enc.params);
         let se = self.db.intern_sample_entry(enc.params.codec, &enc.params.rfc6381, enc.params.width, enc.params.height, &enc.params.sample_entry, enc.params.audio.as_ref()).unwrap();
         let secs = start_dts / TIMESCALE as i64;
@@ -126,9 +137,13 @@ impl Fixture {
         let mut flush = |gop: &mut Vec<mp4::Sample>, file: &mut Vec<u8>, frags: &mut Vec<mp4::FragEntry>| {
             if gop.is_empty() { return; }
             seq += 1;
+            let dts = gop[0].dts;
+            for s in gop.iter_mut() {
+                s.dts -= offset;
+            }
             let frag = mp4::fragment(seq, gop);
             let dur: u32 = gop.iter().map(|s| s.duration).sum();
-            frags.push(mp4::FragEntry { dts: gop[0].dts, duration: dur, offset: file.len() as u64, len: frag.len() as u32, samples: gop.len() as u32, motion: motion(frags.len()) });
+            frags.push(mp4::FragEntry { dts, duration: dur, offset: file.len() as u64, len: frag.len() as u32, samples: gop.len() as u32, motion: motion(frags.len()) });
             file.extend_from_slice(&frag);
             gop.clear();
         };
@@ -141,7 +156,7 @@ impl Fixture {
         }
         flush(&mut gop, &mut file, &mut frags);
         std::fs::write(&abs, &file).unwrap();
-        self.db.insert_segment_ext(cam, self.storage_id, se, &rel, file.len() as i64, init.len() as u32, &frags, 0, None, stream).unwrap()
+        self.db.insert_segment_ext(cam, self.storage_id, se, &rel, file.len() as i64, init.len() as u32, &frags, offset, None, stream).unwrap()
     }
 
     pub fn add_admin(&self, name: &str, pw: &str) -> i64 {

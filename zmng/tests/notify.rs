@@ -57,6 +57,63 @@ async fn sse_delivers_only_visible_cameras() {
     assert_eq!(client.get(format!("http://127.0.0.1:{port}/api/events/stream")).send().await.unwrap().status(), 401);
 }
 
+/// Revoking the token a feed was opened with, or ending the session, stops
+/// the feed at the next notification instead of when the client hangs up.
+#[tokio::test]
+async fn sse_stops_when_its_token_is_revoked() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("front");
+    let admin = fx.add_admin("admin", "password123");
+    let session = fx.token_for(admin);
+    let port = serve(&fx).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let made: Value = client.post(format!("{base}/api/tokens")).bearer_auth(&session).json(&json!({"name": "ha"})).send().await.unwrap().json().await.unwrap();
+    let api_tok = made["token"].as_str().unwrap().to_string();
+    let open = |tok: String| {
+        let (client, base) = (client.clone(), base.clone());
+        async move { client.get(format!("{base}/api/events/stream")).bearer_auth(tok).send().await.unwrap().bytes_stream() }
+    };
+    let mut by_token = open(api_tok).await;
+    let mut by_session = open(session.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    fx.bus.publish(Notification::CameraDown { camera_id: cam, name: "front".into() });
+    for body in [&mut by_token, &mut by_session] {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await.expect("first notification").unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("camera_down"));
+    }
+    let id = made["id"].as_i64().unwrap();
+    assert_eq!(client.delete(format!("{base}/api/tokens/{id}")).bearer_auth(&session).send().await.unwrap().status(), 200);
+    fx.bus.publish(Notification::CameraUp { camera_id: cam, name: "front".into() });
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), by_token.next()).await.expect("the feed ends");
+    assert!(next.is_none(), "revoked: no more notifications");
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), by_session.next()).await.unwrap().unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&chunk).contains("camera_up"), "the session's feed goes on");
+    // signing out ends the session's feed the same way
+    assert_eq!(client.post(format!("{base}/api/logout")).bearer_auth(&session).send().await.unwrap().status(), 200);
+    fx.bus.publish(Notification::CameraDown { camera_id: cam, name: "front".into() });
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), by_session.next()).await.expect("the feed ends").is_none());
+}
+
+/// zmNinjaNg's websocket signs in with the password: once it changes, the
+/// socket is closed at the next event rather than delivering it.
+#[tokio::test]
+async fn event_server_websocket_closes_when_the_password_changes() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("front");
+    let v = fx.add_viewer("v", "password123", &[cam]);
+    let port = serve(&fx).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/zm/ws")).await.unwrap();
+    ws.send(json!({"event": "auth", "data": {"user": "v", "password": "password123"}}).to_string().into()).await.unwrap();
+    assert_eq!(recv(&mut ws).await["status"], "Success");
+    fx.bus.publish(Notification::EventStart(info(&fx, cam, 1)));
+    assert_eq!(recv(&mut ws).await["events"][0]["EventId"], 1);
+    fx.db.set_password_hash(v, &zmng::api::hash_password("another-password").unwrap()).unwrap();
+    fx.bus.publish(Notification::EventStart(info(&fx, cam, 2)));
+    let m = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.expect("closed");
+    assert!(matches!(m, None | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_))), "{m:?}");
+}
+
 #[tokio::test]
 async fn event_server_websocket_speaks_the_zmninja_protocol() {
     let fx = Fixture::new();

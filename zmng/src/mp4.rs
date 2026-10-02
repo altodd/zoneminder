@@ -1160,6 +1160,11 @@ pub fn parse_moof_samples(moof: &[u8], frag_len: usize) -> anyhow::Result<Vec<Sa
                     b"trun" => {
                         let flags = rd32(traf, p + 8)? & 0xff_ffff;
                         let count = rd32(traf, p + 12)? as usize;
+                        // every sample takes at least a byte of the fragment: a
+                        // larger count is a damaged file, not billions of samples
+                        if count > frag_len {
+                            anyhow::bail!("trun claims {count} samples in a {frag_len} byte fragment");
+                        }
                         let mut q = p + 16;
                         let mut data_offset = 0i64;
                         if flags & 0x1 != 0 {
@@ -1380,6 +1385,11 @@ mod tests {
         assert_eq!(samples[1].offset, samples[0].offset + 50);
         assert_eq!(&f[samples[2].offset..samples[2].offset + 20], &[0xCD; 20]);
         assert!(parse_fragment_samples(&f[..40]).is_err());
+        // a damaged sample count is an error, not billions of samples
+        let mut bad = f.to_vec();
+        let at = bad.windows(4).position(|w| w == b"trun").unwrap() + 8;
+        bad[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_fragment_samples(&bad).unwrap_err().to_string().contains("claims"));
     }
 }
 

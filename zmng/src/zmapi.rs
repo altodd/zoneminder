@@ -310,8 +310,11 @@ fn alarm_args(rest: &str) -> (Option<i64>, String) {
 }
 
 /// ZoneMinder's alarm state for a monitor: 2 (Alarm) while the detector has
-/// an event open, else 0 (Idle). zmNinjaNg polls this for its Live Activity
-/// page and the alarm ring. Forcing an alarm on or off has no equivalent
+/// an event open, else 0 (Idle). These are the numbers zmNinjaNg reads
+/// (`lib/monitor/alarm-state.ts`: 0 idle, 1 prealarm, 2 alarm, 3 alert,
+/// 4 tape), the ZoneMinder 1.36 order; current ZoneMinder's `zmu -s` counts
+/// from 0 = Unknown, but the app is the only client of this route. zmNinjaNg
+/// polls it for its Live Activity page and the alarm ring. Forcing an alarm on or off has no equivalent
 /// here (events come from motion and object detection), so `on`/`off` get
 /// ZoneMinder's error shape and the app reports the failure.
 async fn monitor_alarm(State(app): State<App>, Path(rest): Path<String>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
@@ -341,6 +344,7 @@ async fn monitor_post(State(app): State<App>, Path(id): Path<String>, user: Opti
     let cam = app.db.camera(id).map_err(e500)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid monitor"))?;
     let mut enabled: Option<bool> = None;
     let mut refused = Vec::new();
+    let mut idle = Vec::new();
     let mut want = |v: bool, field: &str, refused: &mut Vec<String>| match enabled {
         Some(prev) if prev != v => refused.push(format!("{field} contradicts another field")),
         _ => enabled = Some(v),
@@ -356,9 +360,14 @@ async fn monitor_post(State(app): State<App>, Path(id): Path<String>, user: Opti
             "Function" if v.eq_ignore_ascii_case("Mocord") => want(true, field, &mut refused),
             // what an enabled camera does anyway
             "Analysing" | "Recording" | "Decoding" if v.eq_ignore_ascii_case("Always") => {}
+            // what a disabled camera does: checked once the request's on/off is known
+            "Analysing" | "Recording" | "Decoding" if v.eq_ignore_ascii_case("None") => idle.push(format!("{field}={v}")),
             "Name" if v == cam.name => {}
             _ => refused.push(format!("{field}={v}")),
         }
+    }
+    if enabled.unwrap_or(cam.enabled) {
+        refused.extend(idle);
     }
     if !refused.is_empty() {
         refused.sort();
@@ -1302,7 +1311,14 @@ async fn es_session(app: App, mut socket: axum::extract::ws::WebSocket) {
                     Err(_) => return,
                 };
                 let crate::notify::Notification::EventStart(e) = n else { continue };
-                if !crate::api::visible_cameras_pub(&app, &user).contains(&e.camera_id) {
+                // signed in with the password: a changed password or a
+                // deleted account ends the session, as it does for browsers
+                let Some(cur) = app.db.session_user_by_id(user.id).ok().flatten().filter(|u| u.pass_hash == user.pass_hash) else {
+                    info!(user = %user.username, "event-server websocket closed: password changed or user removed");
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                };
+                if !crate::api::visible_cameras_pub(&app, &cur).contains(&e.camera_id) {
                     continue;
                 }
                 let Some(min_secs) = filter.interval(e.camera_id) else { continue };

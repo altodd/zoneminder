@@ -29,6 +29,8 @@ use crate::mp4::{self, FragEntry, TIMESCALE};
 pub const MAX_RANGE_DTS: i64 = 6 * 3600 * TIMESCALE as i64;
 /// Most cameras in one export.
 pub const MAX_CAMERAS: usize = 32;
+/// Exports written at the same time; more get 429 until one finishes.
+pub const MAX_RUNNING: usize = 2;
 /// A hole in the recording longer than this is listed as a gap.
 const GAP_DTS: i64 = TIMESCALE as i64;
 
@@ -40,12 +42,12 @@ fn crc_tables() -> &'static [[u32; 256]; 8] {
     static T: std::sync::OnceLock<[[u32; 256]; 8]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let mut t = [[0u32; 256]; 8];
-        for i in 0..256 {
+        for (i, e) in t[0].iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
                 c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
             }
-            t[0][i] = c;
+            *e = c;
         }
         for i in 0..256 {
             for k in 1..8 {
@@ -452,62 +454,126 @@ fn progressive(params: &mp4::VideoParams, frags: &[(PathBuf, FragEntry)]) -> Res
     Ok((head, runs, size))
 }
 
+/// Consecutive fragments of one camera recorded with the same codec
+/// settings; a change of settings inside the range starts a new one, and
+/// each becomes its own file.
+struct Stretch {
+    entry: i64,
+    frags: Vec<(PathBuf, FragEntry)>,
+    dts_offsets: Vec<i64>,
+    legacy: bool,
+}
+
 /// Plan an export of `cams` (`stream` "main" or "sub") over [start, end).
-/// Reads only segment indexes and fragment headers.
+/// Reads only segment indexes and fragment headers. One file per camera, or
+/// one per stretch of unchanged codec settings ("part 1 of 2", ...).
 pub fn plan(db: &Db, cams: &[Camera], stream: &str, start: i64, end: i64) -> Result<ExportPlan> {
     let mut files = Vec::new();
     let mut missing = Vec::new();
     for cam in cams {
-        let segs = db.segments_in_range_stream(cam.id, stream, start, end)?;
-        let mut frags: Vec<(PathBuf, FragEntry)> = Vec::new();
-        let mut entries: Vec<i64> = Vec::new();
-        let mut legacy = false;
-        for seg in &segs {
+        let mut stretches: Vec<Stretch> = Vec::new();
+        for seg in &db.segments_in_range_stream(cam.id, stream, start, end)? {
             let Some(st) = db.storage(seg.storage_id)? else { continue };
             let path = PathBuf::from(&st.path).join(&seg.path);
-            let before = frags.len();
-            frags.extend(crate::video::overlapping(seg, start, end).map(|f| (path.clone(), f.clone())));
-            if frags.len() > before {
-                legacy |= seg.dts_offset != 0;
-                if !entries.contains(&seg.sample_entry_id) {
-                    entries.push(seg.sample_entry_id);
-                }
+            let frags: Vec<FragEntry> = crate::video::overlapping(seg, start, end).cloned().collect();
+            if frags.is_empty() {
+                continue;
+            }
+            if stretches.last().is_none_or(|s| s.entry != seg.sample_entry_id) {
+                stretches.push(Stretch { entry: seg.sample_entry_id, frags: Vec::new(), dts_offsets: Vec::new(), legacy: false });
+            }
+            let s = stretches.last_mut().unwrap();
+            s.legacy |= seg.dts_offset != 0;
+            for f in frags {
+                s.frags.push((path.clone(), f));
+                s.dts_offsets.push(seg.dts_offset);
             }
         }
-        if frags.is_empty() {
+        if stretches.is_empty() {
             missing.push(Missing { camera_id: cam.id, camera: cam.name.clone(), reason: "no recording in this range".into() });
             continue;
         }
-        let Some(se) = db.sample_entry(entries[0])? else {
-            missing.push(Missing { camera_id: cam.id, camera: cam.name.clone(), reason: "codec settings missing from the index".into() });
-            continue;
-        };
-        let params = se.video_params();
-        let first_dts = frags[0].1.dts;
-        let end_dts = frags.last().map(|(_, f)| f.dts + f.duration as i64).unwrap_or(first_dts);
-        let frames: u64 = frags.iter().map(|(_, f)| f.samples as u64).sum();
-        let gaps = gaps_of(&frags);
-        let (a, b) = (local(first_dts), local(end_dts));
-        let name = format!("{} {}-{}{}.mp4", safe_name(&cam.name), a.format("%Y-%m-%d %H%M%S"), b.format("%H%M%S"), if stream == "sub" { " sub" } else { "" });
-        let simple = entries.len() == 1 && !legacy && params.audio.is_none();
-        let (format, size, body) = match simple.then(|| progressive(&params, &frags)) {
-            Some(Ok((head, runs, size))) => ("mp4", Some(size), Body::Progressive { head, runs }),
-            other => {
-                if let Some(Err(e)) = other {
-                    tracing::warn!(camera = cam.id, "export: progressive MP4 not possible ({e:#}); exporting fragmented MP4");
-                }
-                let mut p = crate::video::plan_range_stream(db, cam.id, stream, start, end)?;
-                p.tfdt_shift = -p.first_dts.unwrap_or(start);
-                let size = p.exact_len.then_some(p.bytes);
-                ("fragmented mp4", size, Body::Fragmented(p))
-            }
-        };
-        files.push(FilePlan {
-            name, camera_id: cam.id, camera: cam.name.clone(), stream: stream.to_string(), codec: params.rfc6381.clone(),
-            width: params.width, height: params.height, format, size, frames, first_dts, end_dts, gaps, body,
-        });
+        let parts = stretches.len();
+        for (i, s) in stretches.into_iter().enumerate() {
+            let Some(se) = db.sample_entry(s.entry)? else {
+                let (a, b) = (s.frags[0].1.dts, s.frags.last().map(|(_, f)| f.dts + f.duration as i64).unwrap_or_default());
+                let reason = format!("codec settings missing from the index for {} to {}", iso_local(a), iso_local(b));
+                missing.push(Missing { camera_id: cam.id, camera: cam.name.clone(), reason });
+                continue;
+            };
+            files.push(file_plan(cam, stream, &se.video_params(), s, (parts > 1).then_some((i + 1, parts))));
+        }
     }
+    unique_names(&mut files);
     Ok(ExportPlan { start_dts: start, end_dts: end, stream: stream.to_string(), files, missing })
+}
+
+fn file_plan(cam: &Camera, stream: &str, params: &mp4::VideoParams, s: Stretch, part: Option<(usize, usize)>) -> FilePlan {
+    let first_dts = s.frags[0].1.dts;
+    let end_dts = s.frags.last().map(|(_, f)| f.dts + f.duration as i64).unwrap_or(first_dts);
+    let frames: u64 = s.frags.iter().map(|(_, f)| f.samples as u64).sum();
+    let gaps = gaps_of(&s.frags);
+    let (a, b) = (local(first_dts), local(end_dts));
+    let name = format!(
+        "{} {}-{}{}{}.mp4",
+        safe_name(&cam.name),
+        a.format("%Y-%m-%d %H%M%S"),
+        b.format("%H%M%S"),
+        if stream == "sub" { " sub" } else { "" },
+        part.map(|(i, n)| format!(" part {i} of {n}")).unwrap_or_default()
+    );
+    let simple = !s.legacy && params.audio.is_none();
+    let (format, size, body) = match simple.then(|| progressive(params, &s.frags)) {
+        Some(Ok((head, runs, size))) => ("mp4", Some(size), Body::Progressive { head, runs }),
+        other => {
+            if let Some(Err(e)) = other {
+                tracing::warn!(camera = cam.id, "export: progressive MP4 not possible ({e:#}); exporting fragmented MP4");
+            }
+            let p = fragmented(params, &s);
+            ("fragmented mp4", p.exact_len.then_some(p.bytes), Body::Fragmented(p))
+        }
+    };
+    FilePlan {
+        name, camera_id: cam.id, camera: cam.name.clone(), stream: stream.to_string(), codec: params.rfc6381.clone(),
+        width: params.width, height: params.height, format, size, frames, first_dts, end_dts, gaps, body,
+    }
+}
+
+/// Fragmented MP4 of one stretch (legacy fragments, or audio): its one init
+/// segment and the fragments as recorded, the timeline shifted to start at 0.
+fn fragmented(params: &mp4::VideoParams, s: &Stretch) -> crate::video::RangePlan {
+    use crate::video::RangeItem;
+    let init = mp4::init_segment(params);
+    let audio_rate = params.audio.as_ref().map(|a| a.sample_rate);
+    let mut bytes = init.len() as u64;
+    let mut items = vec![RangeItem::Init(init)];
+    for ((path, f), &dts_offset) in s.frags.iter().zip(&s.dts_offsets) {
+        bytes += f.len as u64;
+        items.push(RangeItem::Frag { path: path.clone(), offset: f.offset, len: f.len, dts: f.dts, duration: f.duration, dts_offset, audio_rate });
+    }
+    let first = s.frags[0].1.dts;
+    let last = s.frags.last().map(|(_, f)| f.dts + f.duration as i64);
+    crate::video::RangePlan { items, bytes, exact_len: !s.legacy, tfdt_shift: -first, first_dts: Some(first), last_end_dts: last, mime: Some(params.mime()) }
+}
+
+/// Make file names unique within the archive, ignoring case (Windows and
+/// macOS unpack "Back/Yard" and "back_yard" to the same file): a later
+/// duplicate gets " (camera N)", then a counter.
+fn unique_names(files: &mut [FilePlan]) {
+    let mut seen = std::collections::HashSet::new();
+    for f in files.iter_mut() {
+        if seen.insert(f.name.to_lowercase()) {
+            continue;
+        }
+        let stem = f.name.strip_suffix(".mp4").unwrap_or(&f.name).to_string();
+        let mut name = format!("{stem} (camera {}).mp4", f.camera_id);
+        let mut k = 2;
+        while !seen.insert(name.to_lowercase()) {
+            name = format!("{stem} (camera {} {k}).mp4", f.camera_id);
+            k += 1;
+        }
+        f.name = name;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -119,6 +119,12 @@ async fn legacy_long_lived_sessions_become_api_tokens() {
     w.fx.db.create_session(w.admin_id, &legacy, 10 * 365 * 86400).unwrap();
     let short = zmng::api::new_token();
     w.fx.db.create_session(w.admin_id, &short, 14 * 86400).unwrap();
+    // a database from an older build: no record of the move, and a session
+    // left behind by a user deleted while foreign keys were not enforced
+    {
+        let conn = rusqlite::Connection::open(&w.fx.cfg.db_path).unwrap();
+        conn.execute_batch("DELETE FROM meta WHERE key='legacy_tokens_moved'; PRAGMA foreign_keys=OFF; INSERT INTO session(token,user_id,created_at,expires_at) VALUES('orphan',999,0,315360000);").unwrap();
+    }
     // reopen = upgrade
     let db = zmng::db::Db::open(&w.fx.cfg.db_path).unwrap();
     let app = zmng::api::App::new(w.fx.cfg.clone(), db, w.fx.hub.clone(), w.fx.bus.clone());
@@ -132,6 +138,14 @@ async fn legacy_long_lived_sessions_become_api_tokens() {
     let conn = rusqlite::Connection::open(&w.fx.cfg.db_path).unwrap();
     let left: i64 = conn.query_row("SELECT COUNT(*) FROM session WHERE token=?1", [&legacy], |r| r.get(0)).unwrap();
     assert_eq!(left, 0, "the session row is replaced, not duplicated");
+    let orphan: i64 = conn.query_row("SELECT COUNT(*) FROM session WHERE token='orphan'", [], |r| r.get(0)).unwrap();
+    assert_eq!(orphan, 0, "dropped, not an error at startup");
+    // once only: a later 10-year session (none are issued now) stays a session
+    let later = zmng::api::new_token();
+    w.fx.db.create_session(w.admin_id, &later, 10 * 365 * 86400).unwrap();
+    drop(zmng::db::Db::open(&w.fx.cfg.db_path).unwrap());
+    let kept: i64 = conn.query_row("SELECT COUNT(*) FROM session WHERE token=?1", [&later], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1);
     assert_eq!(call(&r, "DELETE", &format!("/api/tokens/{}", list[0]["id"]), Some(&w.admin), None).await.status, 200);
     assert_eq!(get(&r, "/api/me", &legacy).await.status, 401);
 }
@@ -165,4 +179,9 @@ async fn users_change_their_own_password() {
     assert_eq!(get(&r, "/api/me", &fresh).await.status, 401);
     assert_eq!(get(&r, "/api/me", &w.admin).await.status, 200);
     assert_eq!(login(&r, "guest", "reset-by-admin").await.status, 200);
+    // an admin's own password goes through the current-password check too
+    let res = call(&r, "PATCH", &format!("/api/users/{}", w.admin_id), Some(&w.admin), Some(json!({"password": "taken-over-pw"}))).await;
+    assert_eq!(res.status, 400, "{}", res.text());
+    assert!(res.text().contains("/api/me/password"), "{}", res.text());
+    assert_eq!(login(&r, "admin", "password123").await.status, 200);
 }

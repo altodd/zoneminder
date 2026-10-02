@@ -312,18 +312,27 @@ fn migrate(c: &Connection) -> Result<()> {
         c.execute_batch("ALTER TABLE camera ADD COLUMN record_sub INTEGER NOT NULL DEFAULT 1; ALTER TABLE camera ADD COLUMN event_retention_days REAL NOT NULL DEFAULT 0;")?;
     }
     // tokens from older builds were 10-year sessions: make them listed,
-    // revocable API tokens (same token, now stored hashed)
-    {
-        let mut st = c.prepare("SELECT token, user_id, created_at, expires_at FROM session WHERE expires_at - created_at > ?1")?;
-        let rows: Vec<(String, i64, i64, i64)> = st.query_map(params![LEGACY_TOKEN_SECS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
-        for (token, user_id, created_at, expires_at) in rows {
-            let day = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at, 0).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
-            c.execute(
-                "INSERT OR IGNORE INTO api_token(user_id,name,token_hash,hint,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![user_id, format!("token from an earlier version ({day})"), token_hash(&token), token_hint(&token), created_at, expires_at],
-            )?;
-            c.execute("DELETE FROM session WHERE token=?1", params![token])?;
-        }
+    // revocable API tokens (same token, now stored hashed). Once, in one
+    // transaction; sessions of users that no longer exist are dropped.
+    let done: bool = c.query_row("SELECT 1 FROM meta WHERE key='legacy_tokens_moved'", [], |_| Ok(())).optional()?.is_some();
+    if !done {
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        let moved = (|| -> Result<()> {
+            let mut st = c.prepare("SELECT s.token, s.user_id, s.created_at, s.expires_at FROM session s JOIN user u ON u.id = s.user_id WHERE s.expires_at - s.created_at > ?1")?;
+            let rows: Vec<(String, i64, i64, i64)> = st.query_map(params![LEGACY_TOKEN_SECS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
+            for (token, user_id, created_at, expires_at) in rows {
+                let day = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at, 0).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
+                c.execute(
+                    "INSERT OR IGNORE INTO api_token(user_id,name,token_hash,hint,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![user_id, format!("token from an earlier version ({day})"), token_hash(&token), token_hint(&token), created_at, expires_at],
+                )?;
+            }
+            c.execute("DELETE FROM session WHERE expires_at - created_at > ?1 OR user_id NOT IN (SELECT id FROM user)", params![LEGACY_TOKEN_SECS])?;
+            c.execute("INSERT INTO meta(key,value) VALUES('legacy_tokens_moved', '1')", [])?;
+            Ok(())
+        })();
+        c.execute_batch(if moved.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+        moved?;
     }
     Ok(())
 }

@@ -1783,7 +1783,7 @@ function editUser(u, cams, users) {
     e.preventDefault();
     const patch = {};
     if (name.value.trim() !== u.username) patch.username = name.value.trim();
-    if (pw.value) patch.password = pw.value;
+    if (!isMe && pw.value) patch.password = pw.value;
     if (!isMe && role.value !== u.role) patch.role = role.value;
     if (role.value !== 'admin') {
       patch.groups = gBoxes.filter((b) => $('input', b).checked).map((b) => $('input', b).value);
@@ -1798,7 +1798,10 @@ function editUser(u, cams, users) {
   };
   const modal = h('div', { class: 'modal' }, h('form', { class: 'card wide-modal', onsubmit: save },
     h('div', { class: 'row' }, h('h2', {}, `User ${u.username}`), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'ghost small', onclick: () => close() }, '✕')),
-    h('div', { class: 'fgrid' }, h('label', {}, 'Username', name), h('label', {}, 'New password (8+)', pw), h('label', {}, 'Role', role)),
+    h('div', { class: 'fgrid' }, h('label', {}, 'Username', name),
+      // your own password needs the current one: the Account dialog asks for it
+      isMe ? h('label', {}, 'Password', h('button', { type: 'button', class: 'ghost', onclick: () => { close(); showAccount(); } }, 'Change in Account…')) : h('label', {}, 'New password (8+)', pw),
+      h('label', {}, 'Role', role)),
     h('p', { class: 'muted small' }, 'Renaming keeps this user\'s sign-ins and API tokens working; the new name is needed at the next sign-in.'),
     accessBox, errEl,
     h('div', { class: 'row sticky-actions' }, h('button', {}, 'Save'), h('button', { type: 'button', class: 'ghost', onclick: () => close() }, 'Cancel'))));

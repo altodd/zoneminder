@@ -56,6 +56,8 @@ pub struct App {
     pub classify_running: Arc<std::sync::atomic::AtomicBool>,
     /// detection dry runs (zone tuning against recorded video)
     pub dryruns: crate::dryrun::Jobs,
+    /// exports being written: each reads hours of video from disk
+    pub exports: Arc<tokio::sync::Semaphore>,
 }
 
 /// (camera, main stream, width)
@@ -83,6 +85,11 @@ const COOKIE: &str = "zmng_session";
 
 #[derive(Clone)]
 pub struct AuthUser(pub User);
+
+/// The token a request was authenticated with, for streams that stay open
+/// and re-check it (a revoked token or ended session stops them).
+#[derive(Clone)]
+pub struct AuthToken(pub String);
 
 pub fn hash_password(pw: &str) -> Result<String> {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
@@ -218,8 +225,9 @@ async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> 
     let public = path == "/api/login" || path == "/api/setup" || path == "/api/health"
         || path == "/zm/api/host/getVersion.json" || path == "/zm/api/host/login.json" || path == "/zm/ws"
         || !(path.starts_with("/api/") || path.starts_with("/zm/"));
-    let user = match token_from(req.headers()).or_else(|| token_from_query(req.uri())) {
-        Some(t) => app.db.auth_user(&t).ok().flatten(),
+    let token = token_from(req.headers()).or_else(|| token_from_query(req.uri()));
+    let user = match &token {
+        Some(t) => app.db.auth_user(t).ok().flatten(),
         None => None,
     };
     let user = match user {
@@ -239,6 +247,9 @@ async fn auth_mw(State(app): State<App>, mut req: Request<Body>, next: Next) -> 
             (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"create the first admin with the setup token first"}))).into_response()
         }
         Some(u) => {
+            if let (Some(t), true) = (token, u.id != 0) {
+                req.extensions_mut().insert(AuthToken(t));
+            }
             req.extensions_mut().insert(AuthUser(u));
             next.run(req).await
         }
@@ -816,14 +827,24 @@ async fn video_range(State(app): State<App>, Path(id): Path<i64>, Query(q): Quer
 /// Live tuning view: what the detector sees in every frame (changed cells,
 /// per-zone change against the zone's thresholds) as server-sent events.
 /// Admins only; the analysis is only built while someone listens.
-async fn analysis_stream(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
-    require_admin(user.as_ref().map(|e| &e.0))?;
+async fn analysis_stream(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, token: Option<axum::Extension<AuthToken>>) -> ApiResult {
+    let me = require_admin(user.as_ref().map(|e| &e.0))?.id;
+    let token = token.map(|t| t.0 .0);
     let h = app.hub.detectors.read().get(&id).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "the detector is not running for this camera"}))).into_response())?;
     let mut rx = h.analysis.subscribe();
     let stream = async_stream_from(move |tx| async move {
+        let mut checked = std::time::Instant::now();
         loop {
             match rx.recv().await {
                 Ok(a) => {
+                    // still an admin with a valid token: checked every few seconds
+                    if checked.elapsed() >= std::time::Duration::from_secs(5) {
+                        let ok = token.as_deref().and_then(|t| app.db.auth_user(t).ok().flatten()).is_some_and(|u| u.id == me && u.role == "admin");
+                        if !ok {
+                            return;
+                        }
+                        checked = std::time::Instant::now();
+                    }
                     let ev = axum::response::sse::Event::default().event("analysis").json_data(&*a).unwrap_or_default();
                     if tx.send(Ok::<_, std::convert::Infallible>(ev)).await.is_err() {
                         return;
@@ -1012,13 +1033,15 @@ async fn export_plan(app: &App, u: &User, q: &ExportQ) -> Result<crate::export::
     let mut ids: Vec<i64> = Vec::new();
     for part in q.cameras.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let id: i64 = part.parse().map_err(|_| bad("cameras: comma separated ids"))?;
-        can_see(app, u, id)?;
         if !ids.contains(&id) {
             ids.push(id);
         }
     }
     if ids.is_empty() || ids.len() > crate::export::MAX_CAMERAS {
         return Err(bad(format!("choose 1 to {} cameras", crate::export::MAX_CAMERAS)));
+    }
+    for &id in &ids {
+        can_see(app, u, id)?;
     }
     let mut cams = Vec::new();
     for id in ids {
@@ -1070,6 +1093,8 @@ async fn export_zip(State(app): State<App>, Query(q): Query<ExportQ>, user: Opti
     if plan.files.is_empty() {
         return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no recording for these cameras in this range"}))).into_response());
     }
+    let busy = || (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")], Json(serde_json::json!({"error": "other exports are being written; try again when one finishes"}))).into_response();
+    let permit = app.exports.clone().try_acquire_owned().map_err(|_| busy())?;
     let info = export_info(u);
     let name = export_zip_name(&plan);
     info!(user = %u.username, cameras = %q.cameras, start = q.start, end = q.end, stream = %plan.stream, files = plan.files.len(), "export");
@@ -1082,6 +1107,8 @@ async fn export_zip(State(app): State<App>, Query(q): Query<ExportQ>, user: Opti
     let total = total.map_err(err500)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     tokio::task::spawn_blocking(move || {
+        // held until the archive is written or the download is abandoned
+        let _permit = permit;
         let mut w = crate::export::ChannelWriter::new(tx.clone());
         let res = crate::export::write(&plan, &info, &mut w, false).and_then(|n| {
             std::io::Write::flush(&mut w)?;
@@ -1614,7 +1641,7 @@ struct UserPatch {
 /// and/or groups). A password reset ends the user's sign-ins; renames and
 /// grant changes leave them, and API tokens stay valid throughout. The last
 /// admin cannot be demoted, and nobody can demote themselves.
-async fn user_update(State(app): State<App>, Path(id): Path<i64>, headers: HeaderMap, user: Option<axum::Extension<AuthUser>>, Json(p): Json<UserPatch>) -> ApiResult {
+async fn user_update(State(app): State<App>, Path(id): Path<i64>, user: Option<axum::Extension<AuthUser>>, Json(p): Json<UserPatch>) -> ApiResult {
     let me = require_admin(user.as_ref().map(|e| &e.0))?.clone();
     let target = app.db.session_user_by_id(id).map_err(err500)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such user").into_response())?;
     // validate everything before changing anything
@@ -1626,6 +1653,10 @@ async fn user_update(State(app): State<App>, Path(id): Path<i64>, headers: Heade
     }
     if p.password.as_ref().is_some_and(|pw| pw.len() < 8) {
         return Err(bad("password >= 8 chars"));
+    }
+    // a stolen session must not be enough to lock the owner out
+    if p.password.is_some() && me.id == id {
+        return Err(bad("change your own password under Account (POST /api/me/password), which asks for the current one"));
     }
     if let Some(r) = &p.role {
         if r != "admin" && r != "viewer" {
@@ -1648,9 +1679,8 @@ async fn user_update(State(app): State<App>, Path(id): Path<i64>, headers: Heade
     }
     if let Some(pw) = &p.password {
         app.db.set_password_hash(id, &hash_password(pw).map_err(err500)?).map_err(err500)?;
-        // a reset ends that user's sign-ins (an admin resetting their own keeps this one)
-        let keep = if me.id == id { token_from(&headers) } else { None };
-        let ended = app.db.delete_user_sessions(id, keep.as_deref()).map_err(err500)?;
+        // a reset ends that user's sign-ins
+        let ended = app.db.delete_user_sessions(id, None).map_err(err500)?;
         info!(user = id, by = %me.username, sessions_ended = ended, "password reset");
     }
     if let Some(r) = &p.role {
@@ -1746,14 +1776,15 @@ async fn stats(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) 
 
 /// Server-sent events: every notification for cameras the user may see.
 /// The UI uses it for toasts and to refresh lists without polling.
-async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthUser>>) -> ApiResult {
+async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthUser>>, token: Option<axum::Extension<AuthToken>>) -> ApiResult {
     use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
     let u = require(user.as_ref().map(|e| &e.0))?;
     let user = u.clone();
+    let token = token.map(|t| t.0 .0);
     let rx = app.bus.subscribe();
     let app2 = app.clone();
     let stream = futures::stream::unfold(rx, move |mut rx| {
-        let (app, user) = (app2.clone(), user.clone());
+        let (app, user, token) = (app2.clone(), user.clone(), token.clone());
         async move {
             loop {
                 match rx.recv().await {
@@ -1762,8 +1793,12 @@ async fn event_stream(State(app): State<App>, user: Option<axum::Extension<AuthU
                             continue;
                         }
                         // re-evaluated per notification (one indexed query) so a
-                        // revoked camera or deleted account stops the feed at once
-                        let user = app.db.session_user_by_id(user.id).ok().flatten()?;
+                        // revoked camera or token, an ended session or a deleted
+                        // account stops the feed at once
+                        let user = match &token {
+                            Some(t) => app.db.auth_user(t).ok().flatten().filter(|u| u.id == user.id)?,
+                            None => app.db.session_user_by_id(user.id).ok().flatten()?,
+                        };
                         let allowed = match n.camera_id() {
                             Some(c) => visible_cameras(&app, &user).contains(&c),
                             None => user.role == "admin",
@@ -1940,6 +1975,7 @@ impl App {
             mjpeg_streams: Default::default(),
             classify_running: Default::default(),
             dryruns: Default::default(),
+            exports: Arc::new(tokio::sync::Semaphore::new(crate::export::MAX_RUNNING)),
         }
     }
 }

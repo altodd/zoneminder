@@ -26,7 +26,7 @@ struct World {
 
 /// front: 4 s segments at T0, T0+4, T0+8, then nothing until T0+20 (a gap),
 /// T0+20..24; main and sub. back: T0..T0+4. mixed: two codec settings in a
-/// row (fragmented-MP4 fallback). empty: nothing recorded.
+/// row (one file each). empty: nothing recorded.
 fn world() -> World {
     let fx = Fixture::new();
     let front = fx.add_camera("Front Door");
@@ -104,15 +104,20 @@ async fn export_zip_has_playable_mp4s_a_manifest_and_checksums() {
     assert_eq!(pre.status, 200, "{}", pre.text());
     let pre = pre.json();
     let files = pre["files"].as_array().unwrap();
-    assert_eq!(files.len(), 3, "{pre}");
+    assert_eq!(files.len(), 4, "{pre}");
     assert_eq!(pre["missing"][0]["camera"], "empty");
     let front = files.iter().find(|f| f["camera_id"] == w.front).unwrap();
     assert_eq!(front["format"], "mp4");
     assert_eq!(front["frames"], 160);
     assert_eq!(front["gaps"].as_array().unwrap().len(), 1, "{front}");
     assert_eq!(front["gaps"][0]["seconds"], 8.0);
-    let mixed = files.iter().find(|f| f["camera_id"] == w.mixed).unwrap();
-    assert_eq!(mixed["format"], "fragmented mp4");
+    // a change of codec settings inside the range: one clean file per stretch
+    let mixed: Vec<_> = files.iter().filter(|f| f["camera_id"] == w.mixed).collect();
+    assert_eq!(mixed.len(), 2, "{pre}");
+    assert!(mixed[0]["name"].as_str().unwrap().ends_with(" part 1 of 2.mp4"), "{}", mixed[0]["name"]);
+    assert!(mixed[1]["name"].as_str().unwrap().ends_with(" part 2 of 2.mp4"), "{}", mixed[1]["name"]);
+    assert_eq!((mixed[0]["width"].as_u64(), mixed[1]["width"].as_u64()), (Some(320), Some(640)));
+    assert!(mixed.iter().all(|f| f["format"] == "mp4" && f["frames"] == 40), "{pre}");
     let total = pre["total_bytes"].as_u64().unwrap();
 
     let res = get(&r, &format!("/api/export.zip?{q}"), &w.admin).await;
@@ -124,9 +129,9 @@ async fn export_zip_has_playable_mp4s_a_manifest_and_checksums() {
 
     let dir = w.fx.dir.path().join("unzipped");
     let names = unzip(&res.body, &dir);
-    assert_eq!(names.len(), 6, "{names:?}");
+    assert_eq!(names.len(), 7, "{names:?}");
     assert!(names.iter().any(|n| n.starts_with("Back_Yard ") && n.ends_with(".mp4")), "{names:?}");
-    assert_eq!(&names[3..], ["manifest.json", "SHA256SUMS", "README.txt"]);
+    assert_eq!(&names[4..], ["manifest.json", "SHA256SUMS", "README.txt"]);
     let x = dir.join("x");
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(x.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["exported_by"], "admin");
@@ -149,8 +154,8 @@ async fn export_zip_has_playable_mp4s_a_manifest_and_checksums() {
             assert_eq!(f["first_frame_utc"], "2027-01-15T08:00:00.000Z");
         }
         if f["camera_id"] == w.mixed {
-            assert_eq!(frames, 80);
-            assert!(boxes(&data).contains(&"moof".to_string()));
+            assert_eq!(frames, 40);
+            assert_eq!(boxes(&data)[..3], ["ftyp", "moov", "mdat"]);
         }
     }
     let manifest_sha = hex::encode(sha2::Sha256::digest(std::fs::read(x.join("manifest.json")).unwrap()));
@@ -181,11 +186,76 @@ async fn export_substream_and_permissions() {
     ] {
         assert_eq!(get(&r, &format!("/api/export.json?{q}"), &w.admin).await.status, 400, "{q}");
     }
+    // too many cameras is refused before any permission check names one
+    let many: Vec<String> = (1000..1040).map(|i| i.to_string()).collect();
+    let res = get(&r, &format!("/api/export.json?cameras={}&start={}&end={}", many.join(","), ms(T0), ms(T0 + 10)), &w.viewer).await;
+    assert_eq!(res.status, 400, "{}", res.text());
+    // every export slot taken: 429 with Retry-After; the preview still answers
+    let app = w.fx.app();
+    let r2 = zmng::api::router(app.clone());
+    let held = app.exports.clone().try_acquire_many_owned(zmng::export::MAX_RUNNING as u32).unwrap();
+    let one = format!("cameras={}&start={}&end={}", w.front, ms(T0), ms(T0 + 4));
+    let res = get(&r2, &format!("/api/export.zip?{one}"), &w.admin).await;
+    assert_eq!(res.status, 429, "{}", res.text());
+    assert_eq!(res.header("retry-after").as_deref(), Some("30"));
+    assert_eq!(get(&r2, &format!("/api/export.json?{one}"), &w.admin).await.status, 200);
+    drop(held);
+    assert_eq!(get(&r2, &format!("/api/export.zip?{one}"), &w.admin).await.status, 200);
+    assert_eq!(app.exports.available_permits(), zmng::export::MAX_RUNNING, "released once written");
     // nothing recorded: 404 for the zip, an empty preview
     let none = format!("cameras={}&start={}&end={}", w.empty, ms(T0), ms(T0 + 10));
     assert_eq!(get(&r, &format!("/api/export.zip?{none}"), &w.admin).await.status, 404);
     assert_eq!(get(&r, &format!("/api/export.json?{none}"), &w.admin).await.json()["files"].as_array().unwrap().len(), 0);
     assert_eq!(call(&r, "GET", &format!("/api/export.zip?{q}"), None, None).await.status, 401);
+}
+
+/// Two cameras whose names differ only in case or in characters a file name
+/// cannot hold still get two files.
+#[tokio::test]
+async fn export_file_names_are_unique() {
+    let fx = Fixture::new();
+    let enc = parse_encoded(&encode_fmp4(4, "libx264", 320, 180));
+    let a = fx.add_camera("Back/Yard");
+    let b = fx.add_camera("back_yard");
+    for cam in [a, b] {
+        fx.write_segment(cam, "main", &enc, dts(T0), |_| 0);
+    }
+    let admin = fx.token_for(fx.add_admin("admin", "password123"));
+    let r = fx.router();
+    let res = get(&r, &format!("/api/export.zip?cameras={a},{b}&start={}&end={}", ms(T0), ms(T0 + 4)), &admin).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    let names = unzip(&res.body, &fx.dir.path().join("u"));
+    assert_eq!(names.len(), 5, "{names:?}");
+    assert!(names[0].starts_with("Back_Yard ") && names[1].starts_with("back_yard "), "{names:?}");
+    assert!(names[1].ends_with(&format!(" (camera {b}).mp4")), "{names:?}");
+}
+
+/// Recordings imported from ZoneMinder (their own timeline from 0) export as
+/// fragmented MP4 rebased to start at 0; the archive has no Content-Length,
+/// as the rewritten fragments' size is only known once written.
+#[tokio::test]
+async fn legacy_recordings_export_as_fragmented_mp4() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("old");
+    let enc = parse_encoded(&encode_fmp4(4, "libx264", 320, 180));
+    fx.write_legacy_segment(cam, "main", &enc, dts(T0));
+    let admin = fx.token_for(fx.add_admin("admin", "password123"));
+    let r = fx.router();
+    let q = format!("cameras={cam}&start={}&end={}", ms(T0), ms(T0 + 4));
+    let pre = get(&r, &format!("/api/export.json?{q}"), &admin).await.json();
+    assert_eq!(pre["files"][0]["format"], "fragmented mp4", "{pre}");
+    assert!(pre["files"][0]["bytes"].is_null(), "{pre}");
+    let res = get(&r, &format!("/api/export.zip?{q}"), &admin).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    assert!(res.header("content-length").is_none());
+    let dir = fx.dir.path().join("legacy");
+    let names = unzip(&res.body, &dir);
+    let data = std::fs::read(dir.join("x").join(&names[0])).unwrap();
+    assert_eq!(boxes(&data)[..2], ["ftyp", "moov"]);
+    assert!(boxes(&data).contains(&"moof".to_string()));
+    let (_, dur, frames) = probe(&dir.join("x").join(&names[0]));
+    assert_eq!(frames, 40);
+    assert!((dur - 4.0).abs() < 0.3, "duration {dur}");
 }
 
 /// HEVC (the production cameras' codec) exports as a progressive MP4 that

@@ -106,6 +106,11 @@ async fn monitor_settings_apply_what_maps_and_refuse_the_rest() {
     assert!(enabled());
     // values that are already true are fine (the app may send them along)
     assert_eq!(form(&r, &url(&w.admin), "Monitor%5BAnalysing%5D=Always&Monitor%5BRecording%5D=Always").await.status, 200);
+    // and None for each part when the camera is switched off with it
+    assert_eq!(form(&r, &url(&w.admin), "Monitor%5BCapturing%5D=None&Monitor%5BAnalysing%5D=None&Monitor%5BRecording%5D=None").await.status, 200);
+    assert!(!enabled());
+    assert_eq!(form(&r, &url(&w.admin), "Monitor%5BEnabled%5D=1").await.status, 200);
+    assert!(enabled());
     // no equivalent: refused, nothing changed
     for body in ["Monitor%5BFunction%5D=Modect", "Monitor%5BRecording%5D=OnMotion", "Monitor%5BAnalysing%5D=None", "Monitor%5BMaxFPS%5D=5", "Monitor%5BEnabled%5D=0&Monitor%5BPath%5D=rtsp%3A%2F%2Fx"] {
         let res = form(&r, &url(&w.admin), body).await;
