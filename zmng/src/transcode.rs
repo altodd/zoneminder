@@ -37,6 +37,10 @@ pub struct TranscodeConfig {
     pub max_sessions: usize,
     /// Extra ffmpeg output arguments (e.g. `["-rc", "vbr"]`).
     pub extra_args: Vec<String>,
+    /// Hardware decoder for the input (`cuda`, `vaapi`, `qsv`); decoded
+    /// frames come back to system memory for the scale filter. Unset =
+    /// software decode.
+    pub hwaccel: Option<String>,
 }
 
 impl Default for TranscodeConfig {
@@ -49,6 +53,7 @@ impl Default for TranscodeConfig {
             gop_secs: 1.0,
             max_sessions: 3,
             extra_args: Vec::new(),
+            hwaccel: None,
         }
     }
 }
@@ -72,11 +77,16 @@ pub fn ffmpeg_args(cfg: &TranscodeConfig, fps_hint: f64) -> Vec<String> {
     // short piped input (a 2 s range encodes to nothing); low_delay alone
     // keeps live latency at one fragment
     let mut a: Vec<String> = ["-nostdin", "-loglevel", "error", "-nostats", "-flags", "low_delay",
-        "-probesize", "1000000", "-analyzeduration", "0", "-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
+        "-probesize", "1000000", "-analyzeduration", "0"]
+        .iter().map(|s| s.to_string()).collect();
+    // decode on the GPU (NVDEC) when configured; an input option, so before -i
+    if let Some(hw) = cfg.hwaccel.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        a.extend(["-hwaccel".into(), hw.to_string()]);
+    }
+    a.extend(["-f", "mp4", "-i", "pipe:0", "-an", "-sn", "-dn",
         // keep the camera's variable frame rate: without it ffmpeg pads an
         // 18 fps VFR source to 30 fps CFR (1829 frames out for 1098 in)
-        "-fps_mode", "passthrough"]
-        .iter().map(|s| s.to_string()).collect();
+        "-fps_mode", "passthrough"].iter().map(|s| s.to_string()));
     if cfg.max_height > 0 {
         a.extend(["-vf".into(), format!("scale=-2:'min({},ih)'", cfg.max_height)]);
     }
@@ -252,6 +262,10 @@ mod tests {
         assert!(s.contains("-c:v h264_nvenc -preset p4 -b:v"));
         assert!(!s.contains("zerolatency") && !s.contains("scale="));
         assert!(s.contains("-rc vbr -f mp4"));
+        assert!(!s.contains("-hwaccel"));
+        let gpu = TranscodeConfig { hwaccel: Some("cuda".into()), ..Default::default() };
+        let s = ffmpeg_args(&gpu, 20.0).join(" ");
+        assert!(s.contains("-analyzeduration 0 -hwaccel cuda -f mp4 -i pipe:0"));
     }
 
     #[tokio::test]

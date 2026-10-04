@@ -37,6 +37,10 @@ pub struct ImportOpts<'a> {
     pub thumb_width: u32,
     pub dry_run: bool,
     pub skip_thumbs: bool,
+    /// Sections with fewer alarm frames become `zm` markers (continuous
+    /// footage, not pinned by event retention) instead of motion events.
+    /// ZoneMinder's own "low motion" filters usually use 2.
+    pub motion_min_alarm_frames: i64,
 }
 
 #[derive(Default, Debug)]
@@ -150,7 +154,7 @@ fn import_one(
     // the ZoneMinder event becomes an event row (motion if it had alarm frames, else a marker)
     let end_dts = if end_s > start_s { end_s * TIMESCALE as i64 } else { frags.last().map(|f| f.dts + f.duration as i64).unwrap_or(start_dts) };
     let score = ((max_score.max(0) as f64).ln_1p() * 40.0).clamp(1.0, 255.0) as u8;
-    let kind = if alarm_frames > 0 { "motion" } else { "zm" };
+    let kind = if alarm_frames >= opts.motion_min_alarm_frames.max(1) { "motion" } else { "zm" };
     let mut thumb_rel: Option<String> = None;
     if !opts.skip_thumbs {
         let snap = abs.parent().unwrap().join("snapshot.jpg");

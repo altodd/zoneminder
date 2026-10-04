@@ -20,7 +20,7 @@ pub fn fs_free_bytes(path: &Path) -> Result<u64> {
     Ok(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-fn remove_segment_file(db: &Db, storage_path: &str, rel: &str, id: i64) -> Result<()> {
+fn remove_segment_file(db: &Db, storage_path: &str, rel: &str, id: i64, zm_event: Option<i64>) -> Result<()> {
     let abs = Path::new(storage_path).join(rel);
     match std::fs::remove_file(&abs) {
         Ok(()) => {}
@@ -32,8 +32,22 @@ fn remove_segment_file(db: &Db, storage_path: &str, rel: &str, id: i64) -> Resul
         }
     }
     db.delete_segment(id)?;
-    // prune empty day directory
     if let Some(dir) = abs.parent() {
+        // an imported ZoneMinder event owns its directory
+        // (<monitor>/<date>/<event id>/): the snapshot and analysis files go
+        // with the video, then the day directory if it is empty
+        if let Some(eid) = zm_event {
+            if dir.file_name().map(|n| n.to_string_lossy() == eid.to_string()).unwrap_or(false) {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    warn!(path = %dir.display(), "removing ZoneMinder event directory: {e}");
+                }
+                if let Some(day) = dir.parent() {
+                    let _ = std::fs::remove_dir(day);
+                }
+                return Ok(());
+            }
+        }
+        // prune empty day directory
         let _ = std::fs::remove_dir(dir); // fails harmlessly if not empty
     }
     Ok(())
@@ -77,7 +91,7 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
                     continue; // footage of an event worth keeping
                 }
                 if let Some(st) = storages.iter().find(|x| x.id == s.storage_id && !x.read_only && storage_mounted(x)) {
-                    if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
+                    if remove_segment_file(db, &st.path, &s.path, s.id, s.zm_event_id).is_ok() {
                         deleted += 1;
                         progressed = true;
                     }
@@ -130,7 +144,7 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
                 if !hard_floor && db.segment_pinned(&s, *event_cutoffs.get(&s.camera_id).unwrap_or(&now))? {
                     continue;
                 }
-                if remove_segment_file(db, &st.path, &s.path, s.id).is_ok() {
+                if remove_segment_file(db, &st.path, &s.path, s.id, s.zm_event_id).is_ok() {
                     used -= s.bytes;
                     deleted += 1;
                     unlinked += 1;
@@ -143,10 +157,13 @@ pub fn run_once(db: &Db, thumb_dir: &Path) -> Result<()> {
         }
     }
 
-    // 3. events whose footage is entirely gone (keep archived ones)
+    // 3. events whose footage is entirely gone (keep archived ones): anything
+    //    older than the oldest segment, plus gaps age retention opened between
+    //    pinned segments (only possible past the camera's retention cutoff)
     for cam in &cameras {
         let earliest = db.earliest_segment_dts(Some(cam.id))?.unwrap_or(now);
-        let orphans = db.orphan_events(cam.id, earliest, 500)?;
+        let age_cutoff = now - (cam.retention_days * 86_400.0 * TIMESCALE as f64) as i64;
+        let orphans = db.orphan_events(cam.id, earliest.max(age_cutoff), 500)?;
         for e in orphans {
             if let Some(t) = &e.thumb_path {
                 let _ = std::fs::remove_file(thumb_dir.join(t));
@@ -174,7 +191,7 @@ pub fn delete_camera_files(db: &Db, thumb_dir: &Path, camera_id: i64) -> Result<
         for s in segs {
             if let Some(st) = storages.iter().find(|x| x.id == s.storage_id) {
                 // a read-only storage keeps its files; only the index row goes
-                let ok = if st.read_only { db.delete_segment(s.id).is_ok() } else { remove_segment_file(db, &st.path, &s.path, s.id).is_ok() };
+                let ok = if st.read_only { db.delete_segment(s.id).is_ok() } else { remove_segment_file(db, &st.path, &s.path, s.id, s.zm_event_id).is_ok() };
                 if ok {
                     n += 1;
                     progressed = true;

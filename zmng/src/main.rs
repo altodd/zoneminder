@@ -103,6 +103,10 @@ enum Cmd {
         dry_run: bool,
         #[arg(long)]
         skip_thumbs: bool,
+        /// Alarm frames needed for a section to import as a motion event
+        /// (fewer = a `zm` marker that event retention does not pin)
+        #[arg(long, default_value_t = 1)]
+        motion_min_alarm_frames: i64,
     },
 }
 
@@ -223,7 +227,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::ImportZm { tsv, storage, camera_map, thumb_width, dry_run, skip_thumbs } => {
+        Cmd::ImportZm { tsv, storage, camera_map, thumb_width, dry_run, skip_thumbs, motion_min_alarm_frames } => {
             let db = db::Db::open(&cfg.db_path)?;
             std::fs::create_dir_all(&cfg.thumb_dir)?;
             let st = import::import_zm(
@@ -236,6 +240,7 @@ fn main() -> Result<()> {
                     thumb_width,
                     dry_run,
                     skip_thumbs,
+                    motion_min_alarm_frames,
                 },
             )?;
             println!("{st:#?}");

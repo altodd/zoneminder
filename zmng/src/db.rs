@@ -701,7 +701,7 @@ impl Db {
     pub fn segment_pinned(&self, seg: &Segment, event_cutoff: i64) -> Result<bool> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT 1 FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 AND (archived=1 OR end_dts>?4) LIMIT 1",
+                "SELECT 1 FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 AND (archived=1 OR (end_dts>?4 AND kind<>'zm')) LIMIT 1",
                 params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff],
                 |_| Ok(()),
             )
@@ -1329,12 +1329,16 @@ impl Db {
         })
     }
 
-    /// Events whose recording is entirely gone (older than the camera's
-    /// oldest segment) and that are not archived.
+    /// Events that ended before `before_dts`, are not archived and have no
+    /// main-stream footage left (no segment overlaps them): age retention can
+    /// remove an unpinned stretch while older, pinned segments remain, so
+    /// "older than the oldest segment" is not enough.
     pub fn orphan_events(&self, camera_id: i64, before_dts: i64, limit: usize) -> Result<Vec<Event>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT * FROM event WHERE camera_id=?1 AND archived=0 AND end_dts IS NOT NULL AND end_dts<?2 ORDER BY start_dts LIMIT ?3",
+                "SELECT * FROM event e WHERE camera_id=?1 AND archived=0 AND end_dts IS NOT NULL AND end_dts<?2 \
+                 AND NOT EXISTS (SELECT 1 FROM segment s WHERE s.camera_id=e.camera_id AND s.stream='main' AND s.end_dts>e.start_dts AND s.start_dts<e.end_dts) \
+                 ORDER BY start_dts LIMIT ?3",
             )?;
             let rows = st.query_map(params![camera_id, before_dts, limit as i64], Self::row_event)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

@@ -110,23 +110,36 @@ impl Fixture {
     /// samples, exactly as the recorder does (init + one fragment per GOP),
     /// and index it. `motion(frag_index)` supplies per-fragment scores.
     pub fn write_segment(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8) -> i64 {
-        self.write_segment_ext(cam, stream, enc, start_dts, motion, false)
+        self.write_segment_ext(cam, stream, enc, start_dts, motion, false, None)
     }
 
     /// A segment as imported from ZoneMinder: the file's own timeline starts
     /// at 0 and the index carries the offset to wall-clock time.
     pub fn write_legacy_segment(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64) -> i64 {
-        self.write_segment_ext(cam, stream, enc, start_dts, |_| 0, true)
+        self.write_segment_ext(cam, stream, enc, start_dts, |_| 0, true, None)
     }
 
-    fn write_segment_ext(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8, legacy: bool) -> i64 {
+    /// A segment exactly as `import-zm` indexes it: the ZoneMinder layout
+    /// `<monitor>/<date>/<event id>/<video>` under the storage root, next to
+    /// the event's `snapshot.jpg`, with `zm_event_id` set.
+    pub fn write_zm_event_segment(&self, cam: i64, enc: &Encoded, start_dts: i64, zm_event_id: i64) -> (i64, PathBuf) {
+        let secs = start_dts / TIMESCALE as i64;
+        let day = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap().format("%Y-%m-%d");
+        let rel = format!("{cam}/{day}/{zm_event_id}/{zm_event_id}-video.mp4");
+        let dir = self.storage_path().join(&rel).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot.jpg"), b"jpeg").unwrap();
+        (self.write_segment_ext(cam, "main", enc, start_dts, |_| 0, true, Some((rel, zm_event_id))), dir)
+    }
+
+    fn write_segment_ext(&self, cam: i64, stream: &str, enc: &Encoded, start_dts: i64, motion: impl Fn(usize) -> u8, legacy: bool, zm: Option<(String, i64)>) -> i64 {
         let offset = if legacy { start_dts } else { 0 };
         let init = mp4::init_segment(&enc.params);
         let se = self.db.intern_sample_entry(enc.params.codec, &enc.params.rfc6381, enc.params.width, enc.params.height, &enc.params.sample_entry, enc.params.audio.as_ref()).unwrap();
         let secs = start_dts / TIMESCALE as i64;
         let t = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap();
         let prefix = if stream == "sub" { format!("{cam}/sub") } else { cam.to_string() };
-        let rel = format!("{}/{}/{}.mp4", prefix, t.format("%Y%m%d"), t.format("%H%M%S"));
+        let rel = zm.as_ref().map(|(r, _)| r.clone()).unwrap_or_else(|| format!("{}/{}/{}.mp4", prefix, t.format("%Y%m%d"), t.format("%H%M%S")));
         let abs = self.storage_path().join(&rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         let mut file = init.to_vec();
@@ -156,7 +169,7 @@ impl Fixture {
         }
         flush(&mut gop, &mut file, &mut frags);
         std::fs::write(&abs, &file).unwrap();
-        self.db.insert_segment_ext(cam, self.storage_id, se, &rel, file.len() as i64, init.len() as u32, &frags, offset, None, stream).unwrap()
+        self.db.insert_segment_ext(cam, self.storage_id, se, &rel, file.len() as i64, init.len() as u32, &frags, offset, zm.map(|(_, id)| id), stream).unwrap()
     }
 
     pub fn add_admin(&self, name: &str, pw: &str) -> i64 {

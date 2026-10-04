@@ -35,6 +35,35 @@ fn age_retention_deletes_old_segments_but_keeps_event_footage() {
 }
 
 #[test]
+fn imported_zoneminder_event_directory_goes_with_its_video_and_zm_markers_do_not_pin() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 1, "event_retention_days": 30}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let old = now_secs() - 10 * 86_400;
+    // two ZoneMinder sections past retention: one with motion (pinned for
+    // event_retention_days), one continuous (`zm` marker, not pinned)
+    let (motion_seg, motion_dir) = fx.write_zm_event_segment(cam, &enc, dts(old), 5531234);
+    let quiet = old + 86_400; // the next day, so its day directory empties
+    let (quiet_seg, quiet_dir) = fx.write_zm_event_segment(cam, &enc, dts(quiet), 5531235);
+    let ev = fx.db.insert_event(cam, dts(old), "motion").unwrap();
+    fx.db.close_event(ev, dts(old) + 90_000, None, "{}").unwrap();
+    let marker = fx.db.insert_event(cam, dts(quiet), "zm").unwrap();
+    fx.db.close_event(marker, dts(quiet) + 90_000, None, "{}").unwrap();
+    assert!(quiet_dir.join("snapshot.jpg").is_file());
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(motion_seg).unwrap().is_some(), "motion section pinned by its event");
+    assert!(motion_dir.is_dir());
+    assert!(fx.db.segment(quiet_seg).unwrap().is_none(), "zm marker does not pin");
+    assert!(!quiet_dir.exists(), "the whole ZoneMinder event directory (snapshot included) is removed");
+    assert!(!quiet_dir.parent().unwrap().exists(), "and the empty day directory");
+    assert!(motion_dir.parent().unwrap().is_dir(), "other days untouched");
+    // the marker event whose footage is gone goes too
+    assert!(fx.db.event(marker).unwrap().is_none());
+    assert!(fx.db.event(ev).unwrap().is_some());
+}
+
+#[test]
 fn archived_events_survive_when_footage_is_gone() {
     let fx = Fixture::new();
     let cam = fx.add_camera("c");
