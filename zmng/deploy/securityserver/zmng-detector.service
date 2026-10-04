@@ -1,0 +1,31 @@
+[Unit]
+Description=zmng object-detection server (ONNX Runtime CUDA, YOLO11s on the Quadro P2200)
+After=network-online.target
+
+[Service]
+User=zmng
+Group=zmng
+WorkingDirectory=/opt/zmng-detector-gpu
+# onnxruntime-gpu 1.25.1 (CUDA 12 build: CUDA 13 dropped Pascal) with the CUDA 12 runtime,
+# cuDNN 9 and cuBLAS from the pip "nvidia-*-cu12" packages inside the venv
+Environment=LD_LIBRARY_PATH=/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/curand/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/opt/zmng-detector-gpu/lib/python3.12/site-packages/nvidia/nvjitlink/lib
+ExecStart=/opt/zmng-detector-gpu/bin/python3 /opt/zmng-detector-gpu/server.py --model /opt/zmng-detector-gpu/yolo11s.onnx --host 127.0.0.1 --port 32168 --threads 2
+Restart=always
+RestartSec=5
+Environment=OMP_NUM_THREADS=2
+Nice=5
+MemoryMax=6G
+TasksMax=256
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# CUDA needs /dev/nvidia*
+PrivateDevices=false
+ReadOnlyPaths=/opt/zmng-detector-gpu
+# it only ever talks to zmng on this host (no model downloads, no telemetry)
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

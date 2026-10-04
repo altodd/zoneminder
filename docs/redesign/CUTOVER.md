@@ -48,9 +48,9 @@ The design keeps the most recent footage of every camera on the RAID and moves w
 
 Create the directories next to ZoneMinder's data (do **not** point zmng at ZoneMinder's event directories as recording targets). Storage ids are assigned in order, and `--archive-to` must name a storage that already exists, so the archive volume is added **first**:
 ```
-sudo install -d -o zmng -g zmng /var/cache/zoneminder/zmng /media/zmoverflow/zmng
+sudo install -d -o zmng -g zmng /var/cache/zoneminder/events/zmng /media/zmoverflow/zmng          # the RAID is mounted at …/events; /var/cache/zoneminder itself is the root LV
 sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/zmng --reserve-gb 300                                                   # storage 1 (USB, the archive)
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/zmng --reserve-gb 150 --archive-to 1 --archive-after-days 3   # storage 2 (RAID, the primary)
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/events/zmng --reserve-gb 150 --archive-to 1 --archive-after-days 3   # storage 2 (RAID, the primary)
 ```
 `add-storage` writes a `.zmng-storage` marker at each root; zmng treats a root without it as an unmounted volume and refuses to record, delete or move there (Status and `zmng doctor` say so). The unit file's `RequiresMountsFor=` covers both mounts, so a boot with the USB disk missing leaves zmng stopped rather than recording onto the root filesystem. Pull the USB disk once during the parallel week (§6) and watch Status.
 
@@ -59,7 +59,7 @@ While ZoneMinder still owns most of both disks, give zmng a **byte cap** on each
 
 Add the cameras (main + sub URLs; the names become the UI names, the `tags` field the groups):
 ```
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-camera "Front Door" "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/101" --sub-url "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/102"
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-camera "Front Door" "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/101" --sub-url "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/102" --storage 2   # --storage: the CLI defaults to storage 1, the archive
 ```
 or paste them in `Admin → Cameras`. Then `systemctl enable --now zmng`, open the UI, create the first admin with the setup token from `journalctl -u zmng`, set retention/groups/zones per camera, add the staff users (viewers get an explicit camera list; it fails closed).
 
@@ -73,11 +73,11 @@ mysql -B -N zm -e "… AND StorageId=2 …" > /var/lib/zmng/events-storage2.tsv
 Register ZoneMinder's event roots as **read-only legacy storages** (`--read-only`: retention, tiering and doctor never delete, move or write there) and import:
 ```
 sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /var/cache/zoneminder/events --read-only     # storage 3
-sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow/events       --read-only     # storage 4
-sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm /var/lib/zmng/events-storage1.tsv --storage 3 --camera-map 1=1,2=2,…   # ZM MonitorId=zmng camera id
+sudo -u zmng zmng -c /etc/zmng/zmng.toml add-storage /media/zmoverflow              --read-only     # storage 4 (ZoneMinder's USB root IS the mount point)
+sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm /var/lib/zmng/events-storage1.tsv --storage 3 --motion-min-alarm-frames 2 --camera-map 1=1,2=2,…   # ZM MonitorId=zmng camera id; sections under 2 alarm frames become zm markers (ZoneMinder's own low-motion rule)
 sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm /var/lib/zmng/events-storage2.tsv --storage 4 --camera-map …
 ```
-The files are not touched; each event becomes a legacy segment (timestamps shifted when served) plus an event row with its `snapshot.jpg` as thumbnail. The import is idempotent; `--dry-run` first. Old events then play in the timeline, Review and Events views like new ones. The `zmng` user needs read access to ZoneMinder's event directories (`usermod -aG www-data zmng` or an ACL).
+The files are not touched; each event becomes a legacy segment (timestamps shifted when served) plus an event row with its `snapshot.jpg` as thumbnail. The import is idempotent; `--dry-run` first. It reads every `moof` header of every file: fast on the RAID, **1–2 days for 35k events on a single USB disk** — run it in the background (`nohup`, `ionice -c2 -n7`) while zmng records; it needs no stop. Rows without `EndDateTime` (events ZoneMinder never closed) import too, their end taken from the file. See `CUTOVER-RECORD-2026-10-04.md` for the real run. Old events then play in the timeline, Review and Events views like new ones. The `zmng` user needs read access to ZoneMinder's event directories (`usermod -aG www-data zmng` or an ACL).
 
 ## 4. TLS and the network
 

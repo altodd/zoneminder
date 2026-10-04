@@ -1,0 +1,35 @@
+# zmng — the recorder of record on securityserver since 2026-10-04 (cut over from ZoneMinder).
+# Cameras, users, storages and zones live in the database (Admin UI / API), not here.
+db_path    = "/var/lib/zmng/zmng.db"
+listen     = "10.10.100.100:80"            # LAN, WireGuard, site VPN; the CBA guests' tailnet ACL allows tcp 80
+web_dir    = "/usr/local/share/zmng"
+thumb_dir  = "/var/cache/zoneminder/events/zmng-thumbs"   # RAID: event thumbnails + scrub previews (~1.2 GB/day, pruned with retention)
+backup_dir = "/media/zmoverflow/zmng-backups"             # daily VACUUM INTO on the other volume
+segment_secs = 60
+fsync = true
+ffmpeg = "/usr/bin/ffmpeg"
+session_hours = 336
+log = "info,retina=warn"
+secure_cookies = false        # plain HTTP on the LAN; set true if Caddy/TLS is put in front
+alert_after_minutes = 3
+preview_secs = 5
+public_url = "http://10.10.100.100"
+
+# The Quadro P2200 is zmng's: NVDEC decodes the HEVC main stream and NVENC encodes the
+# H.264 fallback for browsers without HEVC (Firefox, older Windows).
+[transcode]
+encoder = "h264_nvenc"
+preset = "p4"
+hwaccel = "cuda"
+max_height = 1080
+bitrate_kbps = 4000
+gop_secs = 1
+max_sessions = 4
+
+# Object detection: zmng-detector (YOLO11s on ONNX Runtime CUDA, 127.0.0.1 only), motion-gated.
+[objects]
+url = "http://127.0.0.1:32168/v1/vision/detection"
+min_confidence = 0.5
+interval_secs = 2.0
+timeout_ms = 3000
+max_concurrent = 4

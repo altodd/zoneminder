@@ -1,0 +1,46 @@
+# zmng (ZoneMinder NG) — the recorder of record on securityserver since 2026-10-04.
+# ZoneMinder (zoneminder.service) is stopped and disabled; its event files are served and
+# retired by zmng as read-only-then-writable legacy storages (see claude-ops runbook §4).
+[Unit]
+Description=zmng (ZoneMinder NG) recorder/API - production, recorder of record
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# never start on bare mount points (a missing volume would be recorded onto the root filesystem)
+RequiresMountsFor=/var/cache/zoneminder/events /media/zmoverflow
+
+[Service]
+User=zmng
+Group=zmng
+# the imported ZoneMinder event trees are owned by www-data (directories group-writable so
+# retention can retire them)
+SupplementaryGroups=www-data
+WorkingDirectory=/var/lib/zmng
+ExecStart=/usr/local/bin/zmng -c /etc/zmng/zmng.toml run
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+# the index holds RTSP credentials
+UMask=0077
+# port 80
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# zmng is this box's main workload: no nice/CPU-weight penalty. The page cache of ~0.7 TB/day
+# of writes is charged to the unit: MemoryHigh starts reclaim early so the recorders never
+# stall on it, MemoryMax leaves ~30 GB of the 125 GB for MySQL, Docker (WireGuard, Pi-hole,
+# church Home Assistant) and the OS.
+MemoryHigh=64G
+MemoryMax=96G
+TasksMax=4096
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zmng /var/cache/zoneminder/events /media/zmoverflow
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+# ffmpeg children use /dev/nvidia* (NVDEC/NVENC)
+PrivateDevices=false
+Environment=RUST_BACKTRACE=1
+# Ubuntu's ffmpeg starts one OpenMP thread per core per process; pin it
+Environment=OMP_NUM_THREADS=1
+
+[Install]
+WantedBy=multi-user.target
