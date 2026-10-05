@@ -61,7 +61,7 @@ Add the cameras (main + sub URLs; the names become the UI names, the `tags` fiel
 ```
 sudo -u zmng zmng -c /etc/zmng/zmng.toml add-camera "Front Door" "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/101" --sub-url "rtsp://user:pass@10.10.0.101:554/Streaming/Channels/102" --storage 2   # --storage: the CLI defaults to storage 1, the archive
 ```
-or paste them in `Admin → Cameras`. Then `systemctl enable --now zmng`, open the UI, create the first admin with the setup token from `journalctl -u zmng`, set retention/groups/zones per camera, add the staff users (viewers get an explicit camera list; it fails closed).
+or paste them in `Admin → Cameras`. Then `systemctl enable --now zmng`, open the UI, create the first admin with the setup token from `journalctl -u zmng`, set retention/groups/zones per camera, create the accounts (viewers get an explicit camera list or groups; it fails closed), then give them their ZoneMinder passwords: `mysql -B zm -e "SELECT * FROM Users" > users.tsv` on the ZoneMinder host and `sudo -u zmng zmng -c /etc/zmng/zmng.toml import-zm-users users.tsv` (`--dry-run` first) — the bcrypt hashes are verified as such and re-hashed with argon2 at each person's first login.
 
 ## 3. Import the existing 14 TB of ZoneMinder events (in place, no re-encode)
 

@@ -30,3 +30,9 @@ while ZoneMinder still ran (camera 13 refused a third main-stream session until 
   1–2 days for 35k events and run it in the background; it is idempotent.
 - The pip `nvidia-cudnn-cu12` that onnxruntime-gpu pulls in by default is too new for Pascal; pin it.
 - A `tar` made on macOS carries `._*` AppleDouble files and the Mac's uid/gid: clean the web dir after extracting.
+
+## Addendum, 21:19 ET — passwords did come over after all
+Hashes cannot be converted (bcrypt → argon2 needs the plaintext), but zmng now verifies ZoneMinder's
+`$2y$` bcrypt hashes at login and re-hashes with argon2 on the first successful login (`336820c4a`).
+`import-zm-users <Users.tsv>` copied the 12 hashes onto the accounts of the same name, so every
+ZoneMinder login works unchanged. CUTOVER.md §2 now says so instead of "add the staff users".
