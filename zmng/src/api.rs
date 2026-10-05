@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::{Db, User};
@@ -187,8 +187,18 @@ pub async fn frame_jpeg_pub(app: &App, cam: i64, dts: i64, width: u32) -> Result
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=5")], jpeg).into_response())
 }
 
+/// A PHP/ZoneMinder bcrypt hash (`$2y$10$…`), as imported by `import-zm-users`.
+pub fn is_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2y$") || hash.starts_with("$2b$") || hash.starts_with("$2a$")
+}
+
 fn verify_password(pw: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    // imported ZoneMinder accounts keep their bcrypt hash until their first
+    // login here, which re-hashes the password with argon2 (see `login`)
+    if is_bcrypt_hash(hash) {
+        return bcrypt::verify(pw, hash).unwrap_or(false);
+    }
     PasswordHash::new(hash)
         .map(|h| argon2::Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
         .unwrap_or(false)
@@ -320,6 +330,16 @@ async fn login(State(app): State<App>, Json(req): Json<LoginReq>) -> ApiResult {
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"bad credentials"}))).into_response());
     }
     let user = user.unwrap();
+    if is_bcrypt_hash(&user.pass_hash) {
+        // the password is known to be right: store it the way every other one is stored
+        match hash_password(&req.password) {
+            Ok(h) => match app.db.set_password_hash(user.id, &h) {
+                Ok(()) => info!(user = %user.username, "login: ZoneMinder bcrypt hash upgraded to argon2"),
+                Err(e) => warn!(user = %user.username, "could not upgrade the password hash: {e:#}"),
+            },
+            Err(e) => warn!(user = %user.username, "could not re-hash the password: {e:#}"),
+        }
+    }
     let token = new_token();
     let ttl = app.cfg.session_hours as i64 * 3600;
     app.db.create_session(user.id, &token, ttl).map_err(err500)?;

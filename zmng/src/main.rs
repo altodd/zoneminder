@@ -87,6 +87,15 @@ enum Cmd {
     },
     /// Print storage usage
     Stats,
+    /// Give existing zmng accounts their ZoneMinder passwords: reads ZoneMinder's
+    /// `Users` table as TSV with a header row (`mysql -B zm -e "SELECT * FROM Users"`)
+    /// and copies each bcrypt hash to the zmng user of the same name. People keep
+    /// their old password; it is re-hashed with argon2 at their first login.
+    ImportZmUsers {
+        tsv: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Import ZoneMinder events (TSV export + files in place). See src/import.rs for the SQL.
     ImportZm {
         /// TSV from `mysql -B -N -e "SELECT ..."`
@@ -225,6 +234,36 @@ fn main() -> Result<()> {
                     s.reserve_bytes as f64 / 1e9
                 );
             }
+            Ok(())
+        }
+        Cmd::ImportZmUsers { tsv, dry_run } => {
+            let db = db::Db::open(&cfg.db_path)?;
+            let text = std::fs::read_to_string(&tsv).with_context(|| format!("reading {}", tsv.display()))?;
+            let mut lines = text.lines();
+            let header: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
+            let col = |name: &str| header.iter().position(|h| *h == name).ok_or_else(|| anyhow::anyhow!("no {name} column in {}", tsv.display()));
+            let (iu, ip) = (col("Username")?, col("Password")?);
+            let (mut done, mut skipped) = (0, 0);
+            for line in lines.filter(|l| !l.trim().is_empty()) {
+                let cols: Vec<&str> = line.split('\t').collect();
+                let (Some(name), Some(hash)) = (cols.get(iu).map(|s| s.trim()), cols.get(ip).map(|s| s.trim())) else { continue };
+                let Some(user) = db.user_by_name(name)? else {
+                    println!("{name:<28} no zmng account with that name; skipped");
+                    skipped += 1;
+                    continue;
+                };
+                if !api::is_bcrypt_hash(hash) {
+                    println!("{name:<28} ZoneMinder hash is not bcrypt ({}); skipped", if hash.is_empty() { "empty" } else { &hash[..hash.len().min(4)] });
+                    skipped += 1;
+                    continue;
+                }
+                if !dry_run {
+                    db.set_password_hash(user.id, hash)?;
+                }
+                println!("{name:<28} {} ZoneMinder password (bcrypt, re-hashed at first login)", if dry_run { "would take" } else { "takes" });
+                done += 1;
+            }
+            println!("{done} account(s) {}, {skipped} skipped", if dry_run { "would change" } else { "changed" });
             Ok(())
         }
         Cmd::ImportZm { tsv, storage, camera_map, thumb_width, dry_run, skip_thumbs, motion_min_alarm_frames } => {

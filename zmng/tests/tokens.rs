@@ -185,3 +185,24 @@ async fn users_change_their_own_password() {
     assert!(res.text().contains("/api/me/password"), "{}", res.text());
     assert_eq!(login(&r, "admin", "password123").await.status, 200);
 }
+
+
+/// An account imported from ZoneMinder keeps its PHP bcrypt hash ($2y$): the
+/// old password logs in, the hash is upgraded to argon2 on that first login,
+/// the next login verifies the argon2 hash, and a wrong password never passes.
+#[tokio::test]
+async fn zoneminder_bcrypt_hashes_log_in_and_upgrade_to_argon2() {
+    let fx = Fixture::new();
+    fx.add_admin("boss", "bosspassword");
+    let zm_hash = bcrypt::hash("OldZmSecret!", 4).unwrap();
+    assert!(zm_hash.starts_with("$2b$") || zm_hash.starts_with("$2y$"));
+    let id = fx.db.add_user("kstabler", &zm_hash, "viewer").unwrap();
+    let r = fx.router();
+    assert_eq!(login(&r, "kstabler", "wrong-password").await.status, 401);
+    assert_eq!(login(&r, "kstabler", "OldZmSecret!").await.status, 200, "the ZoneMinder password works");
+    let stored = fx.db.user_by_name("kstabler").unwrap().unwrap().pass_hash;
+    assert!(stored.starts_with("$argon2"), "upgraded on first login: {stored}");
+    assert_eq!(login(&r, "kstabler", "OldZmSecret!").await.status, 200, "and still works afterwards");
+    assert_eq!(login(&r, "kstabler", "wrong-password").await.status, 401);
+    assert_eq!(fx.db.user_by_name("kstabler").unwrap().unwrap().id, id);
+}
