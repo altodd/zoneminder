@@ -59,6 +59,9 @@ pub struct Config {
     /// websocket (`/zm/go2rtc/ws`) instead of MJPEG. Ignored when
     /// `go2rtc_url` is set (that go2rtc is advertised instead).
     pub zmninja_mse: bool,
+    /// Concurrent MJPEG streams (`nph-zms?mode=jpeg`, one per montage tile in
+    /// zmNinja); more get 503. Each costs a few % of one core.
+    pub mjpeg_max_streams: usize,
 }
 
 impl Default for Config {
@@ -85,6 +88,7 @@ impl Default for Config {
             peers: Vec::new(),
             zmninja_mse: true,
             public_url: None,
+            mjpeg_max_streams: 8,
         }
     }
 }

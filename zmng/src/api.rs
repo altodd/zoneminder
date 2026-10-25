@@ -1967,6 +1967,7 @@ impl App {
     /// Assemble the shared application state. The setup token is printed by
     /// `serve` when no users exist yet.
     pub fn new(cfg: Config, db: Db, hub: Arc<LiveHub>, bus: Arc<crate::notify::Bus>) -> App {
+        let mjpeg_max = cfg.mjpeg_max_streams.max(1);
         let transcoder = cfg.transcode.clone().map(|t| Arc::new(crate::transcode::Transcoder::new(t, cfg.ffmpeg.clone())));
         App {
             cfg: Arc::new(cfg),
@@ -1978,7 +1979,7 @@ impl App {
             decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
             // a 640x360 MJPEG stream costs a few % of one core now that ffmpeg
             // no longer starts a thread per core (see thumbs::ffmpeg_command)
-            mjpeg_sem: Arc::new(tokio::sync::Semaphore::new(8)),
+            mjpeg_sem: Arc::new(tokio::sync::Semaphore::new(mjpeg_max)),
             started_ms: crate::db::now_dts() / 90,
             transcoder,
             ptz_timers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),

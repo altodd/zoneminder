@@ -1404,6 +1404,7 @@ impl Db {
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(v) = f.start_ge { args.push(v.into()); wh.push_str(&format!(" AND start_dts>=?{}", args.len())); }
         if let Some(v) = f.start_le { args.push(v.into()); wh.push_str(&format!(" AND start_dts<=?{}", args.len())); }
+        if let Some(v) = f.end_ge { args.push(v.into()); wh.push_str(&format!(" AND end_dts>=?{}", args.len())); }
         if let Some(v) = f.end_le { args.push(v.into()); wh.push_str(&format!(" AND end_dts<=?{}", args.len())); }
         if f.min_score > 0 { args.push((f.min_score as i64).into()); wh.push_str(&format!(" AND score>=?{}", args.len())); }
         if let Some(a) = f.archived { args.push((a as i64).into()); wh.push_str(&format!(" AND archived=?{}", args.len())); }
