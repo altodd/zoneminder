@@ -54,7 +54,7 @@ pub fn run_once(db: &Db, max_per_pass: usize) -> Result<TierStats> {
             warn!(storage = src.id, path = %src.path, "primary volume not mounted; skipping this pass");
             continue;
         }
-        if !crate::retention::storage_mounted(dst) || fs_free_bytes(Path::new(&dst.path)).is_err() {
+        if dst.read_only || !crate::retention::storage_mounted(dst) || fs_free_bytes(Path::new(&dst.path)).is_err() {
             warn!(storage = dst.id, path = %dst.path, "archive volume not available; skipping this pass");
             continue;
         }
@@ -78,10 +78,12 @@ pub fn run_once(db: &Db, max_per_pass: usize) -> Result<TierStats> {
         if candidates.len() >= max_per_pass {
             stats.more = true;
         }
+        // the archive keeps the reserve of its filesystem (shared with any
+        // other writable storage there); retention keeps headroom above it
+        let dst_reserve = crate::retention::fs_reserve(&storages, dst, &crate::retention::RealVolumes);
         for seg in candidates {
-            // archive must have room: keep its own reserve
             let dst_free = fs_free_bytes(Path::new(&dst.path)).unwrap_or(0) as i64;
-            if dst_free - seg.bytes < dst.reserve_bytes {
+            if dst_free - seg.bytes < dst_reserve {
                 warn!(storage = dst.id, "archive volume under reserve; retention on the archive must free space first");
                 stats.more = false;
                 break;
