@@ -1,7 +1,8 @@
 # zmng — the recorder of record on securityserver since 2026-10-04 (cut over from ZoneMinder).
 # Cameras, users, storages and zones live in the database (Admin UI / API), not here.
 db_path    = "/var/lib/zmng/zmng.db"
-listen     = "10.10.100.100:80"            # LAN, WireGuard, site VPN; the CBA guests' tailnet ACL allows tcp 80
+listen     = "127.0.0.1:8080"              # Caddy (deploy/securityserver/Caddyfile) serves https://10.10.100.100 and redirects :80;
+                                           # the CBA guests' tailnet ACL must allow tcp 443 (80 only redirects)
 web_dir    = "/usr/local/share/zmng"
 thumb_dir  = "/var/cache/zoneminder/events/zmng-thumbs"   # RAID: event thumbnails + scrub previews (~1.2 GB/day, pruned with retention)
 backup_dir = "/media/zmoverflow/zmng-backups"             # daily VACUUM INTO on the other volume
@@ -10,10 +11,10 @@ fsync = true
 ffmpeg = "/usr/bin/ffmpeg"
 session_hours = 336
 log = "info,retina=warn"
-secure_cookies = false        # plain HTTP on the LAN; set true if Caddy/TLS is put in front
+secure_cookies = true         # behind Caddy (HTTPS)
 alert_after_minutes = 3
 preview_secs = 5
-public_url = "http://10.10.100.100"
+public_url = "https://10.10.100.100"
 
 # The Quadro P2200 is zmng's: NVDEC decodes the HEVC main stream and NVENC encodes the
 # H.264 fallback for browsers without HEVC (Firefox, older Windows).

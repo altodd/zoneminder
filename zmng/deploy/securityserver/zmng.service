@@ -21,9 +21,6 @@ RestartSec=3
 LimitNOFILE=65536
 # the index holds RTSP credentials
 UMask=0077
-# port 80
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # zmng is this box's main workload: no nice/CPU-weight penalty. The page cache of ~0.7 TB/day
 # of writes is charged to the unit: MemoryHigh starts reclaim early so the recorders never
 # stall on it, MemoryMax leaves ~30 GB of the 125 GB for MySQL, Docker (WireGuard, Pi-hole,

@@ -1,0 +1,38 @@
+# Caddy in front of zmng on securityserver: HTTPS with Caddy's own CA (no domain, no Tailscale),
+# HTTP/2 so the Live wall can stream every tile, websocket (/zm/ws) and SSE pass-through.
+# Install as /etc/caddy/Caddyfile (apt install caddy).
+#
+# zmng.toml: listen = "127.0.0.1:8080", secure_cookies = true, public_url = "https://10.10.100.100"
+#
+# Devices must trust Caddy's root CA once:
+#   sudo caddy trust                                  # on the server itself
+#   /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+#                                                     # copy to each device: macOS Keychain "Always Trust",
+#                                                     # Windows "Trusted Root Certification Authorities",
+#                                                     # iOS: install profile + Settings > General > About >
+#                                                     # Certificate Trust Settings, Android: Settings >
+#                                                     # Security > Install certificate > CA certificate
+# zmNinja / zmNinjaNg: Android apps ignore user-installed CAs. In classic zmNinja leave
+# Developer Options > "Enable strict SSL" off (it then accepts this certificate); portal
+# https://10.10.100.100/zm, event server wss://10.10.100.100/zm/ws.
+# The root CA is valid for 10 years; the leaf certificate renews itself.
+
+{
+	# plain http://10.10.100.100 redirects here; nothing else on this box serves 80/443
+	# on this address (Apache is on :8081)
+	default_bind 10.10.100.100
+}
+
+10.10.100.100, securityserver {
+	tls internal
+
+	# Caddy's default match compresses text/JSON/JS only; video and JPEG pass untouched
+	encode zstd gzip
+
+	# streaming responses (live fMP4, MJPEG, SSE) must not be buffered
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+}
