@@ -15,15 +15,17 @@ Group=zmng
 # retention can retire them)
 SupplementaryGroups=www-data
 WorkingDirectory=/var/lib/zmng
+# a cold page cache makes the first reads of the 2.7 GB index take ~5 min, during which
+# nothing records; reading the files once first takes ~25 s (and the unit shows
+# "activating", not "active", meanwhile). "-": a missing WAL is not an error.
+ExecStartPre=-/bin/sh -c 'cat /var/lib/zmng/zmng.db /var/lib/zmng/zmng.db-wal > /dev/null 2>&1'
+TimeoutStartSec=300
 ExecStart=/usr/local/bin/zmng -c /etc/zmng/zmng.toml run
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
 # the index holds RTSP credentials
 UMask=0077
-# port 80
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # zmng is this box's main workload: no nice/CPU-weight penalty. The page cache of ~0.7 TB/day
 # of writes is charged to the unit: MemoryHigh starts reclaim early so the recorders never
 # stall on it, MemoryMax leaves ~30 GB of the 125 GB for MySQL, Docker (WireGuard, Pi-hole,

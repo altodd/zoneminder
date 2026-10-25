@@ -102,12 +102,28 @@ async fn get_version() -> Response {
 
 #[derive(Deserialize)]
 struct LoginForm {
+    #[serde(alias = "username")]
     user: Option<String>,
+    #[serde(alias = "password")]
     pass: Option<String>,
     token: Option<String>,
 }
 
 async fn login(State(app): State<App>, Form(f): Form<LoginForm>) -> ApiResult {
+    do_login(app, f).await
+}
+
+/// Classic zmNinja refreshes with `GET login.json?token=<refresh>` and can log
+/// in with `GET login.json?username=&password=`; without either, GET is the
+/// version probe it always was.
+async fn login_get(State(app): State<App>, Query(f): Query<LoginForm>) -> ApiResult {
+    if f.token.as_deref().is_some_and(|t| !t.is_empty()) || f.user.is_some() {
+        return do_login(app, f).await;
+    }
+    Ok(get_version().await)
+}
+
+async fn do_login(app: App, f: LoginForm) -> ApiResult {
     let user = if let Some(refresh) = f.token.filter(|t| !t.is_empty()) {
         app.db.session_user(&refresh).map_err(e500)?.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Invalid refresh token"))?
     } else {
@@ -144,7 +160,9 @@ async fn login(State(app): State<App>, Form(f): Form<LoginForm>) -> ApiResult {
 }
 
 async fn get_timezone() -> Response {
-    Json(json!({"DateTime": {"TimeZone": local_tz_name()}})).into_response()
+    // zmNinjaNg reads DateTime.TimeZone, classic zmNinja and ZoneMinder's own API `tz`
+    let tz = local_tz_name();
+    Json(json!({"DateTime": {"TimeZone": tz}, "tz": tz})).into_response()
 }
 async fn daemon_check() -> Response {
     Json(json!({"result": 1})).into_response()
@@ -419,6 +437,7 @@ pub struct EventFilter {
     pub monitors: Vec<i64>,
     pub start_ge: Option<i64>,
     pub start_le: Option<i64>,
+    pub end_ge: Option<i64>,
     pub end_le: Option<i64>,
     pub min_score: u8,
     pub archived: Option<bool>,
@@ -437,15 +456,25 @@ pub fn parse_filter(path: &str) -> EventFilter {
         }
         let Some((key, val)) = seg.split_once(':') else { continue };
         let (key, val) = (key.trim(), val.trim());
+        // ZoneMinder times have whole seconds and events do not: a strict
+        // bound moves by a second (">") or a tick ("<") so that "StartTime >:"
+        // an event's own StartTime does not return that event again
+        let after = |v: &str| parse_zm_time(v).map(|t| t + TIMESCALE as i64);
+        let before = |v: &str| parse_zm_time(v).map(|t| t - 1);
         match key {
-            "MonitorId" => {
+            "MonitorId" | "MonitorId =" => {
                 if let Ok(v) = val.parse() {
                     f.monitors.push(v);
                 }
             }
-            "StartDateTime >=" | "StartDateTime >" | "StartTime >=" | "StartTime >" => f.start_ge = parse_zm_time(val),
-            "StartDateTime <=" | "StartDateTime <" | "StartTime <=" | "StartTime <" => f.start_le = parse_zm_time(val),
-            "EndDateTime <=" | "EndDateTime <" | "EndTime <=" => f.end_le = parse_zm_time(val),
+            "StartDateTime >=" | "StartTime >=" => f.start_ge = parse_zm_time(val),
+            "StartDateTime >" | "StartTime >" => f.start_ge = after(val),
+            "StartDateTime <=" | "StartTime <=" => f.start_le = parse_zm_time(val),
+            "StartDateTime <" | "StartTime <" => f.start_le = before(val),
+            "EndDateTime >=" | "EndTime >=" => f.end_ge = parse_zm_time(val),
+            "EndDateTime >" | "EndTime >" => f.end_ge = after(val),
+            "EndDateTime <=" | "EndTime <=" => f.end_le = parse_zm_time(val),
+            "EndDateTime <" | "EndTime <" => f.end_le = before(val),
             "AlarmFrames >=" => f.min_score = if val.parse::<i64>().unwrap_or(0) > 0 { 1 } else { 0 },
             "Archived" => f.archived = Some(val == "1"),
             "Id IN" => f.ids = val.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
@@ -470,6 +499,9 @@ fn event_json(e: &Event, cam_name: &str, width: u32, height: u32) -> Value {
         "Id": e.id.to_string(), "MonitorId": e.camera_id.to_string(), "Name": format!("{cam_name} {}", e.id),
         "Cause": cause, "Notes": e.notes.clone().unwrap_or_else(|| format!("detected:{}", e.kind)),
         "StartDateTime": zm_time(e.start_dts), "EndDateTime": e.end_dts.map(zm_time),
+        // ZoneMinder's API virtual fields; classic zmNinja reads only these
+        "StartTime": zm_time(e.start_dts), "EndTime": e.end_dts.map(zm_time),
+        "StartTimeSecs": (e.start_dts / TIMESCALE as i64).to_string(), "EndTimeSecs": (end / TIMESCALE as i64).to_string(),
         "Length": format!("{len:.2}"), "Frames": frames.to_string(), "AlarmFrames": (if e.score > 0 { frames.max(1) } else { 0 }).to_string(),
         "AlarmFrameId": peak_frame.to_string(), "MaxScoreFrameId": peak_frame.to_string(),
         "MaxScore": e.score.to_string(), "AvgScore": (e.score / 2).to_string(), "TotScore": (e.score as i64 * frames).to_string(),
@@ -511,7 +543,7 @@ async fn events_index(State(app): State<App>, path: Option<Path<String>>, Query(
         .iter()
         .map(|e| {
             let (n, w, h) = names.get(&e.camera_id).cloned().unwrap_or_default();
-            json!({"Event": event_json(e, &n, w, h)})
+            json!({"Event": event_json(e, &n, w, h), "Monitor": {"Id": e.camera_id.to_string(), "Name": n}})
         })
         .collect();
     let page_count = total.div_ceil(limit).max(1);
@@ -534,9 +566,9 @@ async fn event_one(State(app): State<App>, Path(id): Path<String>, user: Option<
     if !crate::api::visible_cameras_pub(&app, u).contains(&e.camera_id) {
         return Err(err(StatusCode::NOT_FOUND, "Invalid event"));
     }
-    let cam = app.db.camera(e.camera_id).map_err(e500)?;
+    let name = app.db.camera(e.camera_id).map_err(e500)?.map(|c| c.name).unwrap_or_default();
     let st = app.hub.get(e.camera_id).map(|h| h.status.read().clone()).unwrap_or_default();
-    Ok(Json(json!({"event": {"Event": event_json(&e, &cam.map(|c| c.name).unwrap_or_default(), st.width, st.height), "Frame": []}})).into_response())
+    Ok(Json(json!({"event": {"Event": event_json(&e, &name, st.width, st.height), "Monitor": {"Id": e.camera_id.to_string(), "Name": name}, "Frame": []}})).into_response())
 }
 
 async fn event_put(State(app): State<App>, Path(id): Path<String>, user: Option<axum::Extension<AuthUser>>, Form(f): Form<HashMap<String, String>>) -> ApiResult {
@@ -1338,7 +1370,7 @@ async fn es_session(app: App, mut socket: axum::extract::ws::WebSocket) {
 pub fn router() -> Router<App> {
     Router::new()
         .route("/zm/api/host/getVersion.json", get(get_version))
-        .route("/zm/api/host/login.json", post(login).get(get_version))
+        .route("/zm/api/host/login.json", post(login).get(login_get))
         .route("/zm/api/host/getTimeZone.json", get(get_timezone))
         .route("/zm/api/host/daemonCheck.json", get(daemon_check))
         .route("/zm/api/host/getLoad.json", get(get_load))
@@ -1354,6 +1386,9 @@ pub fn router() -> Router<App> {
         .route("/zm/api/users.json", get(users))
         .route("/zm/api/storage.json", get(storage_list))
         .route("/zm/api/monitors.json", get(monitors))
+        // classic zmNinja: monitors/index/Type!=:WebSite/Deleted=:0/Capturing!=:None.json
+        // (zmng has no website monitors, deleted rows or disabled capture to filter out)
+        .route("/zm/api/monitors/index/{*filters}", get(monitors))
         .route("/zm/api/monitors/alarm/{*rest}", get(monitor_alarm))
         .route("/zm/api/monitors/daemonStatus/{*rest}", get(monitor_daemon))
         .route("/zm/api/monitors/{id}", get(monitor_one).post(monitor_post))

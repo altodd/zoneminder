@@ -320,11 +320,14 @@ fn space_budget_deletes_unpinned_footage_first() {
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
     assert!(fx.db.segment(pinned).unwrap().is_some(), "archived event footage kept");
     assert!(fx.db.segment(plain).unwrap().is_none(), "the unpinned segment paid for the budget");
-    // at the hard floor the pin no longer holds
+    // not even at the hard floor: only removing the archive mark frees it
     let free = zmng::retention::fs_free_bytes(&fx.storage_path()).unwrap() as i64;
     fx.db.update_storage(fx.storage_id, serde_json::json!({"reserve_bytes": free * 4}).as_object().unwrap()).unwrap();
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
-    assert!(fx.db.segment(pinned).unwrap().is_none(), "floor: pinned footage goes too");
+    assert!(fx.db.segment(pinned).unwrap().is_some(), "archived footage is never deleted automatically");
+    fx.db.set_event_archived(ev, false).unwrap();
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(pinned).unwrap().is_none(), "unarchived, it goes");
 }
 
 /// Retention deletes a segment while tiering is copying it: the copy is
@@ -350,4 +353,209 @@ fn tiering_survives_a_segment_deleted_during_the_copy() {
     fx.db.move_segment(stays, arch_id).unwrap();
     assert!(!fx.db.move_segment(stays, arch_id).unwrap());
     assert_eq!(fx.db.storage_used_bytes(arch_id).unwrap(), fx.db.segment(stays).unwrap().unwrap().bytes);
+}
+
+/// Free space and filesystem identity on demand: `(root, device, free)`.
+struct FakeVolumes(Vec<(std::path::PathBuf, u64, u64)>);
+
+impl zmng::retention::Volumes for FakeVolumes {
+    fn free(&self, p: &std::path::Path) -> Option<u64> {
+        self.0.iter().find(|v| p.starts_with(&v.0)).map(|v| v.2)
+    }
+    fn device(&self, p: &std::path::Path) -> Option<u64> {
+        self.0.iter().find(|v| p.starts_with(&v.0)).map(|v| v.1)
+    }
+}
+
+/// A writable storage at `<tmp>/<name>` with the given reserve.
+fn add_volume(fx: &Fixture, name: &str, reserve: i64) -> (i64, std::path::PathBuf) {
+    let root = fx.dir.path().join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    (fx.db.add_storage(root.to_str().unwrap(), None, reserve).unwrap(), root)
+}
+
+/// Write a segment and move its file and row onto storage `id` at `root`.
+fn segment_on(fx: &Fixture, cam: i64, enc: &Encoded, start_secs: i64, id: i64, root: &std::path::Path) -> i64 {
+    let s = fx.write_segment(cam, "main", enc, dts(start_secs), |_| 0);
+    let seg = fx.db.segment(s).unwrap().unwrap();
+    let dst = root.join(&seg.path);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    std::fs::rename(fx.storage_path().join(&seg.path), &dst).unwrap();
+    fx.db.move_segment(s, id).unwrap();
+    s
+}
+
+/// Imported ZoneMinder footage is mostly motion events, pinned for 120
+/// days: a run of more than a page of pinned segments at the front must not
+/// stop age retention from reaching the continuous footage behind it.
+#[test]
+fn age_retention_steps_over_a_long_pinned_run() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 1, "event_retention_days": 30}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let base = now_secs() - 10 * 86_400;
+    let pinned: Vec<i64> = (0..250).map(|i| fx.write_segment(cam, "main", &enc, dts(base + i * 10), |_| 0)).collect();
+    let ev = fx.db.insert_event(cam, dts(base), "motion").unwrap();
+    fx.db.close_event(ev, dts(base + 250 * 10), None, "{}").unwrap();
+    let behind = fx.write_segment(cam, "main", &enc, dts(base + 86_400), |_| 0);
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(behind).unwrap().is_none(), "continuous footage behind 250 pinned segments is reached");
+    assert!(pinned.iter().all(|s| fx.db.segment(*s).unwrap().is_some()));
+}
+
+/// Space pressure deletes the oldest footage whether or not it holds
+/// motion; only events the user archived are skipped.
+#[test]
+fn space_budget_deletes_oldest_even_when_it_has_motion() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let motion = fx.write_segment(cam, "main", &enc, dts(now_secs() - 3000), |_| 0);
+    let newer = fx.write_segment(cam, "main", &enc, dts(now_secs() - 2000), |_| 0);
+    let ev = fx.db.insert_event(cam, dts(now_secs() - 3000) + 90_000, "motion").unwrap();
+    fx.db.close_event(ev, dts(now_secs() - 3000) + 180_000, None, "{}").unwrap();
+    let one = fx.db.segment(newer).unwrap().unwrap().bytes;
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"max_bytes": one + 10}).as_object().unwrap()).unwrap();
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(motion).unwrap().is_none(), "oldest goes, motion or not");
+    assert!(fx.db.segment(newer).unwrap().is_some());
+}
+
+/// Two writable storages on one filesystem (zmng's directory inside an
+/// imported ZoneMinder tree): the reserve is met by deleting the oldest
+/// footage on the volume, whichever storage holds it.
+#[test]
+fn shared_filesystem_deletes_oldest_across_storages() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 365}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let (legacy, lroot) = add_volume(&fx, "legacy", 0);
+    let recent = fx.write_segment(cam, "main", &enc, dts(now_secs() - 86_400), |_| 0);
+    let oldest = segment_on(&fx, cam, &enc, now_secs() - 60 * 86_400, legacy, &lroot);
+    let older = segment_on(&fx, cam, &enc, now_secs() - 30 * 86_400, legacy, &lroot);
+    let one = fx.db.segment(oldest).unwrap().unwrap().bytes as u64;
+    let reserve = 1_000_000_000u64;
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"reserve_bytes": reserve}).as_object().unwrap()).unwrap();
+    let vols = FakeVolumes(vec![(fx.storage_path(), 1, reserve - one / 2), (lroot.clone(), 1, reserve - one / 2)]);
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(oldest).unwrap().is_none(), "the oldest on the volume goes");
+    assert!(fx.db.segment(older).unwrap().is_some(), "one segment was enough");
+    assert!(fx.db.segment(recent).unwrap().is_some(), "the recording storage keeps its newer footage");
+}
+
+/// The primary is only ever drained by tiering, even under half its
+/// reserve: an imported ZoneMinder tree on the same disk goes, and the
+/// archive volume deletes its oldest footage so the primary can move there.
+#[test]
+fn primary_is_never_deleted_while_the_archive_can_make_room() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 365}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let reserve = 150_000_000_000u64;
+    let (arch, aroot) = add_volume(&fx, "archive", 300_000_000_000);
+    let (legacy, lroot) = add_volume(&fx, "zm-raid", 0);
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"archive_to": arch, "archive_after_days": 3, "reserve_bytes": reserve}).as_object().unwrap()).unwrap();
+    let primary: Vec<i64> = (0..3).map(|d| fx.write_segment(cam, "main", &enc, dts(now_secs() - (6 - d) * 86_400), |_| 0)).collect();
+    let zm_raid = segment_on(&fx, cam, &enc, now_secs() - 90 * 86_400, legacy, &lroot);
+    let archived = segment_on(&fx, cam, &enc, now_secs() - 20 * 86_400, arch, &aroot);
+    // the RAID far under half its reserve; the archive exactly at its reserve
+    let vols = FakeVolumes(vec![(fx.storage_path(), 1, 1_000_000), (lroot.clone(), 1, 1_000_000), (aroot.clone(), 2, 300_000_000_000)]);
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(zm_raid).unwrap().is_none(), "the ZoneMinder tree on the RAID goes");
+    assert!(fx.db.segment(archived).unwrap().is_none(), "the archive makes room");
+    assert!(primary.iter().all(|s| fx.db.segment(*s).unwrap().is_some()), "the primary is untouched");
+    // the archive volume unplugged: the last resort keeps the recorders alive
+    std::fs::remove_file(aroot.join(zmng::retention::MARKER)).unwrap();
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(primary[0]).unwrap().is_none(), "ENOSPC guard: oldest primary footage");
+    // ...but never footage of an event the user archived, even then
+    let saved = fx.write_segment(cam, "main", &enc, dts(now_secs() - 2 * 86_400), |_| 0);
+    let plain = fx.write_segment(cam, "main", &enc, dts(now_secs() - 86_400), |_| 0);
+    let keep = fx.db.segment(saved).unwrap().unwrap();
+    let ev = fx.db.insert_event(cam, keep.start_dts, "motion").unwrap();
+    fx.db.close_event(ev, keep.end_dts, None, "{}").unwrap();
+    fx.db.set_event_archived(ev, true).unwrap();
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(saved).unwrap().is_some(), "archived event footage kept at the floor");
+    assert!(fx.db.segment(plain).unwrap().is_none(), "the unarchived newer one goes instead");
+}
+
+/// The archive at its reserve with a backlog waiting on the primary: the
+/// archive volume deletes its oldest footage (an imported ZoneMinder tree
+/// on the same disk first) to make room for tiering.
+#[test]
+fn archive_makes_room_for_the_backlog_oldest_first() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 365}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let (arch, aroot) = add_volume(&fx, "archive", 300_000_000_000);
+    let (legacy, lroot) = add_volume(&fx, "zm-usb", 0);
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"archive_to": arch, "archive_after_days": 3}).as_object().unwrap()).unwrap();
+    let backlog = fx.write_segment(cam, "main", &enc, dts(now_secs() - 5 * 86_400), |_| 0);
+    let zm_old = segment_on(&fx, cam, &enc, now_secs() - 100 * 86_400, legacy, &lroot);
+    let arch_old = segment_on(&fx, cam, &enc, now_secs() - 20 * 86_400, arch, &aroot);
+    let arch_new = segment_on(&fx, cam, &enc, now_secs() - 10 * 86_400, arch, &aroot);
+    let one = fx.db.segment(zm_old).unwrap().unwrap().bytes as u64;
+    // two segments short of reserve + headroom
+    let free = 300_000_000_000u64 + zmng::retention::ARCHIVE_HEADROOM_BYTES as u64 - one * 3 / 2;
+    let vols = FakeVolumes(vec![(fx.storage_path(), 1, u64::MAX / 4), (aroot.clone(), 2, free), (lroot.clone(), 2, free)]);
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(zm_old).unwrap().is_none(), "oldest on the archive disk, a ZoneMinder event");
+    assert!(fx.db.segment(arch_old).unwrap().is_none(), "then zmng's own archived footage");
+    assert!(fx.db.segment(arch_new).unwrap().is_some(), "no more than needed");
+    assert!(fx.db.segment(backlog).unwrap().is_some(), "the backlog waits for tiering");
+    // no backlog and no pressure: the archive just keeps its reserve
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"archive_after_days": 30}).as_object().unwrap()).unwrap();
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(arch_new).unwrap().is_some());
+}
+
+/// Clearing read-only writes the mount marker, so retention starts acting
+/// on the volume; an unwritable root refuses the change instead of leaving
+/// a storage that silently never frees space.
+#[test]
+fn clearing_read_only_writes_the_marker_or_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let root = fx.dir.path().join("zm-tree");
+    std::fs::create_dir_all(&root).unwrap();
+    let id = fx.db.add_storage(root.to_str().unwrap(), None, 0).unwrap();
+    fx.db.update_storage(id, serde_json::json!({"read_only": true}).as_object().unwrap()).unwrap();
+    std::fs::remove_file(root.join(zmng::retention::MARKER)).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let e = fx.db.update_storage(id, serde_json::json!({"read_only": false}).as_object().unwrap()).unwrap_err();
+    assert!(format!("{e:#}").contains(zmng::retention::MARKER), "{e:#}");
+    assert!(fx.db.storage(id).unwrap().unwrap().read_only, "unchanged");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fx.db.update_storage(id, serde_json::json!({"read_only": false}).as_object().unwrap()).unwrap();
+    let st = fx.db.storage(id).unwrap().unwrap();
+    assert!(!st.read_only);
+    assert!(zmng::retention::storage_mounted(&st));
+}
+
+/// Free space is reported once per filesystem, against the storage that
+/// records there, never under the path of an imported tree on the same disk;
+/// every storage says whether it is read-only.
+#[test]
+fn low_space_is_reported_once_against_the_recording_storage() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    let free = zmng::retention::fs_free_bytes(&fx.storage_path()).unwrap() as i64;
+    let (arch, _) = add_volume(&fx, "archive", 0);
+    let (legacy, _) = add_volume(&fx, "zm-raid", free * 4);
+    let (ro, _) = add_volume(&fx, "zm-ro", free * 4);
+    fx.db.update_storage(ro, serde_json::json!({"read_only": true}).as_object().unwrap()).unwrap();
+    fx.db.update_storage(fx.storage_id, serde_json::json!({"archive_to": arch, "reserve_bytes": free * 4}).as_object().unwrap()).unwrap();
+    let r = zmng::health::report(&fx.db, &fx.hub, 0, 0, &[cam], true).unwrap();
+    let low: Vec<_> = r.issues.iter().filter(|i| i.text.contains("free space")).collect();
+    assert_eq!(low.len(), 1, "{:?}", r.issues);
+    assert_eq!(low[0].subject, fx.storage_path().to_str().unwrap());
+    assert!(r.storages.iter().find(|s| s.id == ro).unwrap().read_only);
+    assert!(!r.storages.iter().find(|s| s.id == legacy).unwrap().read_only);
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json["storages"].as_array().unwrap().iter().all(|s| s["read_only"].is_boolean()));
 }

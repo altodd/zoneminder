@@ -46,6 +46,8 @@ pub struct StorageHealth {
     pub id: i64,
     pub path: String,
     pub available: bool,
+    /// imported tree that is never deleted from, moved or written
+    pub read_only: bool,
     pub used_bytes: i64,
     pub free_bytes: u64,
     pub max_bytes: Option<i64>,
@@ -151,7 +153,18 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
     let mut storages = Vec::new();
     if admin {
         let oldest_st = db.oldest_segment_per_storage()?;
-        for s in db.storages()? {
+        let all = db.storages()?;
+        // free space belongs to a filesystem, not a storage row: report it
+        // once per volume, against the storage that records or archives there
+        // (an imported ZoneMinder tree sharing the disk is not the subject)
+        let groups = crate::retention::fs_groups(&all, &crate::retention::RealVolumes);
+        let reports_free = |s: &crate::db::Storage| -> bool {
+            groups.iter().find(|g| g.members.iter().any(|m| m.id == s.id)).map(|g| {
+                let lead = g.members.iter().find(|m| m.archive_to.is_some()).or_else(|| g.members.iter().find(|m| all.iter().any(|p| p.archive_to == Some(m.id)))).unwrap_or(&g.members[0]);
+                lead.id == s.id
+            }).unwrap_or(false)
+        };
+        for s in all.iter().cloned() {
             let p = Path::new(&s.path);
             let available = crate::retention::storage_mounted(&s);
             let used = db.storage_used_bytes(s.id)?;
@@ -166,12 +179,12 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
             if !available {
                 let why = if p.is_dir() { format!("volume not mounted (no {} marker)", crate::retention::MARKER) } else { "volume not mounted".to_string() };
                 issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: why });
-            } else if free < s.reserve_bytes as u64 / 2 && s.archive_to.is_some() {
-                issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: format!("free space {:.1} GB is under half the reserve: tiering cannot keep up, retention is deleting on the primary", free as f64 / 1e9) });
-            } else if free < s.reserve_bytes as u64 {
+            } else if reports_free(&s) && free < s.reserve_bytes as u64 / 2 && s.archive_to.is_some() {
+                issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: format!("free space {:.1} GB is under half the reserve: tiering cannot keep up, retention is deleting the oldest footage on this volume", free as f64 / 1e9) });
+            } else if reports_free(&s) && free < s.reserve_bytes as u64 {
                 issues.push(Issue { level: "error".into(), subject: s.path.clone(), text: format!("free space {:.1} GB is under the {:.1} GB reserve", free as f64 / 1e9, s.reserve_bytes as f64 / 1e9) });
             } else if let Some(d) = effective_days {
-                if d < 2.0 && s.archive_to.is_none() {
+                if d < 2.0 && s.archive_to.is_none() && reports_free(&s) {
                     issues.push(Issue { level: "warn".into(), subject: s.path.clone(), text: format!("only {d:.1} days of footage fit at the current rate") });
                 }
             }
@@ -184,7 +197,7 @@ pub fn report(db: &Db, hub: &Arc<LiveHub>, started_ms: i64, alert_after_ms: i64,
                 }
             }
             storages.push(StorageHealth {
-                id: s.id, path: s.path.clone(), available, used_bytes: used, free_bytes: free, max_bytes: s.max_bytes, reserve_bytes: s.reserve_bytes,
+                id: s.id, path: s.path.clone(), available, read_only: s.read_only, used_bytes: used, free_bytes: free, max_bytes: s.max_bytes, reserve_bytes: s.reserve_bytes,
                 archive_to: s.archive_to, archive_backlog_bytes, ingest_24h, headroom_bytes: headroom, effective_days, oldest_ms: oldest_st.get(&s.id).map(|d| dts_to_ms(*d)),
             });
         }
@@ -548,7 +561,7 @@ mod tests {
         let r = HealthReport {
             version: "0".into(), started_ms: 0, now_ms: 1000, uptime_secs: 1,
             cameras: vec![CameraHealth { id: 1, name: "Front \"door\"".into(), enabled: true, storage_id: 1, recording: true, codec: None, width: 0, height: 0, fps: 18.0, kbps: 2000.0, last_frame_ms: None, reconnects: 2, last_error: None, sub_recording: None, detect_running: true, detect_fps: 5.0, in_event: Some(3), last_event_ms: None, events_24h: 7, ingest_24h: 1000, oldest_ms: None }],
-            storages: vec![StorageHealth { id: 1, path: "/vol".into(), available: true, used_bytes: 10, free_bytes: 90, max_bytes: None, reserve_bytes: 5, archive_to: None, archive_backlog_bytes: 0, ingest_24h: 20, headroom_bytes: 85, effective_days: Some(4.75), oldest_ms: None }],
+            storages: vec![StorageHealth { id: 1, path: "/vol".into(), available: true, read_only: false, used_bytes: 10, free_bytes: 90, max_bytes: None, reserve_bytes: 5, archive_to: None, archive_backlog_bytes: 0, ingest_24h: 20, headroom_bytes: 85, effective_days: Some(4.75), oldest_ms: None }],
             issues: vec![Issue { level: "warn".into(), subject: "x".into(), text: "y".into() }],
             load: [0.0; 3],
         };

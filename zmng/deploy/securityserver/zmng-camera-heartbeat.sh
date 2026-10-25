@@ -6,7 +6,7 @@ set -u
 source /etc/zm-watch/heartbeat.env
 STATE=/run/zmng-camera-heartbeat.state
 LOG=/var/log/zmng-camera-heartbeat.log
-read EXP HEALTHY ISSUES < <(curl -s -m 10 -H "Authorization: Bearer ${ZMNG_TOKEN:-}" "${ZMNG_URL:-http://10.10.100.100}/api/status" 2>/dev/null | python3 -c '
+read EXP HEALTHY ISSUES < <(curl -s -m 10 -H "Authorization: Bearer ${ZMNG_TOKEN:-}" "${ZMNG_URL:-http://127.0.0.1:8080}/api/status" 2>/dev/null | python3 -c '
 import sys, json
 try:
     s = json.load(sys.stdin)

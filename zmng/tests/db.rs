@@ -111,3 +111,19 @@ fn range_queries_are_bounded_on_the_index() {
     assert_eq!(fx.db.coverage(cam, t + 2 * zmng::mp4::TIMESCALE as i64, t + 10 * zmng::mp4::TIMESCALE as i64).unwrap().len(), 1);
     assert!(fx.db.segments_in_range(cam, t + 3 * zmng::mp4::TIMESCALE as i64, t + 10 * zmng::mp4::TIMESCALE as i64).unwrap().is_empty());
 }
+
+/// Retention pages oldest-first by the key (start_dts, id): both queries
+/// seek on an index and need no sort, so a pass costs the rows it looks at,
+/// not the size of the index.
+#[test]
+fn retention_paging_seeks_on_the_index() {
+    let fx = common::Fixture::new();
+    for sql in [
+        "SELECT * FROM segment WHERE storage_id=1 AND (start_dts, id) > (5, 7) ORDER BY start_dts, id LIMIT 20",
+        "SELECT * FROM segment WHERE camera_id=1 AND end_dts<100 AND (start_dts, id) > (5, 7) ORDER BY start_dts, id LIMIT 200",
+    ] {
+        let text = fx.db.query_plan(sql).unwrap().join("\n");
+        assert!(text.contains("USING INDEX") && text.contains("start_dts") && text.contains(">?"), "{sql}: {text}");
+        assert!(!text.contains("TEMP B-TREE"), "{sql}: {text}");
+    }
+}

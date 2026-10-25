@@ -301,7 +301,9 @@ fn migrate(c: &Connection) -> Result<()> {
         for p in paths {
             let root = std::path::Path::new(&p);
             if root.is_dir() && !root.join(crate::retention::MARKER).exists() {
-                let _ = crate::retention::write_marker(root);
+                if let Err(e) = crate::retention::write_marker(root) {
+                    tracing::warn!(path = %p, "cannot write the storage marker; nothing will be recorded or deleted there: {e:#}");
+                }
             }
         }
     }
@@ -621,6 +623,19 @@ impl Db {
     }
 
     pub fn update_storage(&self, id: i64, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        // clearing read-only makes retention and tiering act on the volume,
+        // and they only act on a root with the mount marker: write it now,
+        // and refuse (rather than leave a storage that silently never frees
+        // space) when the root is not writable for this user
+        if patch.get("read_only") == Some(&serde_json::Value::Bool(false)) {
+            let st = self.storage(id)?.ok_or_else(|| anyhow::anyhow!("storage {id} not found"))?;
+            let root = std::path::Path::new(&st.path);
+            if !root.join(crate::retention::MARKER).is_file() {
+                crate::retention::write_marker(root).with_context(|| {
+                    format!("cannot write {} at {} (make the directory writable for the zmng user, then try again)", crate::retention::MARKER, st.path)
+                })?;
+            }
+        }
         self.with(|c| {
             for (k, v) in patch {
                 let sql = match k.as_str() {
@@ -703,6 +718,20 @@ impl Db {
             Ok(c.query_row(
                 "SELECT 1 FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 AND (archived=1 OR (end_dts>?4 AND kind<>'zm')) LIMIT 1",
                 params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
+    /// True if an event the user archived overlaps the segment: the one pin
+    /// the space budget honours (motion pins only hold against age retention).
+    pub fn segment_in_archived_event(&self, seg: &Segment) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM event WHERE camera_id=?1 AND archived=1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 LIMIT 1",
+                params![seg.camera_id, seg.start_dts, seg.end_dts],
                 |_| Ok(()),
             )
             .optional()?
@@ -1023,15 +1052,26 @@ impl Db {
 
     /// Oldest segments on a storage (for retention).
     pub fn oldest_segments(&self, storage_id: i64, limit: usize) -> Result<Vec<Segment>> {
-        self.oldest_segments_after(storage_id, i64::MIN, limit)
+        self.oldest_segments_after(storage_id, (i64::MIN, i64::MIN), limit)
     }
 
-    /// Oldest segments on a storage starting after `after_start_dts` (paging
-    /// for a loop that skips some rows).
-    pub fn oldest_segments_after(&self, storage_id: i64, after_start_dts: i64, limit: usize) -> Result<Vec<Segment>> {
+    /// Oldest segments on a storage after the key `(start_dts, id)` (keyset
+    /// paging for a loop that skips some rows; the id breaks ties between
+    /// cameras and streams that start in the same tick).
+    pub fn oldest_segments_after(&self, storage_id: i64, after: (i64, i64), limit: usize) -> Result<Vec<Segment>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 AND start_dts>?2 ORDER BY start_dts LIMIT ?3")?;
-            let rows = st.query_map(params![storage_id, after_start_dts, limit as i64], Self::row_segment)?;
+            let mut st = c.prepare("SELECT * FROM segment WHERE storage_id=?1 AND (start_dts, id) > (?2, ?3) ORDER BY start_dts, id LIMIT ?4")?;
+            let rows = st.query_map(params![storage_id, after.0, after.1, limit as i64], Self::row_segment)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Segments of a camera that ended before `before_dts`, oldest first,
+    /// after the key `(start_dts, id)`.
+    pub fn segments_older_than_after(&self, camera_id: i64, before_dts: i64, after: (i64, i64), limit: usize) -> Result<Vec<Segment>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM segment WHERE camera_id=?1 AND end_dts<?2 AND (start_dts, id) > (?3, ?4) ORDER BY start_dts, id LIMIT ?5")?;
+            let rows = st.query_map(params![camera_id, before_dts, after.0, after.1, limit as i64], Self::row_segment)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -1364,6 +1404,7 @@ impl Db {
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(v) = f.start_ge { args.push(v.into()); wh.push_str(&format!(" AND start_dts>=?{}", args.len())); }
         if let Some(v) = f.start_le { args.push(v.into()); wh.push_str(&format!(" AND start_dts<=?{}", args.len())); }
+        if let Some(v) = f.end_ge { args.push(v.into()); wh.push_str(&format!(" AND end_dts>=?{}", args.len())); }
         if let Some(v) = f.end_le { args.push(v.into()); wh.push_str(&format!(" AND end_dts<=?{}", args.len())); }
         if f.min_score > 0 { args.push((f.min_score as i64).into()); wh.push_str(&format!(" AND score>=?{}", args.len())); }
         if let Some(a) = f.archived { args.push((a as i64).into()); wh.push_str(&format!(" AND archived=?{}", args.len())); }

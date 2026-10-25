@@ -390,7 +390,9 @@ fn run(cfg: config::Config) -> Result<()> {
                         }
                     }
                     // storage headroom alerts (state transitions only)
-                    for s in db.storages().unwrap_or_default() {
+                    // an imported read-only tree sharing a disk with a recording
+                    // storage would only repeat that storage's alert under its own path
+                    for s in db.storages().unwrap_or_default().into_iter().filter(|s| !s.read_only) {
                         let free = retention::fs_free_bytes(std::path::Path::new(&s.path)).unwrap_or(u64::MAX);
                         let low = free < s.reserve_bytes as u64;
                         if low && storage_low.insert(s.id) {
