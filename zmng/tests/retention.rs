@@ -320,11 +320,14 @@ fn space_budget_deletes_unpinned_footage_first() {
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
     assert!(fx.db.segment(pinned).unwrap().is_some(), "archived event footage kept");
     assert!(fx.db.segment(plain).unwrap().is_none(), "the unpinned segment paid for the budget");
-    // at the hard floor the pin no longer holds
+    // not even at the hard floor: only removing the archive mark frees it
     let free = zmng::retention::fs_free_bytes(&fx.storage_path()).unwrap() as i64;
     fx.db.update_storage(fx.storage_id, serde_json::json!({"reserve_bytes": free * 4}).as_object().unwrap()).unwrap();
     zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
-    assert!(fx.db.segment(pinned).unwrap().is_none(), "floor: pinned footage goes too");
+    assert!(fx.db.segment(pinned).unwrap().is_some(), "archived footage is never deleted automatically");
+    fx.db.set_event_archived(ev, false).unwrap();
+    zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    assert!(fx.db.segment(pinned).unwrap().is_none(), "unarchived, it goes");
 }
 
 /// Retention deletes a segment while tiering is copying it: the copy is
@@ -468,6 +471,16 @@ fn primary_is_never_deleted_while_the_archive_can_make_room() {
     std::fs::remove_file(aroot.join(zmng::retention::MARKER)).unwrap();
     zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
     assert!(fx.db.segment(primary[0]).unwrap().is_none(), "ENOSPC guard: oldest primary footage");
+    // ...but never footage of an event the user archived, even then
+    let saved = fx.write_segment(cam, "main", &enc, dts(now_secs() - 2 * 86_400), |_| 0);
+    let plain = fx.write_segment(cam, "main", &enc, dts(now_secs() - 86_400), |_| 0);
+    let keep = fx.db.segment(saved).unwrap().unwrap();
+    let ev = fx.db.insert_event(cam, keep.start_dts, "motion").unwrap();
+    fx.db.close_event(ev, keep.end_dts, None, "{}").unwrap();
+    fx.db.set_event_archived(ev, true).unwrap();
+    zmng::retention::run_once_with(&fx.db, &fx.thumb_dir, &vols).unwrap();
+    assert!(fx.db.segment(saved).unwrap().is_some(), "archived event footage kept at the floor");
+    assert!(fx.db.segment(plain).unwrap().is_none(), "the unarchived newer one goes instead");
 }
 
 /// The archive at its reserve with a backlog waiting on the primary: the

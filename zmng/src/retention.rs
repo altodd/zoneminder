@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::db::{now_dts, Db, Storage};
 use crate::mp4::{self, TIMESCALE};
@@ -144,7 +144,8 @@ fn set_age_cursor(cam: i64, key: (i64, i64)) {
 
 /// Delete the oldest segments across `from`, oldest first whichever storage
 /// holds them, until `must` bytes are freed. Footage of an event the user
-/// archived is skipped when `keep_archived`. Motion events do not
+/// archived is skipped when `keep_archived` (always, today: only removing
+/// the archive mark, or deleting the event or camera, frees it). Motion events do not
 /// pin anything here: when space runs out the oldest footage goes first.
 /// Returns (bytes freed, segments deleted). Bounded per call so the 30 s
 /// loop stays responsive whatever the pinned run at the front.
@@ -294,8 +295,7 @@ pub fn run_once_with(db: &Db, thumb_dir: &Path, vols: &dyn Volumes) -> Result<()
         if from.is_empty() {
             continue; // a primary waiting for tiering
         }
-        // under half the reserve even footage the user archived goes
-        let (freed, n) = delete_oldest(db, &from, must, free >= g.reserve / 2)?;
+        let (freed, n) = delete_oldest(db, &from, must, true)?;
         deleted += n;
         for m in &g.members {
             room.insert(m.id, free + freed - g.reserve);
@@ -330,8 +330,11 @@ pub fn run_once_with(db: &Db, thumb_dir: &Path, vols: &dyn Volumes) -> Result<()
             continue;
         }
         warn!(storage = p.id, free_gb = free / 1_000_000_000, "free space under half the reserve and the archive cannot take more: deleting the oldest footage on the primary");
-        let (_, n) = delete_oldest(db, &[p], p.reserve_bytes - free, false)?;
+        let (freed, n) = delete_oldest(db, &[p], p.reserve_bytes - free, true)?;
         deleted += n;
+        if freed < p.reserve_bytes - free {
+            error!(storage = p.id, "the primary is filling with footage of archived events, which is never deleted automatically: unarchive events or add space");
+        }
     }
 
     // 3. events whose footage is entirely gone (keep archived ones): anything
