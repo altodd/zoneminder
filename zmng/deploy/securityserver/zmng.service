@@ -15,6 +15,11 @@ Group=zmng
 # retention can retire them)
 SupplementaryGroups=www-data
 WorkingDirectory=/var/lib/zmng
+# a cold page cache makes the first reads of the 2.7 GB index take ~5 min, during which
+# nothing records; reading the files once first takes ~25 s (and the unit shows
+# "activating", not "active", meanwhile). "-": a missing WAL is not an error.
+ExecStartPre=-/bin/sh -c 'cat /var/lib/zmng/zmng.db /var/lib/zmng/zmng.db-wal > /dev/null 2>&1'
+TimeoutStartSec=300
 ExecStart=/usr/local/bin/zmng -c /etc/zmng/zmng.toml run
 Restart=always
 RestartSec=3
