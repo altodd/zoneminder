@@ -303,6 +303,9 @@ fn run(cfg: config::Config) -> Result<()> {
         let db_api = db.another()?;
         let db_retention = db.another()?;
         let db_tier = db.another()?;
+        if cfg.pin_index {
+            zmng::pin::spawn(cfg.db_path.clone());
+        }
         let closed = db.close_stale_events()?;
         if closed > 0 {
             info!(closed, "closed events left open by previous run");

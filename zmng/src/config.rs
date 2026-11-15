@@ -62,6 +62,10 @@ pub struct Config {
     /// Concurrent MJPEG streams (`nph-zms?mode=jpeg`, one per montage tile in
     /// zmNinja); more get 503. Each costs a few % of one core.
     pub mjpeg_max_streams: usize,
+    /// Lock the index (database + WAL) in memory so the page cache of the
+    /// recordings can never push it out. For a dedicated recorder with RAM to
+    /// spare; needs `LimitMEMLOCK=infinity` in the unit.
+    pub pin_index: bool,
 }
 
 impl Default for Config {
@@ -89,6 +93,7 @@ impl Default for Config {
             zmninja_mse: true,
             public_url: None,
             mjpeg_max_streams: 8,
+            pin_index: false,
         }
     }
 }
