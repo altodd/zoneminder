@@ -1,30 +1,41 @@
-# Caddy in front of zmng on securityserver: HTTPS with Caddy's own CA (no domain, no Tailscale),
-# HTTP/2 so the Live wall can stream every tile, websocket (/zm/ws) and SSE pass-through.
+# Caddy in front of zmng on securityserver: HTTPS with one fixed certificate signed by Caddy's
+# local root CA (no domain, no Tailscale), HTTP/2 so the Live wall can stream every tile,
+# websocket (/zm/ws) and SSE pass-through.
 # Install as /etc/caddy/Caddyfile (apt install caddy).
 #
 # zmng.toml: listen = "127.0.0.1:8080", secure_cookies = true, public_url = "https://10.10.100.100"
 #
-# Devices must trust Caddy's root CA once:
-#   sudo caddy trust                                  # on the server itself
-#   /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
-#                                                     # copy to each device: macOS Keychain "Always Trust",
-#                                                     # Windows "Trusted Root Certification Authorities",
-#                                                     # iOS: install profile + Settings > General > About >
-#                                                     # Certificate Trust Settings, Android: Settings >
-#                                                     # Security > Install certificate > CA certificate
+# The certificate is issued by deploy/securityserver/issue-cert.sh (825 days, the longest Apple
+# accepts; re-run before it expires). It replaced `tls internal` on 2026-11-15: the internal
+# issuer renews its leaf every ~8 hours, and a browser that had only "accepted" the certificate
+# stopped trusting the server at each renewal. Now:
+#   - a device that trusts the root CA never sees a warning (recommended, and required for the
+#     zmNinjaNg iPhone app's video and for installing the web UI as an app):
+#       /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+#     macOS Keychain "Always Trust"; Windows "Trusted Root Certification Authorities"; iOS:
+#     install profile + Settings > General > About > Certificate Trust Settings; Android:
+#     Settings > Security > Install certificate > CA certificate
+#   - any other browser can accept the warning once; Safari and Firefox remember that until the
+#     certificate is replaced, Chrome and Edge ask again after about a week
 # zmNinja / zmNinjaNg: Android apps ignore user-installed CAs. In classic zmNinja leave
 # Developer Options > "Enable strict SSL" off (it then accepts this certificate); portal
 # https://10.10.100.100/zm, event server wss://10.10.100.100/zm/ws.
-# The root CA is valid for 10 years; the leaf certificate renews itself.
+# The root CA is valid until 2036. Do not go back to `tls internal` without reading the above.
 
 {
 	# plain http://10.10.100.100 redirects here; nothing else on this box serves 80/443
 	# on this address (Apache is on :8081)
 	default_bind 10.10.100.100
+
+	# no HTTP/3: requests from the iPhone app over QUIC took 12-20 s each (2026-10-25) for
+	# JSON that HTTP/2 returns at once
+	servers {
+		protocols h1 h2
+	}
 }
 
 10.10.100.100, securityserver {
-	tls internal
+	tls /etc/caddy/certs/zmng.crt /etc/caddy/certs/zmng.key
 
 	# Caddy's default match compresses text/JSON/JS only; video and JPEG pass untouched
 	encode zstd gzip
