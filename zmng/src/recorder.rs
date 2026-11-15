@@ -437,6 +437,8 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     let mut stat_frames = 0u32;
     let mut stat_bytes = 0u64;
     let seg_len_dts = ctx.segment_secs as i64 * TIMESCALE as i64;
+    // segments being fsynced and indexed while the next one records
+    let mut closes = Closes::new();
 
     let result: Result<()> = async {
     loop {
@@ -585,8 +587,25 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
                 flush_gop(&mut gop, &mut agop, &mut seg, h)?;
                 let must_close = seg.as_ref().map(|s| dts - s.start_dts >= seg_len_dts).unwrap_or(false) || force_new_segment;
                 if must_close {
-                    close_segment(ctx, h, cam, storage, sample_entry_id, seg.take()).await?;
+                    // Never wait for the fsync or the index here. While this
+                    // task waits it does not read the camera; the camera's
+                    // send buffer fills and (Hikvision) it corrupts the
+                    // interleaved stream, so a slow disk or a busy index lock
+                    // used to cost a reconnect and 20-90 s of footage on every
+                    // camera at once.
+                    close_segment_bg(&mut closes, ctx, h, cam, storage, sample_entry_id, seg.take());
                     force_new_segment = false;
+                }
+                // a close that failed ends the session, as it did when it was awaited
+                while let Some(r) = closes.try_join_next() {
+                    r.map_err(|e| anyhow::anyhow!("closing segment: {e}"))??;
+                }
+                if closes.len() > MAX_PENDING_CLOSES {
+                    // the index has been unreachable for minutes: stop piling up
+                    warn!(camera = cam.id, pending = closes.len(), "segments are not being indexed; waiting for the index");
+                    if let Some(r) = closes.join_next().await {
+                        r.map_err(|e| anyhow::anyhow!("closing segment: {e}"))??;
+                    }
                 }
             }
         } else if gop.is_empty() && seg.is_none() && pending.is_none() {
@@ -616,8 +635,16 @@ async fn record_session(ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera
     }
     .await;
 
-    // Whatever ended the session, index what was recorded: the pending sample
-    // (duration estimated from the previous one) and the open segment.
+    // Whatever ended the session, index what was recorded: the segments still
+    // closing, then the pending sample (duration estimated from the previous
+    // one) and the open segment.
+    while let Some(r) = closes.join_next().await {
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(camera = cam.id, "closing segment at session end: {e:#}"),
+            Err(e) => warn!(camera = cam.id, "closing segment at session end: {e}"),
+        }
+    }
     if seg.is_some() || !gop.is_empty() {
         if let Some(prev) = pending.take() {
             let dur = gop.last().map(|x| x.duration).unwrap_or(TIMESCALE / 18);
@@ -725,6 +752,22 @@ fn flush_gop(gop: &mut Vec<Sample>, agop: &mut Vec<Sample>, seg: &mut Option<Ope
     Ok(())
 }
 
+/// Closes in flight for one recording session.
+type Closes = tokio::task::JoinSet<Result<()>>;
+
+/// More closes than this still waiting means the index has been stuck for
+/// minutes; the session then waits for it rather than queueing without bound.
+const MAX_PENDING_CLOSES: usize = 4;
+
+/// Close a segment without making the session wait for it.
+fn close_segment_bg(closes: &mut Closes, ctx: &Arc<RecorderCtx>, h: &Arc<CamHandle>, cam: &Camera, storage: &Storage, sample_entry_id: i64, seg: Option<OpenSegment>) {
+    if seg.is_none() {
+        return;
+    }
+    let (ctx, h, cam, storage) = (ctx.clone(), h.clone(), cam.clone(), storage.clone());
+    closes.spawn(async move { close_segment(&ctx, &h, &cam, &storage, sample_entry_id, seg).await });
+}
+
 /// Close a segment: recompute per-fragment motion (the detector may have
 /// delivered scores after the fragment was flushed), fsync and index it.
 /// fsync + SQLite are blocking, so this runs on the blocking pool.
@@ -754,7 +797,23 @@ async fn close_segment(
             let _ = std::fs::remove_file(&s.abs_path);
             return Ok(());
         }
-        let id = ctx.db.insert_segment_ext(cam.id, storage.id, sample_entry_id, &s.rel_path, s.pos as i64, s.init_len, &s.frags, 0, None, kind.as_str())?;
+        // The file is complete and synced; only its index row is missing. A
+        // write lock held elsewhere for longer than busy_timeout must not
+        // cost the footage (the row would only come back at the next start,
+        // by reindex) or the session: this no longer runs in the capture
+        // loop, so waiting is free.
+        let mut attempt = 0u32;
+        let id = loop {
+            match ctx.db.insert_segment_ext(cam.id, storage.id, sample_entry_id, &s.rel_path, s.pos as i64, s.init_len, &s.frags, 0, None, kind.as_str()) {
+                Ok(id) => break id,
+                Err(e) if crate::db::is_busy(&e) && attempt < 8 => {
+                    attempt += 1;
+                    warn!(camera = cam.id, path = %s.rel_path, attempt, "index busy; retrying the segment's row");
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let dur = s.frags.last().map(|f| f.dts + f.duration as i64).unwrap_or(s.start_dts) - s.start_dts;
         debug!(camera = cam.id, segment = id, path = %s.rel_path, secs = dur / TIMESCALE as i64, bytes = s.pos, frags = s.frags.len(), "closed segment");
         Ok(())

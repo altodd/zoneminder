@@ -127,3 +127,66 @@ fn retention_paging_seeks_on_the_index() {
         assert!(!text.contains("TEMP B-TREE"), "{sql}: {text}");
     }
 }
+
+/// Retention and the API read on their own connections: a long query there
+/// must not make a recorder wait to index its segment, and everyone sees
+/// everyone's commits.
+#[test]
+fn another_connection_has_its_own_lock_and_sees_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = zmng::db::Db::open(&dir.path().join("zmng.db")).unwrap();
+    let st = db.add_storage(dir.path().to_str().unwrap(), None, 0).unwrap();
+    let cam = db.add_camera("c", "rtsp://x/1", None, st).unwrap();
+    let se = db.intern_sample_entry(zmng::mp4::Codec::H264, "avc1.64001e", 640, 360, b"x", None).unwrap();
+    let slow = db.another().unwrap();
+    // something slow holds the second connection's lock...
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slow2 = slow.clone();
+    let t = std::thread::spawn(move || {
+        slow2
+            .with(|c| {
+                let n: i64 = c.query_row("SELECT COUNT(*) FROM segment", [], |r| r.get(0))?;
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                Ok(n)
+            })
+            .unwrap()
+    });
+    rx.recv().unwrap();
+    // ...and the first connection indexes a segment meanwhile without waiting
+    let t0 = std::time::Instant::now();
+    let idx = vec![zmng::mp4::FragEntry { dts: 1000, duration: 90_000, offset: 0, len: 10, samples: 1, motion: 0 }];
+    let seg = db.insert_segment_ext(cam, st, se, "1/x.mp4", 10, 0, &idx, 0, None, "main").unwrap();
+    assert!(t0.elapsed() < std::time::Duration::from_millis(400), "the insert waited for the other connection: {:?}", t0.elapsed());
+    assert_eq!(t.join().unwrap(), 0);
+    // commits are visible both ways
+    assert!(slow.segment(seg).unwrap().is_some());
+    slow.delete_segment(seg).unwrap();
+    assert!(db.segment(seg).unwrap().is_none());
+    assert_eq!(db.storage_used_bytes(st).unwrap(), 0);
+}
+
+/// Writers on separate connections queue for the write lock; none of them
+/// may fail with SQLITE_BUSY (a deferred transaction that read first did).
+#[test]
+fn concurrent_writers_on_separate_connections_do_not_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = zmng::db::Db::open(&dir.path().join("zmng.db")).unwrap();
+    let a = db.add_storage(&dir.path().join("a").to_string_lossy(), None, 0).unwrap();
+    let b = db.add_storage(&dir.path().join("b").to_string_lossy(), None, 0).unwrap();
+    let cam = db.add_camera("c", "rtsp://x/1", None, a).unwrap();
+    let se = db.intern_sample_entry(zmng::mp4::Codec::H264, "avc1.64001e", 640, 360, b"x", None).unwrap();
+    let idx = |i: i64| vec![zmng::mp4::FragEntry { dts: i * 90_000, duration: 90_000, offset: 0, len: 10, samples: 1, motion: 0 }];
+    let n = 400i64;
+    let ids: Vec<i64> = (0..n).map(|i| db.insert_segment_ext(cam, a, se, &format!("1/{i}.mp4"), 10, 0, &idx(i), 0, None, "main").unwrap()).collect();
+    let (recorder, tier, retention) = (db.clone(), db.another().unwrap(), db.another().unwrap());
+    let ids2 = ids.clone();
+    let w1 = std::thread::spawn(move || (n..2 * n).map(|i| recorder.insert_segment_ext(cam, a, se, &format!("1/{i}.mp4"), 10, 0, &idx(i), 0, None, "main").map(|_| ())).collect::<Result<Vec<_>, _>>().map(|_| ()));
+    let w2 = std::thread::spawn(move || ids2.iter().filter(|id| *id % 2 == 0).map(|id| tier.move_segment(*id, b).map(|_| ())).collect::<Result<Vec<_>, _>>().map(|_| ()));
+    let w3 = std::thread::spawn(move || ids.iter().filter(|id| *id % 2 == 1).map(|id| retention.delete_segment(*id)).collect::<Result<Vec<_>, _>>().map(|_| ()));
+    for w in [w1, w2, w3] {
+        w.join().unwrap().unwrap();
+    }
+    assert_eq!(db.storage_used_bytes(a).unwrap(), n * 10);
+    assert_eq!(db.storage_used_bytes(b).unwrap(), n / 2 * 10);
+}
