@@ -294,7 +294,18 @@ fn run(cfg: config::Config) -> Result<()> {
     rt.block_on(async move {
         // held for the life of the process; `restore` refuses to run while it is taken
         let _service_lock = health::ServiceLock::acquire(&cfg.db_path)?;
+        // One connection per job. The recorders and detectors index what they
+        // capture on `db`; the API, retention and tiering each get their own,
+        // so nothing they do (a sweep over months of footage, a timeline
+        // query, a cold read of the index) can hold the lock a recorder needs
+        // to close its segment.
         let db = db::Db::open(&cfg.db_path)?;
+        let db_api = db.another()?;
+        let db_retention = db.another()?;
+        let db_tier = db.another()?;
+        if cfg.pin_index {
+            zmng::pin::spawn(cfg.db_path.clone());
+        }
         let closed = db.close_stale_events()?;
         if closed > 0 {
             info!(closed, "closed events left open by previous run");
@@ -311,7 +322,7 @@ fn run(cfg: config::Config) -> Result<()> {
             tokio::spawn(notify::webhook_sink(bus.subscribe(), url));
         }
         if let Some(m) = cfg.mqtt.clone() {
-            tokio::spawn(notify::mqtt_sink(bus.subscribe(), db.clone(), m, hub.clone(), bus.clone()));
+            tokio::spawn(notify::mqtt_sink(bus.subscribe(), db_api.clone(), m, hub.clone(), bus.clone()));
         }
         bus.publish(notify::Notification::ServiceStarted { version: env!("CARGO_PKG_VERSION").into() });
         let rctx = Arc::new(recorder::RecorderCtx {
@@ -337,15 +348,15 @@ fn run(cfg: config::Config) -> Result<()> {
         *hub.objects.write() = dctx.objects.clone();
         detect::reconcile(dctx.clone()).await?;
 
-        // periodic: retention + reconcile (picks up camera changes made via API) + alerts + backup
+        // periodic: reconcile (picks up camera changes made via API) + alerts + backup
         {
-            let db = db.clone();
+            let db = db_api.clone();
             let rctx = rctx.clone();
             let dctx = dctx.clone();
-            let thumb_dir = cfg.thumb_dir.clone();
             let hub = hub.clone();
             let bus = bus.clone();
             let alert_after = cfg.alert_after_minutes as i64 * 60 * 90_000;
+            let started = db::now_dts();
             let backup_to = health::backup_path(&cfg);
             let db_path = cfg.db_path.clone();
             tokio::spawn(async move {
@@ -368,11 +379,11 @@ fn run(cfg: config::Config) -> Result<()> {
                         })
                         .collect();
                     for (id, name, last, connected) in cams {
-                        let is_down = !connected || (last > 0 && now - last > alert_after) || (last == 0);
+                        let (is_down, silent) = camera_down(now, started, last, connected, alert_after);
                         let was_down = down.contains(&id);
-                        if is_down && !was_down && last != 0 {
+                        if is_down && !was_down {
                             down.insert(id);
-                            tracing::warn!(camera = id, %name, "camera down: no frames for {} min", (now - last) / 90_000 / 60);
+                            tracing::warn!(camera = id, %name, "camera down: no frames for {} min", silent / 90_000 / 60);
                             bus.publish(notify::Notification::CameraDown { camera_id: id, name });
                         } else if !is_down && was_down {
                             down.remove(&id);
@@ -408,14 +419,30 @@ fn run(cfg: config::Config) -> Result<()> {
                     if let Err(e) = detect::reconcile(dctx.clone()).await {
                         tracing::error!("reconcile detectors: {e:#}");
                     }
-                    let db2 = db.clone();
-                    let td = thumb_dir.clone();
-                    let r = tokio::task::spawn_blocking(move || retention::run_once(&db2, &td)).await;
-                    match r {
+                }
+            });
+        }
+
+        // retention runs on its own task and its own connection: a pass that
+        // takes minutes must not delay the camera-down check or reconcile
+        // above, and must not hold the recorders' lock
+        {
+            let db = db_retention;
+            let thumb_dir = cfg.thumb_dir.clone();
+            tokio::spawn(async move {
+                loop {
+                    let t0 = std::time::Instant::now();
+                    let (db2, td) = (db.clone(), thumb_dir.clone());
+                    match tokio::task::spawn_blocking(move || retention::run_once(&db2, &td)).await {
                         Ok(Err(e)) => tracing::error!("retention: {e:#}"),
                         Err(e) => tracing::error!("retention task: {e}"),
                         _ => {}
                     }
+                    let took = t0.elapsed();
+                    if took > std::time::Duration::from_secs(60) {
+                        tracing::warn!(secs = took.as_secs(), "retention pass was slow");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30).saturating_sub(took).max(std::time::Duration::from_secs(5))).await;
                 }
             });
         }
@@ -424,7 +451,7 @@ fn run(cfg: config::Config) -> Result<()> {
         // hold up alerts, reconcile or retention, and a pass that hit its
         // limit runs again at once instead of waiting for the next tick
         {
-            let db = db.clone();
+            let db = db_tier;
             tokio::spawn(async move {
                 loop {
                     let db2 = db.clone();
@@ -469,6 +496,44 @@ fn run(cfg: config::Config) -> Result<()> {
             });
         }
 
-        api::serve(cfg, db, hub, bus).await
+        api::serve(cfg, db_api, hub, bus).await
     })
+}
+
+/// Whether a camera counts as down for alerting, and how long it has been
+/// silent (90 kHz ticks). Only silence longer than `alert_after` counts: a
+/// session that dropped and is reconnecting has `connected == false` for a
+/// second or two, and paging "not recording" for that sent hundreds of false
+/// alarms. A camera that has produced nothing since this process started is
+/// measured from the start, so one that never comes up is reported too.
+fn camera_down(now: i64, started: i64, last_frame: i64, _connected: bool, alert_after: i64) -> (bool, i64) {
+    let silent = now - if last_frame > 0 { last_frame } else { started };
+    (silent > alert_after, silent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::camera_down;
+    const MIN: i64 = 60 * 90_000;
+
+    #[test]
+    fn a_reconnecting_camera_is_not_down_until_the_grace_has_passed() {
+        let (now, started, after) = (100 * MIN, 0, 3 * MIN);
+        // session dropped 20 s ago and is reconnecting
+        assert!(!camera_down(now, started, now - MIN / 3, false, after).0);
+        // connected, frames flowing
+        assert!(!camera_down(now, started, now - 90_000, true, after).0);
+        // nothing for four minutes, connected or not
+        assert!(camera_down(now, started, now - 4 * MIN, false, after).0);
+        assert!(camera_down(now, started, now - 4 * MIN, true, after).0);
+    }
+
+    #[test]
+    fn a_camera_that_never_came_up_is_down_after_the_grace_from_start() {
+        let after = 3 * MIN;
+        assert!(!camera_down(MIN, 0, 0, false, after).0);
+        let (down, silent) = camera_down(5 * MIN, 0, 0, false, after);
+        assert!(down);
+        assert_eq!(silent, 5 * MIN);
+    }
 }

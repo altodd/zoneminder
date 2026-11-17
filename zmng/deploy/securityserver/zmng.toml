@@ -16,6 +16,8 @@ alert_after_minutes = 3
 preview_secs = 5
 public_url = "https://10.10.100.100"
 mjpeg_max_streams = 32        # classic zmNinja montage: one MJPEG stream per tile (23 cameras)
+pin_index = true              # keep the ~3 GB index locked in memory (unit: LimitMEMLOCK=infinity); the
+                              # recordings' page cache kept evicting it and the next query waited on the disk
 
 # The Quadro P2200 is zmng's: NVDEC decodes the HEVC main stream and NVENC encodes the
 # H.264 fallback for browsers without HEVC (Firefox, older Windows).

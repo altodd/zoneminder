@@ -367,9 +367,26 @@ pub struct ApiToken {
     pub last_used_at: Option<i64>,
 }
 
+/// One connection to the index behind a lock. Cloning shares that connection;
+/// [`Db::another`] opens a further one, so slow readers (retention, the UI)
+/// never make the recorders wait for the lock.
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+    /// where the index lives (None: opened read-only by a tool)
+    path: Option<Arc<std::path::PathBuf>>,
+}
+
+const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; \
+     PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;";
+
+/// A write transaction that takes the write lock at BEGIN. With several
+/// connections in one process, a deferred transaction that reads first and
+/// writes later fails at once with SQLITE_BUSY_SNAPSHOT when another
+/// connection commits in between; BEGIN IMMEDIATE waits (`busy_timeout`)
+/// instead.
+fn write_tx(c: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)
 }
 
 /// Filters for [`Db::events_q`].
@@ -538,6 +555,51 @@ pub fn now_secs() -> i64 {
 /// bound `start_dts` from below by it so an index covers the window.
 pub const MAX_SPAN: i64 = 4 * 3600 * mp4::TIMESCALE as i64;
 
+/// Is a segment pinned by an event? Asked in two steps, because retention
+/// asks it for every old segment it looks at (thousands a pass).
+///
+/// NEAR looks only at events that start within MAX_SPAN before the segment:
+/// a few rows of (camera, start). Almost every segment that is pinned is
+/// pinned by such an event, so the answer is usually yes, at once.
+///
+/// MAX_SPAN is not a guarantee, though: ZoneMinder events imported in place
+/// can run for half a day. So "no" from NEAR is confirmed by ANY, which has
+/// no lower bound and walks the camera's older events. That is the walk
+/// every check used to make (202 s a pass on securityserver); now it is
+/// made only for segments that are about to be deleted.
+const SEGMENT_PINNED_NEAR_SQL: &str = "SELECT 1 FROM event WHERE camera_id=?1 AND start_dts>?5 AND start_dts<?3 AND end_dts IS NOT NULL AND end_dts>?2 \
+     AND (archived=1 OR (end_dts>?4 AND kind<>'zm')) LIMIT 1";
+const SEGMENT_PINNED_ANY_SQL: &str = "SELECT 1 FROM event WHERE camera_id=?1 AND start_dts<?3 AND end_dts IS NOT NULL AND end_dts>?2 \
+     AND (archived=1 OR (end_dts>?4 AND kind<>'zm')) LIMIT 1";
+const SEGMENT_ARCHIVED_NEAR_SQL: &str = "SELECT 1 FROM event WHERE camera_id=?1 AND start_dts>?4 AND start_dts<?3 AND archived=1 AND end_dts IS NOT NULL AND end_dts>?2 LIMIT 1";
+const SEGMENT_ARCHIVED_ANY_SQL: &str = "SELECT 1 FROM event WHERE camera_id=?1 AND start_dts<?3 AND archived=1 AND end_dts IS NOT NULL AND end_dts>?2 LIMIT 1";
+
+/// Events that may have no main-stream footage left: none that starts
+/// within MAX_SPAN before the event (a few rows of (camera, stream, start)).
+/// Candidates only, for the same reason as above: an imported segment
+/// longer than MAX_SPAN can still cover the event, which
+/// [`Db::orphan_events`] checks with EVENT_FOOTAGE_ANY before it believes
+/// one. Asked without the lower bound for every event, as it used to be,
+/// the search walked every later segment of the camera for each event that
+/// had none, in one statement, with the lock held.
+const ORPHAN_CANDIDATES_SQL: &str = "SELECT * FROM event e WHERE camera_id=?1 AND archived=0 AND end_dts IS NOT NULL AND end_dts<?2 \
+     AND (start_dts, id) > (?5, ?6) \
+     AND NOT EXISTS (SELECT 1 FROM segment s INDEXED BY segment_cam_stream_start WHERE s.camera_id=e.camera_id AND s.stream='main' \
+                     AND s.start_dts<e.end_dts AND s.start_dts>e.start_dts-?4 AND s.end_dts>e.start_dts) \
+     ORDER BY start_dts, id LIMIT ?3";
+const EVENT_FOOTAGE_ANY_SQL: &str = "SELECT 1 FROM segment WHERE camera_id=?1 AND stream='main' AND end_dts>?2 AND start_dts<?3 LIMIT 1";
+
+/// True when `e` is SQLite saying another connection held the write lock for
+/// longer than `busy_timeout`: worth retrying, nothing is wrong with the data.
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _)) if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    })
+}
+
 pub fn now_dts() -> i64 {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -548,10 +610,7 @@ pub fn now_dts() -> i64 {
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; \
-             PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;",
-        )?;
+        conn.execute_batch(PRAGMAS)?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         conn.execute_batch(INDEXES)?;
@@ -559,7 +618,20 @@ impl Db {
             "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
-        Ok(Db { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Db { conn: Arc::new(Mutex::new(conn)), path: Some(Arc::new(path.to_path_buf())) })
+    }
+
+    /// A further connection to the same index, with its own lock. SQLite's
+    /// WAL lets any number of connections read while one writes, so a long
+    /// query here (a retention sweep, a timeline over months) does not hold
+    /// up a recorder indexing a segment on its own connection; two writers
+    /// queue for at most `busy_timeout`. A read-only handle has no path to
+    /// reopen and shares its connection instead.
+    pub fn another(&self) -> Result<Db> {
+        let Some(path) = self.path.as_ref() else { return Ok(self.clone()) };
+        let conn = Connection::open(path.as_path()).with_context(|| format!("opening {}", path.display()))?;
+        conn.execute_batch(PRAGMAS)?;
+        Ok(Db { conn: Arc::new(Mutex::new(conn)), path: Some(path.clone()) })
     }
 
     /// Open without creating, migrating or writing anything (doctor, tools
@@ -568,12 +640,30 @@ impl Db {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
-        Ok(Db { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Db { conn: Arc::new(Mutex::new(conn)), path: None })
     }
 
+    /// Run `f` on this connection. Every call can block: on the lock while
+    /// another task uses the connection, on the disk, or in SQLite's busy
+    /// handler while another connection holds the write lock. Much of zmng
+    /// calls this straight from async tasks (detectors, API handlers), and a
+    /// runtime worker that blocks keeps the tasks queued behind it from
+    /// running: with enough workers waiting here, nothing reads the cameras.
+    /// So on the multi-threaded runtime the call is declared blocking, which
+    /// lets the runtime move the worker's other tasks to another thread
+    /// first. (A no-op on the blocking pool; a current-thread runtime, as in
+    /// most tests, cannot do this and just waits.)
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let c = self.conn.lock();
-        f(&c)
+        let run = || {
+            let c = self.conn.lock();
+            f(&c)
+        };
+        let multi_thread = tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread).unwrap_or(false);
+        if multi_thread {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        }
     }
 
     // ----- storage -----------------------------------------------------------
@@ -668,7 +758,7 @@ impl Db {
     /// or already lives on `storage_id`; nothing is changed then.
     pub fn move_segment(&self, id: i64, storage_id: i64) -> Result<bool> {
         self.with(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = write_tx(c)?;
             let cur: Option<(i64, i64)> = tx.query_row("SELECT storage_id, bytes FROM segment WHERE id=?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             let Some((from, bytes)) = cur else { return Ok(false) };
             if from == storage_id {
@@ -715,13 +805,14 @@ impl Db {
     /// True if any event overlaps the segment and is archived or ended after `event_cutoff`.
     pub fn segment_pinned(&self, seg: &Segment, event_cutoff: i64) -> Result<bool> {
         self.with(|c| {
-            Ok(c.query_row(
-                "SELECT 1 FROM event WHERE camera_id=?1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 AND (archived=1 OR (end_dts>?4 AND kind<>'zm')) LIMIT 1",
-                params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+            let near = c
+                .query_row(SEGMENT_PINNED_NEAR_SQL, params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff, seg.start_dts - MAX_SPAN], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if near {
+                return Ok(true);
+            }
+            Ok(c.query_row(SEGMENT_PINNED_ANY_SQL, params![seg.camera_id, seg.start_dts, seg.end_dts, event_cutoff], |_| Ok(())).optional()?.is_some())
         })
     }
 
@@ -729,13 +820,14 @@ impl Db {
     /// the space budget honours (motion pins only hold against age retention).
     pub fn segment_in_archived_event(&self, seg: &Segment) -> Result<bool> {
         self.with(|c| {
-            Ok(c.query_row(
-                "SELECT 1 FROM event WHERE camera_id=?1 AND archived=1 AND end_dts IS NOT NULL AND end_dts>?2 AND start_dts<?3 LIMIT 1",
-                params![seg.camera_id, seg.start_dts, seg.end_dts],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+            let near = c
+                .query_row(SEGMENT_ARCHIVED_NEAR_SQL, params![seg.camera_id, seg.start_dts, seg.end_dts, seg.start_dts - MAX_SPAN], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if near {
+                return Ok(true);
+            }
+            Ok(c.query_row(SEGMENT_ARCHIVED_ANY_SQL, params![seg.camera_id, seg.start_dts, seg.end_dts], |_| Ok(())).optional()?.is_some())
         })
     }
 
@@ -969,7 +1061,7 @@ impl Db {
         let frames: i64 = index.iter().map(|f| f.samples as i64).sum();
         let motion_max = index.iter().map(|f| f.motion).max().unwrap_or(0);
         self.with(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = write_tx(c)?;
             tx.execute(
                 "INSERT INTO segment(camera_id,storage_id,sample_entry_id,start_dts,end_dts,path,bytes,init_len,frames,motion_max,index_blob,dts_offset,zm_event_id,stream,created_at) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
@@ -1088,7 +1180,7 @@ impl Db {
 
     pub fn delete_segment(&self, id: i64) -> Result<()> {
         self.with(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = write_tx(c)?;
             tx.execute("UPDATE storage SET used_bytes=used_bytes-COALESCE((SELECT bytes FROM segment WHERE id=?1),0) WHERE id=(SELECT storage_id FROM segment WHERE id=?1)", params![id])?;
             tx.execute("DELETE FROM segment WHERE id=?1", params![id])?;
             tx.commit()?;
@@ -1374,15 +1466,33 @@ impl Db {
     /// remove an unpinned stretch while older, pinned segments remain, so
     /// "older than the oldest segment" is not enough.
     pub fn orphan_events(&self, camera_id: i64, before_dts: i64, limit: usize) -> Result<Vec<Event>> {
-        self.with(|c| {
-            let mut st = c.prepare(
-                "SELECT * FROM event e WHERE camera_id=?1 AND archived=0 AND end_dts IS NOT NULL AND end_dts<?2 \
-                 AND NOT EXISTS (SELECT 1 FROM segment s WHERE s.camera_id=e.camera_id AND s.stream='main' AND s.end_dts>e.start_dts AND s.start_dts<e.end_dts) \
-                 ORDER BY start_dts LIMIT ?3",
-            )?;
-            let rows = st.query_map(params![camera_id, before_dts, limit as i64], Self::row_event)?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-        })
+        // candidates a page at a time, each confirmed against all of the
+        // camera's footage; the lock is released between statements
+        let mut out = Vec::new();
+        let (mut after, mut looked) = ((i64::MIN, i64::MIN), 0usize);
+        while out.len() < limit && looked < limit.max(1) * 10 {
+            let page: Vec<Event> = self.with(|c| {
+                let mut st = c.prepare_cached(ORPHAN_CANDIDATES_SQL)?;
+                let rows = st.query_map(params![camera_id, before_dts, 200i64, MAX_SPAN, after.0, after.1], Self::row_event)?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })?;
+            if page.is_empty() {
+                break;
+            }
+            for e in page {
+                looked += 1;
+                after = (e.start_dts, e.id);
+                let end = e.end_dts.unwrap_or(e.start_dts);
+                let has_footage = self.with(|c| Ok(c.query_row(EVENT_FOOTAGE_ANY_SQL, params![camera_id, e.start_dts, end], |_| Ok(())).optional()?.is_some()))?;
+                if !has_footage {
+                    out.push(e);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Close any events left open by a crash.
@@ -1528,7 +1638,7 @@ impl Db {
 
     pub fn set_user_groups(&self, user_id: i64, groups: &[String]) -> Result<()> {
         self.with(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = write_tx(c)?;
             tx.execute("DELETE FROM user_group WHERE user_id=?1", params![user_id])?;
             for g in groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
                 tx.execute("INSERT OR IGNORE INTO user_group(user_id,name) VALUES(?1,?2)", params![user_id, g])?;
@@ -1594,7 +1704,7 @@ impl Db {
     pub fn rename_group(&self, from: &str, to: Option<&str>) -> Result<usize> {
         let from_l = from.trim().to_lowercase();
         self.with(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = write_tx(c)?;
             let rows: Vec<(i64, String)> = {
                 let mut st = tx.prepare("SELECT id, tags FROM camera")?;
                 let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -1857,5 +1967,37 @@ mod tests {
         let d = std::env::temp_dir().join(format!("zmng-test-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn plan(c: &Connection, sql: &str, n: usize) -> String {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args: Vec<i64> = (0..n as i64).collect();
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3)).unwrap();
+        rows.map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+    }
+
+    /// The two checks retention runs for every old segment and event must be
+    /// range searches bounded on both sides, not walks over a camera's history.
+    #[test]
+    fn retention_checks_are_two_sided_index_ranges() {
+        let dir = std::env::temp_dir().join(format!("zmng-plan-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("zmng.db")).unwrap();
+        db.with(|c| {
+            for (sql, n) in [(SEGMENT_PINNED_NEAR_SQL, 5), (SEGMENT_ARCHIVED_NEAR_SQL, 4)] {
+                let p = plan(c, sql, n);
+                assert!(p.contains("event_cam_start (camera_id=? AND start_dts>? AND start_dts<?)"), "{p}");
+            }
+            let orphans = plan(c, ORPHAN_CANDIDATES_SQL, 6);
+            assert!(orphans.contains("segment_cam_stream_start (camera_id=? AND stream=? AND start_dts>? AND start_dts<?)"), "{orphans}");
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -16,6 +16,7 @@ pub mod notify;
 pub mod objects;
 pub mod onvif;
 pub mod peers;
+pub mod pin;
 pub mod preview;
 pub mod recorder;
 pub mod retention;

@@ -26,12 +26,18 @@ RestartSec=3
 LimitNOFILE=65536
 # the index holds RTSP credentials
 UMask=0077
-# zmng is this box's main workload: no nice/CPU-weight penalty. The page cache of ~0.7 TB/day
-# of writes is charged to the unit: MemoryHigh starts reclaim early so the recorders never
-# stall on it, MemoryMax leaves ~30 GB of the 125 GB for MySQL, Docker (WireGuard, Pi-hole,
+# zmng is this box's main workload: no nice/CPU-weight penalty, and it may have most of the
+# memory. The page cache of ~0.85 TB/day of writes is charged to the unit. MemoryHigh is
+# off: at 64G it throttled every thread of the unit while the kernel reclaimed, which stalled
+# the recorders (2026-11-06; it had only been lifted at runtime, so each reboot brought it
+# back). MemoryMax still leaves ~30 GB of the 125 GB for MySQL, Docker (WireGuard, Pi-hole,
 # church Home Assistant) and the OS.
-MemoryHigh=64G
+MemoryHigh=infinity
 MemoryMax=96G
+# pin_index = true in zmng.toml: the index is mlock()ed so that reclaim under MemoryMax
+# cannot evict it; never let it go to swap either
+LimitMEMLOCK=infinity
+MemorySwapMax=0
 TasksMax=4096
 ProtectSystem=strict
 ReadWritePaths=/var/lib/zmng /var/cache/zoneminder/events /media/zmoverflow

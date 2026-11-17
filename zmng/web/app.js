@@ -46,19 +46,37 @@ const fmtBytes = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `$
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
+// A request that got no answer (server down, network gone, certificate
+// refused, timed out) throws an error with `.net` set, so callers can tell it
+// from an answer they did not like. `timeout` (ms) bounds the wait for the
+// response headers; without it a request waits as long as the browser does.
 const api = {
-  async req(method, url, body) {
-    const r = await fetch(url, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
-    if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  async req(method, url, body, { timeout = 0 } = {}) {
+    const ac = timeout ? new AbortController() : null;
+    const timer = ac ? setTimeout(() => ac.abort(), timeout) : null;
+    let r;
+    try {
+      r = await fetch(url, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: ac?.signal });
+    } catch (e) {
+      const err = new Error(e.name === 'AbortError' ? `no answer after ${Math.round(timeout / 1000)} s` : (e.message || 'request failed'));
+      err.net = true;
+      throw err;
+    } finally { clearTimeout(timer); }
+    if (r.status === 401) { showLogin(); const err = new Error('unauthorized'); err.auth = true; throw err; }
     const ct = r.headers.get('content-type') || '';
     const data = ct.includes('json') ? await r.json() : await r.text();
-    if (!r.ok) throw new Error(data.error || data || r.statusText);
+    if (!r.ok) {
+      const err = new Error(data.error || (typeof data === 'string' && data.length < 200 ? data : '') || `${r.status} ${r.statusText}`.trim());
+      // the proxy answering for a server that is down or restarting
+      if (r.status >= 502 && r.status <= 504) err.net = true;
+      throw err;
+    }
     return data;
   },
-  get: (u) => api.req('GET', u),
-  post: (u, b) => api.req('POST', u, b),
-  patch: (u, b) => api.req('PATCH', u, b),
-  del: (u) => api.req('DELETE', u),
+  get: (u, o) => api.req('GET', u, undefined, o),
+  post: (u, b, o) => api.req('POST', u, b, o),
+  patch: (u, b, o) => api.req('PATCH', u, b, o),
+  del: (u, o) => api.req('DELETE', u, undefined, o),
 };
 
 const state = { me: null, cameras: [], cleanup: null };
@@ -93,9 +111,16 @@ const mainQuery = (c) => (canPlayMain(c) ? '' : canTranscode(c) ? '&codec=h264' 
 // with timestampOffset so the media timeline starts at 0.
 // ---------------------------------------------------------------------------
 class MsePlayer {
-  constructor(video) { this.video = video; this.abort = null; this.ms = null; this.sb = null; this.queue = []; this.mime = null; this.baseSec = null; this.ended = false; this.onLiveEnded = null; }
-  async play(url, { live = false, startMs = null } = {}) {
+  constructor(video) {
+    this.video = video; this.abort = null; this.ms = null; this.sb = null; this.queue = []; this.mime = null; this.baseSec = null; this.ended = false; this.onLiveEnded = null;
+    // live only: how far behind the newest data to play, and the watchdog's state
+    this.live = false; this.autoResume = false; this.liveLag = 1.5; this.liveTimer = null; this.lastEnd = null; this.lastT = null; this.stuck = 0;
+  }
+  // `autoResume`: start playing again when the browser pauses the video by
+  // itself (a wall tile has no controls; a player with controls is the user's).
+  async play(url, { live = false, startMs = null, autoResume = false } = {}) {
     this.stop();
+    this.live = live; this.autoResume = autoResume;
     const ac = new AbortController(); this.abort = ac;
     const res = await fetch(url, { signal: ac.signal });
     if (!res.ok) throw new Error(`video: ${res.status} ${await res.text()}`);
@@ -110,7 +135,10 @@ class MsePlayer {
     const sb = ms.addSourceBuffer(this.mime); this.sb = sb;
     sb.mode = 'segments';
     sb.timestampOffset = -this.baseSec;
-    sb.addEventListener('updateend', () => this.pump());
+    // The buffer can only be inspected and trimmed between appends: right
+    // after appendBuffer() it is `updating`, so trimming from the read loop
+    // (as this did) never ran and nothing ever brought a live view back.
+    sb.addEventListener('updateend', () => { if (this.live) this.trimLive(); this.pump(); });
     const reader = res.body.getReader();
     (async () => {
       try {
@@ -118,10 +146,15 @@ class MsePlayer {
           const { value, done } = await reader.read();
           if (done) { if (live && this.onLiveEnded && this.ms === ms) this.onLiveEnded(); this.ended = true; this.pump(); break; }
           this.queue.push(value); this.pump();
-          if (live) this.trimLive();
         }
-      } catch (e) { if (e.name !== 'AbortError') console.warn('stream', e); }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        console.warn('stream', e);
+        // the connection dropped: a live view reconnects like one that ended
+        if (live && this.onLiveEnded && this.ms === ms) this.onLiveEnded();
+      }
     })();
+    if (live) { this.lastEnd = null; this.lastT = null; this.stuck = 0; this.liveLag = 1.5; this.liveTimer = setInterval(() => this.tickLive(), 500); }
     this.video.play().catch(() => {});
   }
   pump() {
@@ -138,16 +171,52 @@ class MsePlayer {
       }
     } else if (this.ended) { try { this.ms.endOfStream(); } catch {} this.ended = false; }
   }
+  // Live fragments arrive one whole GOP at a time (0.3 s on a substream, 1-2.5 s
+  // on a main stream) and the stream starts on the newest one, so a player at
+  // 1x sits a fraction of a fragment from running dry. Play `liveLag` behind
+  // the newest data instead: about one and a half fragments, learned from how
+  // the buffer grows.
   trimLive() {
     const v = this.video, sb = this.sb; if (!sb || sb.updating) return;
     const b = sb.buffered; if (!b.length) return;
     const end = b.end(b.length - 1);
-    if (end - v.currentTime > 4) v.currentTime = end - 0.5;
+    if (this.lastEnd !== null && end > this.lastEnd) this.liveLag = Math.min(6, Math.max(1, this.liveLag * 0.9, (end - this.lastEnd) * 1.5));
+    this.lastEnd = end;
+    // far behind (the tab was in the background, the machine slept): skip to live
+    if (end - v.currentTime > this.liveLag + 6) v.currentTime = end - this.liveLag;
     if (b.start(0) < end - 30) { try { sb.remove(0, end - 20); } catch {} }
+  }
+  // Twice a second while live: hold the cushion with small speed changes, and
+  // get a stuck picture moving again. A recorder that reconnected leaves a
+  // hole in the timeline that no browser plays across, and Safari can stay
+  // stalled after running dry even once more data is buffered.
+  tickLive() {
+    const v = this.video; if (!this.sb || !v) return;
+    const b = v.buffered; if (!b.length) return;
+    const t = v.currentTime, end = b.end(b.length - 1);
+    if (v.paused) { if (this.autoResume && !document.hidden) v.play().catch(() => {}); this.lastT = t; this.stuck = 0; return; }
+    let cur = -1;
+    for (let i = 0; i < b.length; i++) if (t >= b.start(i) - 0.05 && t < b.end(i)) { cur = i; break; }
+    const ahead = cur >= 0 ? b.end(cur) - t : 0;
+    this.stuck = t === this.lastT ? this.stuck + 1 : 0; this.lastT = t;
+    if (cur < 0 || (cur < b.length - 1 && ahead < 0.2)) {
+      // before the first data, or at the end of a range with newer footage past a hole
+      const next = [...Array(b.length).keys()].find((i) => b.start(i) > t);
+      if (next !== undefined && (cur < 0 || this.stuck >= 1)) { v.currentTime = Math.max(b.start(next) + 0.05, end - this.liveLag); this.stuck = 0; }
+    } else if (this.stuck >= 4 && ahead > 0.4) {
+      // two seconds without moving although there is data ahead
+      v.currentTime = t + 0.1; this.stuck = 0;
+      v.play().catch(() => {});
+    }
+    const rate = ahead < this.liveLag * 0.5 ? 0.9 : ahead > this.liveLag + 1.5 ? 1.1 : 1;
+    if (v.playbackRate !== rate) v.playbackRate = rate;
   }
   wallMs() { return this.baseSec === null ? null : (this.baseSec + this.video.currentTime) * 1000; }
   stop() {
     if (this.abort) this.abort.abort(); this.abort = null;
+    clearInterval(this.liveTimer); this.liveTimer = null;
+    if (this.live && this.video.playbackRate !== 1) this.video.playbackRate = 1;
+    this.live = false;
     this.queue = []; this.ended = false;
     if (this.ms && this.ms.readyState === 'open') { try { this.ms.endOfStream(); } catch {} }
     this.ms = null; this.sb = null; this.baseSec = null;
@@ -796,7 +865,7 @@ async function viewLive(main) {
     grid.append(tile);
     if (mode === 'sub' && support.h264Mse && c.sub_status?.connected) {
       const v = h('video', { muted: true, playsinline: true, autoplay: true }); tile.prepend(v);
-      const p = new MsePlayer(v); const start = () => p.play(`${camApi(c)}/live.mp4?stream=sub`, { live: true }).catch(() => fallbackSnapshot(tile, c));
+      const p = new MsePlayer(v); const start = () => p.play(`${camApi(c)}/live.mp4?stream=sub`, { live: true, autoResume: true }).catch(() => fallbackSnapshot(tile, c));
       p.onLiveEnded = () => setTimeout(start, 2000); start(); players.push(p);
     } else if (mode === 'webrtc' && state.me.go2rtc_url && !c.peer) {
       tile.prepend(h('iframe', { src: `${state.me.go2rtc_url}/stream.html?src=${encodeURIComponent(c.id + '_CameraDirectSecondary')}&mode=webrtc`, style: 'width:100%;height:100%;border:0;background:#000;pointer-events:none', allow: 'autoplay' }));
@@ -1831,7 +1900,10 @@ $('#login-form').addEventListener('submit', async (e) => {
     await boot();
   } catch (err) { $('#login-err').textContent = err.message; }
 });
-$('#logout').addEventListener('click', async () => { await api.post('/api/logout'); location.reload(); });
+// Sign out always does something: whatever the server says (or does not
+// say), the page reloads, and lands on the sign-in form or on the
+// "cannot reach the server" notice.
+$('#logout').addEventListener('click', async () => { try { await api.post('/api/logout', undefined, { timeout: 5000 }); } catch {} location.reload(); });
 $('#account').addEventListener('click', () => { if (state.me?.user) showAccount(); });
 // Armed / disarmed: alert rules marked "only when armed" send while armed
 const drawArmed = () => { const b = $('#armed'); b.textContent = state.me?.armed ? '● Armed' : '○ Disarmed'; b.classList.toggle('armed', !!state.me?.armed); };
@@ -1867,22 +1939,82 @@ function listen() {
   sse.addEventListener('camera_up', (m) => { const e = JSON.parse(m.data); toast(`${e.name}: recording again`, { kind: 'ok' }); });
   sse.addEventListener('storage_low', (m) => { const e = JSON.parse(m.data); toast(`Storage ${e.path} low: ${gb(e.free_bytes)} free`, { kind: 'bad', ttl: 30000 }); });
   sse.addEventListener('armed', (m) => { const e = JSON.parse(m.data); if (state.me) { state.me.armed = e.armed; drawArmed(); } $('#alerts')?._redraw?.(); if (e.by !== state.me?.user?.username) toast(`${e.armed ? 'Armed' : 'Disarmed'} by ${e.by}`); });
+  // The browser reconnects an event stream by itself after a network error,
+  // but gives up for good when the server answers with an error (a session
+  // that expired). Ask who we are: a 401 brings up the sign-in form, anything
+  // else is retried.
+  const mine = sse;
+  sse.onerror = () => {
+    if (mine !== sse || mine.readyState !== EventSource.CLOSED) return;
+    setTimeout(() => { if (mine === sse) api.get('/api/me', { timeout: 10000 }).then(listen, (e) => { if (!e.auth) mine.onerror(); }); }, 5000);
+  };
 }
 
-async function boot() {
-  try { state.me = await api.get('/api/me'); } catch { return; }
-  if (state.me.setup_needed) { showLogin(true); return; }
-  state.cameras = await api.get('/api/cameras');
-  for (const pr of state.me.peers || []) {
-    try { const remote = await api.get(`/api/peers/${pr}/api/cameras`); state.cameras.push(...remote.map((c) => ({ ...c, peer: pr }))); } catch (e) { toast(`Peer ${pr}: ${e.message}`, { kind: 'bad' }); }
-  }
-  document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = state.me.user.role !== 'admin'; });
-  $('#account').textContent = state.me.user.username;
-  drawArmed();
-  listen();
-  route();
+// Starting up. Until the server has said who we are there is nothing to
+// draw, and a failure must never leave an empty page that does nothing:
+// every way of not getting an answer says so in the page, with the reason,
+// and keeps trying. (It used to return silently, and every click after that
+// failed on `state.me` being null.)
+let bootTimer = null, bootTries = 0, booting = false;
+function cannotReach(err) {
+  const wait = Math.min(30, 2 ** Math.min(bootTries, 5));
+  bootTries++;
+  const left = h('span', {}, String(wait));
+  let n = wait;
+  clearInterval(bootTimer);
+  bootTimer = setInterval(() => { n--; left.textContent = String(Math.max(0, n)); if (n <= 0) boot(); }, 1000);
+  $('#main').replaceChildren(h('div', { class: 'card', style: 'max-width:640px;margin:40px auto' },
+    h('h2', { style: 'margin-top:0' }, 'Cannot reach the zmng server'),
+    h('p', { class: 'err' }, err?.message || 'no answer'),
+    h('p', { class: 'muted' }, 'Recording does not depend on this page. Trying again in ', left, ' s.'),
+    h('div', { class: 'row' },
+      h('button', { onclick: () => boot() }, 'Try now'),
+      h('button', { class: 'ghost', title: 'forget the copy of this page kept for offline use and load it from the server', onclick: () => reloadFromServer() }, 'Reload from the server'),
+      h('a', { href: '/api/health', target: '_blank', rel: 'noopener', class: 'muted' }, 'Open the server check in a new tab')),
+    h('p', { class: 'muted small' }, 'If the new tab shows a certificate warning, this browser no longer trusts the server\'s certificate (a certificate accepted by hand stops matching when the server renews it). Accept it there and come back, or install the server\'s root certificate on this device once so it never asks again.')));
 }
+// The page itself can come from the service worker's offline copy while the
+// server is unreachable, which also hides the browser's own explanation (its
+// certificate warning, its "cannot connect" page). Drop that copy and load
+// the page from the network so the browser can say what is wrong.
+async function reloadFromServer() {
+  try {
+    const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+    await Promise.all(regs.map((r) => r.unregister()));
+    if (window.caches) await Promise.all((await caches.keys()).map((k) => caches.delete(k)));
+  } catch {}
+  location.reload();
+}
+async function boot() {
+  if (booting) return;
+  booting = true;
+  clearInterval(bootTimer);
+  try {
+    const me = await api.get('/api/me', { timeout: 10000 });
+    if (me.setup_needed) { state.me = me; showLogin(true); return; }
+    const cameras = await api.get('/api/cameras', { timeout: 20000 });
+    for (const pr of me.peers || []) {
+      try { const remote = await api.get(`/api/peers/${pr}/api/cameras`, { timeout: 15000 }); cameras.push(...remote.map((c) => ({ ...c, peer: pr }))); } catch (e) { toast(`Peer ${pr}: ${e.message}`, { kind: 'bad' }); }
+    }
+    state.me = me; state.cameras = cameras; bootTries = 0;
+    document.querySelectorAll('.admin-only').forEach((el) => { el.hidden = me.user.role !== 'admin'; });
+    $('#account').textContent = me.user.username;
+    drawArmed();
+    listen();
+    booting = false;
+    route();
+  } catch (e) {
+    if (e.auth) return; // the sign-in form is up; signing in boots again
+    state.me = null;
+    cannotReach(e);
+  } finally { booting = false; }
+}
+// back from sleep, or back on the network: do not wait out the countdown
+window.addEventListener('online', () => { if (!state.me) boot(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !state.me && $('#login').hidden) boot(); });
 async function route() {
+  // nothing can be drawn before the server has answered; boot() routes when it has
+  if (!state.me || state.me.setup_needed) return;
   if (state.cleanup) { state.cleanup(); state.cleanup = null; }
   const parts = (location.hash || '#/live').slice(2).split('/');
   let view = parts[0] || 'live';

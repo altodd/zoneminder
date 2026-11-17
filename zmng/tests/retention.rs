@@ -559,3 +559,42 @@ fn low_space_is_reported_once_against_the_recording_storage() {
     let json = serde_json::to_value(&r).unwrap();
     assert!(json["storages"].as_array().unwrap().iter().all(|s| s["read_only"].is_boolean()));
 }
+
+/// Imported ZoneMinder recordings can run for half a day, far longer than the
+/// window the quick pin and footage checks look in. Neither a segment under
+/// such an event nor an event inside such a segment may be given up for that.
+#[test]
+fn footage_and_events_longer_than_the_search_window_still_count() {
+    let fx = Fixture::new();
+    let cam = fx.add_camera("c");
+    fx.db.update_camera(cam, serde_json::json!({"retention_days": 1, "event_retention_days": 30}).as_object().unwrap()).unwrap();
+    let enc = parse_encoded(&encode_fmp4(2, "libx264", 160, 90));
+    let hour = 3600;
+    assert!(zmng::db::MAX_SPAN < dts(5 * hour), "the test needs spans beyond MAX_SPAN");
+
+    // a six-hour event, and a one-minute segment five hours into it
+    let ev_start = now_secs() - 10 * 86_400;
+    let long_event = fx.db.insert_event_full(cam, dts(ev_start), dts(ev_start + 6 * hour), "motion", 200, None, None, "{}", false, None).unwrap();
+    let under_event = fx.write_segment(cam, "main", &enc, dts(ev_start + 5 * hour), |_| 0);
+
+    // a six-hour segment (index row only, as an import leaves it), and a short event five hours into it
+    let seg_start = now_secs() - 8 * 86_400;
+    let se = fx.db.intern_sample_entry(enc.params.codec, &enc.params.rfc6381, enc.params.width, enc.params.height, &enc.params.sample_entry, None).unwrap();
+    let idx = vec![zmng::mp4::FragEntry { dts: dts(seg_start), duration: dts(6 * hour) as u32, offset: 0, len: 10, samples: 1, motion: 0 }];
+    let long_segment = fx.db.insert_segment_ext(cam, fx.storage_id, se, "c/long.mp4", 10, 0, &idx, 0, None, "main").unwrap();
+    let inside = fx.db.insert_event_full(cam, dts(seg_start + 5 * hour), dts(seg_start + 5 * hour + 60), "person", 200, None, None, "{}", false, None).unwrap();
+
+    // a plain old segment and an old event with no footage at all still go
+    let plain = fx.write_segment(cam, "main", &enc, dts(now_secs() - 5 * 86_400), |_| 0);
+    let orphan = fx.db.insert_event_full(cam, dts(now_secs() - 6 * 86_400), dts(now_secs() - 6 * 86_400 + 30), "motion", 200, None, None, "{}", false, None).unwrap();
+
+    for _ in 0..2 {
+        zmng::retention::run_once(&fx.db, &fx.thumb_dir).unwrap();
+    }
+    assert!(fx.db.segment(under_event).unwrap().is_some(), "pinned by an event that began five hours earlier");
+    assert!(fx.db.event(long_event).unwrap().is_some());
+    assert!(fx.db.segment(long_segment).unwrap().is_some(), "pinned by the event inside it");
+    assert!(fx.db.event(inside).unwrap().is_some(), "its footage began five hours earlier");
+    assert!(fx.db.segment(plain).unwrap().is_none(), "past retention, no event");
+    assert!(fx.db.event(orphan).unwrap().is_none(), "no footage left");
+}
